@@ -1,0 +1,167 @@
+{
+  "state_db": "../data/state.db",
+  "work_dir": "../data/work",
+  "source": {
+    "mode": "local_filesystem",
+    "root_dir": "C:\\REPLACE_WITH_LOCAL_SOURCE_ROOT",
+    "excel_path": "C:\\REPLACE_WITH_LOCAL_SOURCE_ROOT\\7-7\\나의업무관리.xlsx",
+    "immutable": true,
+    "initial_auto_hydrate": true,
+    "steady_state_auto_hydrate": false,
+    "snapshot_dir": "../data/work/local-source-snapshots"
+  },
+  "excel": {
+    "sheets": [
+      "2026",
+      "등록결정"
+    ],
+    "header_row": 1,
+    "key_columns": [
+      "당소 사건번호",
+      "사건번호",
+      "업무번호",
+      "ID"
+    ],
+    "key_groups": {
+      "2026": [
+        ["사건번호", "종류", "작업설명", "받은날짜"],
+        ["사건번호", "종류", "작업설명"],
+        ["사건번호"]
+      ],
+      "등록결정": [
+        ["사건번호", "등록 마감일"],
+        ["사건번호"],
+        ["의뢰인"]
+      ]
+    }
+  },
+  "wiki": {
+    "enabled": true,
+    "source_root": "C:\\REPLACE_WITH_LOCAL_SOURCE_ROOT",
+    "output_root": "C:\\REPLACE_WITH_LOCAL_WIKI_OUTPUT_ROOT",
+    "initial_auto_hydrate": true,
+    "steady_state_auto_hydrate": false,
+    "index_db": "%LOCALAPPDATA%\\notion-excel-sync\\wiki\\index.db",
+    "rollout_mode": "shadow",
+    "include_roots": [
+      "2. 해외총괄",
+      "3. 사무소규정관련",
+      "4. 사무소사업관련",
+      "4-1. 기타 과제관련(4번 항목 제외 과제)",
+      "4-2. 대리인 지원 자료 및 고객 관리",
+      "4-3. 절세",
+      "5. 사무소특허제도_특허,실시권,이전,감평",
+      "5-1. 소송 및 권리행사",
+      "6. 사무소상표제도",
+      "7. 사무소디자인제도",
+      "7-1. 저작권",
+      "8. 기술분류",
+      "9. 법령",
+      "16. 당소 사무소 정보"
+    ],
+    "exclude_roots": [
+      "0-1. 영업 관련 정보",
+      "1. 업무분류_국내",
+      "1. 업무분류_국내2",
+      "1-1. 업무분류_인커밍",
+      "1-2. 업무분류_아웃고잉",
+      "1-3. 업무분류(사업계획서_제안서)",
+      "1-4. 업무분류_과제",
+      "11. 팀원실적정산_월간업무보고",
+      "12. 파트너_회의록_단톡방자료",
+      "20. 상상인력이력정보"
+    ],
+    "allowed_extensions": [
+      ".txt",
+      ".md",
+      ".csv",
+      ".html",
+      ".htm",
+      ".docx",
+      ".pptx",
+      ".xlsx",
+      ".hwpx"
+    ],
+    "max_file_bytes": 20971520,
+    "max_total_bytes": 262144000,
+    "max_documents": 300,
+    "max_output_chars": 2000000,
+    "max_generation_chars": 30000000,
+    "max_generation_chunks": 50000,
+    "extractor_timeout_seconds": 30,
+    "chunk_chars": 1200,
+    "chunk_overlap_chars": 180,
+    "retrieval_top_k": 5,
+    "policy_version": "sangsang-wiki-policy-v2",
+    "selective_roots": [
+      "2. 해외총괄",
+      "4. 사무소사업관련",
+      "4-1. 기타 과제관련(4번 항목 제외 과제)",
+      "4-2. 대리인 지원 자료 및 고객 관리",
+      "16. 당소 사무소 정보"
+    ],
+    "selective_keywords": [
+      "공고",
+      "규정",
+      "지침",
+      "기준",
+      "요령",
+      "안내",
+      "가이드",
+      "매뉴얼",
+      "절차",
+      "서식",
+      "양식",
+      "템플릿",
+      "faq",
+      "사업비",
+      "지원사업",
+      "바우처",
+      "증빙",
+      "정산",
+      "수행기관",
+      "관납료",
+      "비용"
+    ]
+  },
+  "email": {
+    "enabled": true,
+    "reference_project": "C:\\Users\\REPLACE_WITH_USER\\Documents\\hermes-tools\\hiworks-mail",
+    "host": "pop3s.hiworks.com",
+    "port": 995,
+    "username": "REPLACE_WITH_HIWORKS_ACCOUNT",
+    "password_secret": "HIWORKS_MAIL_PASSWORD",
+    "use_ssl": true,
+    "header_first": true,
+    "max_message_bytes": 10485760,
+    "max_body_bytes": 2097152,
+    "max_attachment_bytes": 20971520
+  },
+  "notion": {
+    "read_token_env": "NOTION_READ_TOKEN",
+    "write_token_env": "GATEWAY_RELAY_NX_NOTION_TOKEN",
+    "api_version": "2026-03-11",
+    "schema_parent_page_id": "REPLACE_WITH_SCHEMA_PARENT_PAGE_ID",
+    "databases": {
+      "한국 특허 사건": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "그룹": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "당사자": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "업무·절차": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "기일": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "비용·청구": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "정부지원사업 증빙": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "등록결정 후속관리": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "연락이력": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "근거자료": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "검토함": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID",
+      "변경이력": "REPLACE_WITH_DATABASE_OR_DATA_SOURCE_ID"
+    }
+  },
+  "approval": {
+    "secret_env": "GATEWAY_RELAY_NX_APPROVAL_SECRET",
+    "ttl_seconds": 1800,
+    "allowed_telegram_users": [
+      "REPLACE_WITH_NUMERIC_TELEGRAM_USER_ID"
+    ]
+  }
+}

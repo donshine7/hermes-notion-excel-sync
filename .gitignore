@@ -1,0 +1,44 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Runtime state, generated Wiki layers, snapshots, receipts, and token caches.
+data/
+업무_wiki/
+
+# Machine-local configuration and credentials.
+config/sync.json
+config/sync.local.json
+config/*.local.json
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+
+# Never publish source-office files, mail originals, databases, or bulk exports.
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.pdf
+*.eml
+*.msg
+*.pst
+*.ost
+*.mbox
+*.sqlite
+*.sqlite3
+*.db
+*.db-*
+*.parquet
+*.jsonl

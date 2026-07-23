@@ -1,0 +1,4 @@
+interface:
+  display_name: "Notion Excel Sync"
+  short_description: "Review Excel changes and safely retrieve the bounded LLM Wiki"
+  default_prompt: "Use $notion-excel-sync for an explicit Excel review or LLM Wiki status, search, or refresh request while preserving Telegram approval for every Notion write."
