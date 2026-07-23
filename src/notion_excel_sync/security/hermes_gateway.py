@@ -21,6 +21,10 @@ from notion_excel_sync.adapters.onedrive import OneDriveReadOnlyClient
 from notion_excel_sync.adapters.onedrive_auth import build_onedrive_token_provider
 from notion_excel_sync.config import AppConfig, load_config
 from notion_excel_sync.domain import AnalysisPipeline, build_default_registry
+from notion_excel_sync.knowledge.corrections import (
+    ApprovedCorrectionEvent,
+    CorrectionOverlayStore,
+)
 from notion_excel_sync.knowledge.index import WikiIndex
 from notion_excel_sync.knowledge.projection import WikiOutputStore
 from notion_excel_sync.knowledge.provider import AnalyzerKnowledgeProvider
@@ -56,6 +60,11 @@ from notion_excel_sync.workflow.notion_writer import (
     NotionCurrentValueReader,
 )
 from notion_excel_sync.workflow.proposals import ProposalError, ProposalService
+from notion_excel_sync.workflow.review_cards import (
+    ReviewCardPageError,
+    build_review_cards,
+    render_review_card_page,
+)
 from notion_excel_sync.workflow.sync import PreparationResult, SyncPreparationService
 
 
@@ -105,7 +114,6 @@ _SET_RE = re.compile(
 )
 _REJECT_RE = re.compile(rf"/nx_reject ({_IDENTIFIER}) ([1-9][0-9]*)")
 _RECOVER_RE = re.compile(rf"/nx_recover ({_IDENTIFIER}) ([1-9][0-9]*)")
-_SHOW_PAGE_SIZE = 4
 _MAX_EDIT_JSON_CHARS = 2048
 _WIKI_BOOTSTRAP_CHECKPOINT = "wiki-bootstrap"
 _WIKI_EXCEL_CHECKPOINT = "wiki-excel"
@@ -409,108 +417,18 @@ def _audit_gateway_command(
     )
 
 
-def _short_value(value: object, limit: int = 240) -> str:
-    rendered = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return rendered if len(rendered) <= limit else rendered[: limit - 1] + "…"
-
-
 def _proposal_screen(proposal: ProposalRevision, *, prefix: str) -> str:
-    actions: dict[str, int] = {}
-    for operation in proposal.operations:
-        actions[operation.action.value] = actions.get(operation.action.value, 0) + 1
-    lines = [
-        f"[{prefix}]",
-        f"Proposal: {proposal.proposal_id}",
-        f"Revision: {proposal.revision}",
-        f"Status: {proposal.status.value}",
-        f"Digest: {proposal.digest}",
-        f"Operations: {len(proposal.operations)} {json.dumps(actions, sort_keys=True)}",
-        f"Show: /nx_show {proposal.proposal_id} {proposal.revision}",
-        "Final approval (exact full digest):",
-        f"/nx_approve {proposal.proposal_id} {proposal.revision} {proposal.digest}",
-        "Notion has not been changed.",
-    ]
-    return "\n".join(lines)
+    return f"[{prefix}]\n{render_review_card_page(proposal, 1)}"
 
 
 def _proposal_page(
     proposal: ProposalRevision,
     page: int,
 ) -> str:
-    total_pages = max(
-        1,
-        (len(proposal.operations) + _SHOW_PAGE_SIZE - 1) // _SHOW_PAGE_SIZE,
-    )
-    if page > total_pages:
-        raise HermesGatewayApprovalError(
-            f"Page {page} does not exist; valid pages are 1-{total_pages}"
-        )
-    start = (page - 1) * _SHOW_PAGE_SIZE
-    selected = proposal.operations[start : start + _SHOW_PAGE_SIZE]
-    lines = [
-        f"[NX_PROPOSAL {proposal.proposal_id} r{proposal.revision}]",
-        f"Status: {proposal.status.value}",
-        f"Digest: {proposal.digest}",
-        f"Page: {page}/{total_pages}",
-    ]
-    if not selected:
-        lines.append("No operations.")
-    for index, operation in enumerate(selected, start=start + 1):
-        change = operation.change
-        lines.extend(
-            [
-                "",
-                f"{index}. Operation ID: {change.operation_id}",
-                (
-                    f"[{operation.action.value}] {change.target_database} / "
-                    f"{change.entity_key} / {change.property_name}"
-                ),
-                f"Current: {_short_value(change.current_value)}",
-                f"Analyzed: {_short_value(change.proposed_value)}",
-                f"Selected: {_short_value(operation.approved_value)}",
-                f"Reason: {change.reason[:240]}",
-                "Exact commands:",
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} apply"
-                ),
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} exclude"
-                ),
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} defer"
-                ),
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} edit <JSON>"
-                ),
-            ]
-        )
-    if page < total_pages:
-        lines.extend(
-            [
-                "",
-                f"Next: /nx_show {proposal.proposal_id} {proposal.revision} {page + 1}",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            f"Reject: /nx_reject {proposal.proposal_id} {proposal.revision}",
-            "Final approval (exact full digest):",
-            f"/nx_approve {proposal.proposal_id} {proposal.revision} {proposal.digest}",
-            "Notion has not been changed.",
-        ]
-    )
-    return "\n".join(lines)
+    try:
+        return render_review_card_page(proposal, page)
+    except ReviewCardPageError as exc:
+        raise HermesGatewayApprovalError(str(exc)) from exc
 
 
 def _configured_knowledge_provider(
@@ -1075,6 +993,85 @@ def _handle_nonapproval_command(
     raise AssertionError(f"Unsupported non-approval command: {command_name}")
 
 
+def _correction_overlay_publisher(
+    config: AppConfig,
+    database: StateDatabase,
+) -> Callable[[ProposalRevision, ApprovalReceipt], None]:
+    """Build the post-Notion publisher for user-approved value overrides."""
+
+    def publish(
+        proposal: ProposalRevision,
+        receipt: ApprovalReceipt,
+    ) -> None:
+        selected = []
+        for operation in proposal.operations:
+            if not operation.user_override:
+                continue
+            if operation.change.entity_key.startswith("history:"):
+                continue
+            state = database.operation_outbox_state(
+                operation.change.operation_id
+            )
+            if (
+                operation.action
+                not in {ProposalAction.APPLY, ProposalAction.EDIT}
+                and (state is None or state.get("status") != "done")
+            ):
+                continue
+            selected.append(operation)
+        if not selected:
+            return
+        if not config.wiki.enabled or config.wiki.output_root is None:
+            raise RuntimeError(
+                "A user-approved correction requires an enabled Wiki output"
+            )
+        cards = {
+            card.operation_id: card
+            for card in build_review_cards(proposal)
+        }
+        store = CorrectionOverlayStore(config.wiki.output_root)
+        for operation in selected:
+            change = operation.change
+            event_id = "correction-" + sha256_json(
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "revision": proposal.revision,
+                    "operation_id": change.operation_id,
+                    "digest": proposal.digest,
+                }
+            )[:40]
+            card = cards.get(change.operation_id)
+            store.publish(
+                ApprovedCorrectionEvent(
+                    event_id=event_id,
+                    proposal_id=proposal.proposal_id,
+                    proposal_revision=proposal.revision,
+                    proposal_digest=proposal.digest,
+                    operation_id=change.operation_id,
+                    case_number=(
+                        card.case_number if card is not None else change.entity_key
+                    ),
+                    target_database=change.target_database,
+                    entity_key=change.entity_key,
+                    property_name=change.property_name,
+                    current_value=change.current_value,
+                    approved_value=operation.approved_value,
+                    reason=change.reason,
+                    approved_by_user_id=receipt.telegram_user_id,
+                    approved_in_chat_id=receipt.chat_id,
+                    approved_at=receipt.issued_at,
+                    source_refs_digest=sha256_json(
+                        [
+                            dataclass_to_dict(source_ref)
+                            for source_ref in change.source_refs
+                        ]
+                    ),
+                )
+            )
+
+    return publish
+
+
 def _apply_gateway_receipt(
     config: AppConfig,
     database: StateDatabase,
@@ -1119,7 +1116,15 @@ def _apply_gateway_receipt(
     )
 
     def apply_under_current_generation() -> ApplyReport:
-        return ApprovalGatedApplyService(database, approval, writer).apply(
+        return ApprovalGatedApplyService(
+            database,
+            approval,
+            writer,
+            correction_overlay_publisher=_correction_overlay_publisher(
+                config,
+                database,
+            ),
+        ).apply(
             receipt=receipt,
             drive_id=config.onedrive.drive_id,
             item_id=config.onedrive.item_id,

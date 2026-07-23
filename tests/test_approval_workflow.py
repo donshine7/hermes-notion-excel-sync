@@ -14,6 +14,7 @@ from notion_excel_sync.adapters.notion import (
 from notion_excel_sync.models import (
     ChangeKind,
     ProposalAction,
+    ProposalPurpose,
     ProposalStatus,
     ProposedChange,
     SourceRef,
@@ -183,6 +184,143 @@ class ApprovalWorkflowTest(unittest.TestCase):
         self.assertTrue(report.committed)
         self.assertEqual(writer.calls, 1)
         self.assertEqual(self.database.get_checkpoint("drive", "item")["version_id"], "2.0")
+
+    def test_independent_correction_never_advances_excel_checkpoint(self) -> None:
+        proposal = self.proposals.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [sample_change()],
+            purpose=ProposalPurpose.USER_CORRECTION,
+        )
+        loaded = self.database.load_proposal(proposal.proposal_id)
+        self.assertIs(loaded.purpose, ProposalPurpose.USER_CORRECTION)
+        self.assertNotEqual(loaded.digest, "")
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+
+        report = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            MemoryWriter(),
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(report.committed)
+        self.assertIsNone(self.database.get_checkpoint("drive", "item"))
+        self.assertIs(
+            self.database.load_proposal(proposal.proposal_id).status,
+            ProposalStatus.COMMITTED,
+        )
+
+    def test_user_edit_publishes_overlay_only_after_notion_write(self) -> None:
+        proposal = self.create_pending()
+        proposal = self.proposals.edit(
+            proposal.proposal_id,
+            proposal.operations[0].change.operation_id,
+            ProposalAction.EDIT,
+            "사용자 승인값",
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        writer = MemoryWriter()
+        published: list[tuple[str, str]] = []
+
+        def publish_overlay(revision, approved_receipt) -> None:
+            self.assertEqual(writer.calls, 1)
+            published.append(
+                (revision.proposal_id, approved_receipt.proposal_digest)
+            )
+
+        report = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=publish_overlay,
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(report.committed)
+        self.assertEqual(
+            published,
+            [(proposal.proposal_id, proposal.digest)],
+        )
+
+    def test_overlay_failure_recovers_without_replaying_notion_write(self) -> None:
+        proposal = self.create_pending()
+        operation_id = proposal.operations[0].change.operation_id
+        proposal = self.proposals.edit(
+            proposal.proposal_id,
+            operation_id,
+            ProposalAction.EDIT,
+            "사용자 승인값",
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        writer = MemoryWriter()
+
+        def fail_overlay(_revision, _approved_receipt) -> None:
+            raise RuntimeError("simulated Wiki publication failure")
+
+        failed = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=fail_overlay,
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertFalse(failed.committed)
+        self.assertIn("__wiki_overlay__", failed.failed)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(
+            self.database.operation_outbox_state(operation_id)["status"],
+            "done",
+        )
+        self.assertIsNone(self.database.get_checkpoint("drive", "item"))
+
+        recovery = self.proposals.create_recovery_revision(
+            proposal.proposal_id
+        )
+        self.assertIs(recovery.operations[0].action, ProposalAction.EXCLUDE)
+        recovery = self.proposals.request_approval(recovery.proposal_id)
+        recovery_receipt = self.proposals.approve(
+            recovery.proposal_id,
+            recovery.revision,
+            "123",
+            "chat",
+            recovery.digest,
+        )
+        recovered_events: list[str] = []
+
+        recovered = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=lambda revision, _: (
+                recovered_events.append(revision.proposal_id)
+            ),
+        ).apply(recovery_receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(recovered.committed)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(recovered_events, [proposal.proposal_id])
 
     def test_started_apply_resumes_without_replaying_confirmed_remote_write(self) -> None:
         proposal = self.create_pending()

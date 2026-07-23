@@ -13,14 +13,17 @@ from typing import Any, Iterator
 from notion_excel_sync.models import (
     ApprovalReceipt,
     ChangeKind,
+    EXCEL_SYNC_PURPOSE,
     KnowledgeRef,
     ProposalAction,
     ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
     SCHEMA_APPROVAL_PURPOSE,
     SCHEMA_RECOVERY_PURPOSE,
+    USER_CORRECTION_PURPOSE,
     SchemaApprovalReceipt,
     SchemaProposalRevision,
     SchemaProposalStatus,
@@ -56,6 +59,7 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoint (
 CREATE TABLE IF NOT EXISTS proposal (
     proposal_id TEXT PRIMARY KEY,
     current_revision INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'excel_sync/v1',
     requested_by TEXT NOT NULL,
     chat_id TEXT NOT NULL,
     source_version_id TEXT NOT NULL,
@@ -308,6 +312,19 @@ CREATE TABLE IF NOT EXISTS notion_schema_installation (
     FOREIGN KEY (schema_proposal_id, revision)
         REFERENCES schema_proposal_revision(schema_proposal_id, revision)
 );
+
+CREATE TABLE IF NOT EXISTS correction_gateway_event_claim (
+    event_key TEXT PRIMARY KEY,
+    telegram_user_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    update_id INTEGER NOT NULL,
+    request_digest TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (telegram_user_id, update_id),
+    UNIQUE (chat_id, message_id)
+);
 """
 
 
@@ -321,6 +338,10 @@ class SchemaStateError(RuntimeError):
 
 class SchemaEventClaimError(SchemaStateError):
     """Raised when a Telegram update/message is replayed with changed content."""
+
+
+class CorrectionEventClaimError(RuntimeError):
+    """Raised when a correction command event is replayed inconsistently."""
 
 
 def _safe_schema_reason_code(value: str) -> str:
@@ -391,6 +412,17 @@ class StateDatabase:
     def initialize(self) -> None:
         with self.session() as connection:
             connection.executescript(SCHEMA)
+            proposal_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(proposal)"
+                ).fetchall()
+            }
+            if "purpose" not in proposal_columns:
+                connection.execute(
+                    "ALTER TABLE proposal ADD COLUMN purpose TEXT NOT NULL "
+                    f"DEFAULT '{EXCEL_SYNC_PURPOSE}'"
+                )
             event_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -712,6 +744,117 @@ class StateDatabase:
             )
         return winner
 
+    def claim_correction_gateway_event(
+        self,
+        *,
+        telegram_user_id: str,
+        chat_id: str,
+        message_id: str,
+        update_id: int,
+        request_digest: str,
+        proposal_id: str,
+    ) -> dict[str, Any]:
+        """Claim one exact Telegram correction event idempotently.
+
+        A Telegram retry with the same event and canonical request returns the
+        existing claim. Reuse of either the update ID or message ID with
+        different content fails closed.
+        """
+
+        values = {
+            "telegram_user_id": str(telegram_user_id).strip(),
+            "chat_id": str(chat_id).strip(),
+            "message_id": str(message_id).strip(),
+            "proposal_id": str(proposal_id).strip(),
+        }
+        if any(not value or len(value) > 256 for value in values.values()):
+            raise ValueError("Correction event identifiers are invalid")
+        if isinstance(update_id, bool) or not isinstance(update_id, int) or update_id < 0:
+            raise ValueError("Correction Telegram update_id is invalid")
+        digest = str(request_digest).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("Correction request digest must be SHA-256")
+        event_key = sha256_json(
+            {
+                "purpose": USER_CORRECTION_PURPOSE,
+                "telegram_user_id": values["telegram_user_id"],
+                "chat_id": values["chat_id"],
+                "message_id": values["message_id"],
+                "update_id": update_id,
+            }
+        )
+        now = datetime.now().astimezone().isoformat()
+        expected = {
+            "event_key": event_key,
+            **values,
+            "update_id": update_id,
+            "request_digest": digest,
+        }
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM correction_gateway_event_claim
+                WHERE event_key = ?
+                   OR (telegram_user_id = ? AND update_id = ?)
+                   OR (chat_id = ? AND message_id = ?)
+                """,
+                (
+                    event_key,
+                    values["telegram_user_id"],
+                    update_id,
+                    values["chat_id"],
+                    values["message_id"],
+                ),
+            ).fetchone()
+            if row is not None:
+                existing = dict(row)
+                if any(
+                    str(existing[key]) != str(value)
+                    for key, value in expected.items()
+                ):
+                    raise CorrectionEventClaimError(
+                        "Telegram correction event was replayed with changed content"
+                    )
+                return existing
+            connection.execute(
+                """
+                INSERT INTO correction_gateway_event_claim(
+                    event_key, telegram_user_id, chat_id, message_id, update_id,
+                    request_digest, proposal_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    values["telegram_user_id"],
+                    values["chat_id"],
+                    values["message_id"],
+                    update_id,
+                    digest,
+                    values["proposal_id"],
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO audit_log("
+                "event_type, proposal_id, actor, details, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    "correction_gateway_event_claimed",
+                    values["proposal_id"],
+                    values["telegram_user_id"],
+                    json.dumps(
+                        {
+                            "event_key": event_key,
+                            "request_digest": digest,
+                            "telegram_update_id": update_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return {**expected, "created_at": now}
+
     def commit_checkpoint(
         self,
         drive_id: str,
@@ -783,11 +926,12 @@ class StateDatabase:
             connection.execute(
                 """
                 INSERT INTO proposal(
-                    proposal_id, current_revision, requested_by, chat_id,
+                    proposal_id, current_revision, purpose, requested_by, chat_id,
                     source_version_id, source_file_hash, status, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
                     current_revision = excluded.current_revision,
+                    purpose = excluded.purpose,
                     source_version_id = excluded.source_version_id,
                     source_file_hash = excluded.source_file_hash,
                     status = excluded.status,
@@ -796,6 +940,7 @@ class StateDatabase:
                 (
                     proposal.proposal_id,
                     proposal.revision,
+                    proposal.purpose.value,
                     proposal.requested_by,
                     proposal.chat_id,
                     proposal.source_version_id,
@@ -3172,10 +3317,19 @@ class StateDatabase:
         version_id: str,
         file_hash: str,
     ) -> None:
-        """Atomically commit local proposal, pending queue, and source checkpoint."""
+        """Atomically finalize a proposal in its own authority domain.
+
+        Ordinary Excel synchronization advances the source checkpoint and may
+        retain deferred changes. An independently requested Telegram
+        correction is bound to the current source for staleness checks, but
+        must never claim that the Excel source itself was synchronized.
+        """
 
         now = datetime.now().astimezone().isoformat()
         payload = json.dumps(dataclass_to_dict(proposal), ensure_ascii=False)
+        advances_source_checkpoint = (
+            proposal.purpose is ProposalPurpose.EXCEL_SYNC
+        )
         with self.transaction() as connection:
             proposal_cursor = connection.execute(
                 "UPDATE proposal SET status = ?, expires_at = ? "
@@ -3201,50 +3355,53 @@ class StateDatabase:
                 raise RuntimeError(
                     "Proposal head changed before the local commit could finalize"
                 )
-            for operation in proposal.operations:
-                if operation.action is ProposalAction.DEFER:
-                    operation_payload = json.dumps(
-                        dataclass_to_dict(operation),
-                        ensure_ascii=False,
-                        default=str,
-                    )
+            if advances_source_checkpoint:
+                for operation in proposal.operations:
+                    if operation.action is ProposalAction.DEFER:
+                        operation_payload = json.dumps(
+                            dataclass_to_dict(operation),
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        connection.execute(
+                            "INSERT OR REPLACE INTO pending_change("
+                            "operation_id, proposal_id, payload, created_at, resolved_at"
+                            ") VALUES (?, ?, ?, ?, NULL)",
+                            (
+                                operation.change.operation_id,
+                                proposal.proposal_id,
+                                operation_payload,
+                                now,
+                            ),
+                        )
+                        continue
                     connection.execute(
-                        "INSERT OR REPLACE INTO pending_change("
-                        "operation_id, proposal_id, payload, created_at, resolved_at"
-                        ") VALUES (?, ?, ?, ?, NULL)",
-                        (
-                            operation.change.operation_id,
-                            proposal.proposal_id,
-                            operation_payload,
-                            now,
-                        ),
+                        "UPDATE pending_change SET resolved_at = ? "
+                        "WHERE operation_id = ? AND resolved_at IS NULL",
+                        (now, operation.change.operation_id),
                     )
-                    continue
+            if advances_source_checkpoint:
                 connection.execute(
-                    "UPDATE pending_change SET resolved_at = ? "
-                    "WHERE operation_id = ? AND resolved_at IS NULL",
-                    (now, operation.change.operation_id),
+                    """
+                    INSERT INTO sync_checkpoint(
+                        drive_id, item_id, version_id, file_hash,
+                        committed_at, proposal_id
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(drive_id, item_id) DO UPDATE SET
+                        version_id = excluded.version_id,
+                        file_hash = excluded.file_hash,
+                        committed_at = excluded.committed_at,
+                        proposal_id = excluded.proposal_id
+                    """,
+                    (
+                        drive_id,
+                        item_id,
+                        version_id,
+                        file_hash,
+                        now,
+                        proposal.proposal_id,
+                    ),
                 )
-            connection.execute(
-                """
-                INSERT INTO sync_checkpoint(
-                    drive_id, item_id, version_id, file_hash, committed_at, proposal_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(drive_id, item_id) DO UPDATE SET
-                    version_id = excluded.version_id,
-                    file_hash = excluded.file_hash,
-                    committed_at = excluded.committed_at,
-                    proposal_id = excluded.proposal_id
-                """,
-                (
-                    drive_id,
-                    item_id,
-                    version_id,
-                    file_hash,
-                    now,
-                    proposal.proposal_id,
-                ),
-            )
             connection.execute(
                 "INSERT INTO audit_log("
                 "event_type, proposal_id, actor, details, created_at"
@@ -3256,7 +3413,10 @@ class StateDatabase:
                     json.dumps(
                         {
                             "revision": proposal.revision,
-                            "checkpoint": version_id,
+                            "purpose": proposal.purpose.value,
+                            "checkpoint": (
+                                version_id if advances_source_checkpoint else None
+                            ),
                             "file_hash": file_hash,
                             "applied_scope": [
                                 item.change.operation_id
@@ -3334,6 +3494,9 @@ def _proposal_from_dict(data: dict[str, Any]) -> ProposalRevision:
         status=ProposalStatus(data["status"]),
         created_at=datetime.fromisoformat(data["created_at"]),
         expires_at=datetime.fromisoformat(data["expires_at"]) if data.get("expires_at") else None,
+        purpose=ProposalPurpose(
+            data.get("purpose", ProposalPurpose.EXCEL_SYNC.value)
+        ),
     )
 
 

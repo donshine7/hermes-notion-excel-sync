@@ -8,6 +8,7 @@ from notion_excel_sync.models import (
     JsonValue,
     ProposalAction,
     ProposalOperation,
+    ProposalRevision,
     ProposalStatus,
     WritePreconditionState,
     sha256_json,
@@ -44,10 +45,15 @@ class ApprovalGatedApplyService:
         database: StateDatabase,
         approval_service: ApprovalService,
         writer: NotionOperationWriter,
+        *,
+        correction_overlay_publisher: (
+            Callable[[ProposalRevision, ApprovalReceipt], None] | None
+        ) = None,
     ) -> None:
         self.database = database
         self.approval_service = approval_service
         self.writer = writer
+        self.correction_overlay_publisher = correction_overlay_publisher
 
     def apply(
         self,
@@ -278,6 +284,12 @@ class ApprovalGatedApplyService:
                 verify_latest_source()
             except ApprovalError as exc:
                 report.failed["__source__"] = str(exc)
+
+        if not report.failed and self.correction_overlay_publisher is not None:
+            try:
+                self.correction_overlay_publisher(proposal, receipt)
+            except Exception as exc:
+                report.failed["__wiki_overlay__"] = str(exc)
 
         if report.failed:
             proposal.status = ProposalStatus.FAILED

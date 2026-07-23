@@ -10,6 +10,7 @@ from notion_excel_sync.models import (
     ApprovalReceipt,
     ProposalAction,
     ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
@@ -48,6 +49,8 @@ class ProposalService:
         defer_databases: set[str] | None = None,
         notion_binding: dict[str, object] | None = None,
         knowledge_binding: dict[str, object] | None = None,
+        purpose: ProposalPurpose = ProposalPurpose.EXCEL_SYNC,
+        proposal_id: str | None = None,
     ) -> ProposalRevision:
         deferred = defer_databases or set()
         change_list = list(changes)
@@ -75,7 +78,10 @@ class ProposalService:
                 self.notion_data_sources,
             )
         proposal = ProposalRevision(
-            proposal_id=f"P-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8]}",
+            proposal_id=(
+                proposal_id
+                or f"P-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8]}"
+            ),
             revision=1,
             source_version_id=source_version_id,
             source_file_hash=source_file_hash,
@@ -85,6 +91,7 @@ class ProposalService:
             notion_binding=dict(notion_binding or {}),
             knowledge_binding=dict(knowledge_binding or {}),
             status=ProposalStatus.DRAFT,
+            purpose=purpose,
         )
         self.database.save_proposal(proposal)
         self.database.audit(
@@ -94,6 +101,7 @@ class ProposalService:
                 "operations": len(proposal.operations),
                 "deferred_unavailable_databases": sorted(deferred),
                 "digest": proposal.digest,
+                "purpose": proposal.purpose.value,
             },
             proposal.proposal_id,
             requested_by,
