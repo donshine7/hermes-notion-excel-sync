@@ -17,7 +17,10 @@ from notion_excel_sync.models import (
     ProposedChange,
     source_basis_digest,
 )
-from notion_excel_sync.persistence.database import StateDatabase
+from notion_excel_sync.persistence.database import (
+    ProposalRejectionError,
+    StateDatabase,
+)
 from notion_excel_sync.security.approval import ApprovalService
 from notion_excel_sync.workflow.review_cards import (
     HISTORY_DATABASE,
@@ -545,34 +548,26 @@ class ProposalService:
         proposal_id: str,
         actor: str,
         chat_id: str | None = None,
+        *,
+        expected_revision: int | None = None,
     ) -> None:
-        proposal = self.database.load_proposal(proposal_id)
-        if str(actor) != proposal.requested_by:
-            raise ProposalError("Only the request owner can reject the proposal")
-        if chat_id is not None and str(chat_id) != proposal.chat_id:
-            raise ProposalError("Proposal must be rejected from the original Telegram chat")
-        if any(
-            (
-                state := self.database.operation_outbox_state(
-                    operation.change.operation_id
-                )
-            )
-            and state["proposal_id"] == proposal.proposal_id
-            for operation in proposal.operations
-        ):
+        if chat_id is None:
             raise ProposalError(
-                "A proposal with a started apply must be recovered and finalized "
-                "before it can close"
+                "Proposal rejection requires the original Telegram chat"
             )
-        if proposal.status in {
-            ProposalStatus.APPLYING,
-            ProposalStatus.COMMITTED,
-            ProposalStatus.REJECTED,
-        }:
-            raise ProposalError(f"Proposal cannot be rejected in {proposal.status.value}")
-        proposal.status = ProposalStatus.REJECTED
-        self.database.save_proposal(proposal)
-        self.database.audit("proposal_rejected", {}, proposal_id, actor)
+        if expected_revision is None:
+            expected_revision = self.database.load_proposal(
+                proposal_id
+            ).revision
+        try:
+            self.database.reject_proposal_atomically(
+                proposal_id,
+                expected_revision=expected_revision,
+                actor=str(actor),
+                chat_id=str(chat_id),
+            )
+        except ProposalRejectionError as exc:
+            raise ProposalError(str(exc)) from exc
 
 
 def _display_value(value: object) -> str:

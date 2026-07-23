@@ -18,14 +18,20 @@ from notion_excel_sync.models import (
     ApprovalReceipt,
     ChangeKind,
     ProposalAction,
+    ProposalOperation,
     ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
     SourceRef,
     WritePreconditionState,
+    dataclass_to_dict,
 )
-from notion_excel_sync.persistence.database import ApplyLeaseError, StateDatabase
+from notion_excel_sync.persistence.database import (
+    ApplyLeaseError,
+    MutationScopeConflict,
+    StateDatabase,
+)
 from notion_excel_sync.security.approval import ApprovalService
 from notion_excel_sync.security.hermes_gateway import (
     TelegramEventIdentity,
@@ -821,6 +827,287 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         self.assertEqual(recovery.revision, 2)
         self.assertIs(recovery.status, ProposalStatus.PENDING_APPROVAL)
         self.assertTrue(recovered.startswith("[NX_RECOVERY_PROPOSAL_READY]"))
+
+    def test_reject_can_close_invalid_legacy_scope_without_relaxing_others(
+        self,
+    ) -> None:
+        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        config["approval"]["allowed_telegram_users"].append("456")
+        self.config_path.write_text(
+            json.dumps(config),
+            encoding="utf-8",
+        )
+        proposal, change = self.editable_proposal()
+        service = ProposalService(self.database, ttl_seconds=1800)
+        survivor_change = ProposedChange(
+            target_database=change.target_database,
+            entity_key="CASE-SURVIVOR",
+            property_name=change.property_name,
+            kind=ChangeKind.UPDATE,
+            current_value="old",
+            proposed_value="survivor-title",
+            analyzer="legacy_synthetic",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic surviving proposal",
+            source_refs=[],
+            operation_id="legacy-survivor-operation",
+        )
+        survivor = service.create(
+            "source-v1",
+            "source-hash",
+            "123",
+            "chat",
+            [survivor_change],
+        )
+        survivor = service.request_approval(survivor.proposal_id)
+        duplicate_change = ProposedChange(
+            target_database=change.target_database,
+            entity_key=change.entity_key,
+            property_name=change.property_name,
+            kind=ChangeKind.UPDATE,
+            current_value=change.current_value,
+            proposed_value="different-new-value",
+            analyzer="legacy_synthetic",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic legacy duplicate scope",
+            source_refs=[],
+            operation_id="legacy-duplicate-operation",
+        )
+        proposal.operations.append(ProposalOperation(duplicate_change))
+        with self.database.session() as connection:
+            connection.execute(
+                "UPDATE proposal_revision SET payload = ?, digest = ? "
+                "WHERE proposal_id = ? AND revision = ?",
+                (
+                    json.dumps(
+                        dataclass_to_dict(proposal),
+                        ensure_ascii=False,
+                    ),
+                    proposal.digest,
+                    proposal.proposal_id,
+                    proposal.revision,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM mutation_scope_claim"
+            )
+
+        with self.assertRaisesRegex(
+            MutationScopeConflict,
+            "multiple non-identical mutations",
+        ):
+            self.database.initialize()
+
+        constructor_patches = [
+            patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "_prepare_authenticated_sync",
+                side_effect=AssertionError("sync preparation must not run"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._source_client",
+                side_effect=AssertionError("source client must not be built"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "_notion_read_gateway",
+                side_effect=AssertionError("Notion reader must not be built"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "_wiki_live_binding_guard",
+                side_effect=AssertionError("Wiki guard must not run"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "ApprovedNotionWriter",
+                side_effect=AssertionError("Notion writer must not be built"),
+            ),
+        ]
+        constructor_mocks = [item.start() for item in constructor_patches]
+        for item in constructor_patches:
+            self.addCleanup(item.stop)
+
+        with patch.object(
+            StateDatabase,
+            "initialize_for_legacy_rejection",
+            side_effect=AssertionError(
+                "malformed rejection must not use relaxed initialization"
+            ),
+        ) as relaxed:
+            malformed = self.handle(
+                FakeEvent(
+                    text=f"/nx_reject {proposal.proposal_id}",
+                    source=FakeSource(),
+                )
+            )
+        self.assertIn("code=invalid_syntax", malformed)
+        relaxed.assert_not_called()
+
+        strict_commands = (
+            "/nx_sync",
+            f"/nx_show {proposal.proposal_id} {proposal.revision}",
+            (
+                f"/nx_set {proposal.proposal_id} {proposal.revision} "
+                f"{change.operation_id} exclude"
+            ),
+            f"/nx_recover {proposal.proposal_id} {proposal.revision}",
+            (
+                f"/nx_approve {proposal.proposal_id} {proposal.revision} "
+                f"{proposal.digest}"
+            ),
+            '/nx_correct {"synthetic":"request"}',
+            "/nx_schema_show SCHEMA-SYNTHETIC 1",
+        )
+        for command_text in strict_commands:
+            with self.subTest(strict_command=command_text.split(maxsplit=1)[0]):
+                denied = self.handle(
+                    FakeEvent(text=command_text, source=FakeSource())
+                )
+                self.assertIn("code=", denied)
+                self.assertIn("same Notion mutation scope", denied)
+
+        for source, revision, expected_message in (
+            (
+                FakeSource(user_id="456"),
+                proposal.revision,
+                "Only the proposal owner",
+            ),
+            (
+                FakeSource(chat_id="other-chat"),
+                proposal.revision,
+                "original Telegram chat",
+            ),
+            (
+                FakeSource(),
+                proposal.revision + 1,
+                "is stale",
+            ),
+        ):
+            with self.subTest(
+                user_id=source.user_id,
+                chat_id=source.chat_id,
+                revision=revision,
+            ):
+                denied = self.handle(
+                    FakeEvent(
+                        text=(
+                            f"/nx_reject {proposal.proposal_id} "
+                            f"{revision}"
+                        ),
+                        source=source,
+                    )
+                )
+                self.assertIn("code=command_rejected", denied)
+                self.assertIn(expected_message, denied)
+                self.assertIs(
+                    self.database.load_proposal(proposal.proposal_id).status,
+                    ProposalStatus.PENDING_APPROVAL,
+                )
+
+        with self.database.session() as connection:
+            connection.execute(
+                "UPDATE proposal SET source_file_hash = ? "
+                "WHERE proposal_id = ?",
+                ("head-payload-mismatch", proposal.proposal_id),
+            )
+        inconsistent = self.handle(
+            FakeEvent(
+                text=f"/nx_reject {proposal.proposal_id} {proposal.revision}",
+                source=FakeSource(),
+            )
+        )
+        self.assertIn("code=command_rejected", inconsistent)
+        self.assertIn("proposal state transition was rejected", inconsistent)
+        with self.database.session() as connection:
+            connection.execute(
+                "UPDATE proposal SET source_file_hash = ? "
+                "WHERE proposal_id = ?",
+                (proposal.source_file_hash, proposal.proposal_id),
+            )
+
+        with (
+            patch.object(
+                StateDatabase,
+                "initialize",
+                side_effect=RuntimeError("synthetic non-scope failure"),
+            ),
+            patch.object(
+                StateDatabase,
+                "initialize_for_legacy_rejection",
+            ) as relaxed,
+        ):
+            internal_error = self.handle(
+                FakeEvent(
+                    text=(
+                        f"/nx_reject {proposal.proposal_id} "
+                        f"{proposal.revision}"
+                    ),
+                    source=FakeSource(),
+                )
+            )
+        self.assertIn("code=internal_error", internal_error)
+        relaxed.assert_not_called()
+
+        with self.database.session() as connection:
+            connection.execute(
+                "INSERT INTO outbox("
+                "operation_id, proposal_id, revision, payload, status, updated_at"
+                ") VALUES (?, ?, ?, ?, 'done', ?)",
+                (
+                    "orphan-started-outbox",
+                    proposal.proposal_id,
+                    proposal.revision,
+                    "{}",
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+        started_denied = self.handle(
+            FakeEvent(
+                text=f"/nx_reject {proposal.proposal_id} {proposal.revision}",
+                source=FakeSource(),
+            )
+        )
+        self.assertIn("code=command_rejected", started_denied)
+        self.assertIn("proposal state transition was rejected", started_denied)
+        with self.database.session() as connection:
+            connection.execute(
+                "DELETE FROM outbox WHERE proposal_id = ?",
+                (proposal.proposal_id,),
+            )
+
+        rejected = self.handle(
+            FakeEvent(
+                text=f"/nx_reject {proposal.proposal_id} {proposal.revision}",
+                source=FakeSource(),
+            )
+        )
+        self.assertTrue(rejected.startswith("[NX_PROPOSAL_REJECTED]"))
+        self.assertIs(
+            self.database.load_proposal(proposal.proposal_id).status,
+            ProposalStatus.REJECTED,
+        )
+        self.database.initialize()
+        with self.database.session() as connection:
+            rejected_audits = connection.execute(
+                "SELECT event_type FROM audit_log WHERE proposal_id = ? "
+                "AND event_type IN ('proposal_rejected', "
+                "'telegram_gateway_command')",
+                (proposal.proposal_id,),
+            ).fetchall()
+            survivor_claims = connection.execute(
+                "SELECT proposal_id FROM mutation_scope_claim"
+            ).fetchall()
+        self.assertEqual(len(rejected_audits), 2)
+        self.assertEqual(
+            [str(row["proposal_id"]) for row in survivor_claims],
+            [survivor.proposal_id],
+        )
+        self.apply_mock.assert_not_called()
+        for constructor_mock in constructor_mocks:
+            constructor_mock.assert_not_called()
 
     def test_recovery_rejects_wiki_drift_before_notion_inspection(self) -> None:
         failed, _ = self.editable_proposal(status=ProposalStatus.FAILED)

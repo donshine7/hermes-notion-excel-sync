@@ -11,6 +11,7 @@ from notion_excel_sync.models import (
 )
 from notion_excel_sync.persistence.database import (
     MutationScopeConflict,
+    ProposalRejectionError,
     StateDatabase,
 )
 from notion_excel_sync.security.approval import ApprovalService
@@ -273,6 +274,123 @@ def test_rejection_and_success_release_the_scope(tmp_path) -> None:
         [_change("operation-replacement")],
     )
     assert replacement.proposal_id
+
+
+def test_atomic_reject_fails_closed_on_stale_head_and_revision(tmp_path) -> None:
+    database, proposals = _database(tmp_path)
+    proposal = proposals.create(
+        "v1",
+        "a" * 64,
+        "user",
+        "chat",
+        [_change("atomic-reject-operation")],
+    )
+    proposal = proposals.request_approval(proposal.proposal_id)
+    with database.session() as connection:
+        connection.execute(
+            "UPDATE proposal SET status = ? WHERE proposal_id = ?",
+            (ProposalStatus.STALE.value, proposal.proposal_id),
+        )
+
+    with pytest.raises(
+        ProposalRejectionError,
+        match="head and current revision are inconsistent",
+    ):
+        database.reject_proposal_atomically(
+            proposal.proposal_id,
+            expected_revision=proposal.revision,
+            actor="user",
+            chat_id="chat",
+        )
+    with database.session() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE proposal_id = ? "
+                "AND event_type = 'proposal_rejected'",
+                (proposal.proposal_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        connection.execute(
+            "UPDATE proposal SET status = ? WHERE proposal_id = ?",
+            (ProposalStatus.PENDING_APPROVAL.value, proposal.proposal_id),
+        )
+
+    with pytest.raises(
+        ProposalRejectionError,
+        match="current proposal revision",
+    ):
+        database.reject_proposal_atomically(
+            proposal.proposal_id,
+            expected_revision=proposal.revision + 1,
+            actor="user",
+            chat_id="chat",
+        )
+
+    database.reject_proposal_atomically(
+        proposal.proposal_id,
+        expected_revision=proposal.revision,
+        actor="user",
+        chat_id="chat",
+    )
+    with pytest.raises(
+        ProposalRejectionError,
+        match="cannot be rejected",
+    ):
+        database.reject_proposal_atomically(
+            proposal.proposal_id,
+            expected_revision=proposal.revision,
+            actor="user",
+            chat_id="chat",
+        )
+
+
+def test_atomic_reject_blocks_consumed_receipt_from_prior_revision(
+    tmp_path,
+) -> None:
+    database, proposals = _database(tmp_path)
+    proposal = proposals.create(
+        "v1",
+        "a" * 64,
+        "user",
+        "chat",
+        [_change("prior-receipt-operation")],
+    )
+    proposal = proposals.edit(
+        proposal.proposal_id,
+        proposal.operations[0].change.operation_id,
+        ProposalAction.EXCLUDE,
+    )
+    proposal = proposals.request_approval(proposal.proposal_id)
+    with database.session() as connection:
+        connection.execute(
+            "INSERT INTO approval_receipt("
+            "nonce, proposal_id, revision, payload, used_at, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "synthetic-prior-consumed-nonce",
+                proposal.proposal_id,
+                proposal.revision - 1,
+                "{}",
+                "2026-07-23T00:00:01+00:00",
+                "2026-07-23T00:00:00+00:00",
+            ),
+        )
+
+    with pytest.raises(
+        ProposalRejectionError,
+        match="consumed approval",
+    ):
+        database.reject_proposal_atomically(
+            proposal.proposal_id,
+            expected_revision=proposal.revision,
+            actor="user",
+            chat_id="chat",
+        )
+    assert (
+        database.load_proposal(proposal.proposal_id).status
+        is ProposalStatus.PENDING_APPROVAL
+    )
 
 
 def test_failed_proposal_retains_scope_for_recovery(tmp_path) -> None:

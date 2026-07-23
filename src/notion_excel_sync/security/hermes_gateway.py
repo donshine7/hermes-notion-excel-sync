@@ -48,6 +48,7 @@ from notion_excel_sync.models import (
 from notion_excel_sync.persistence.database import (
     CorrectionEventClaimError,
     MutationScopeConflict,
+    ProposalRejectionError,
     StateDatabase,
 )
 from notion_excel_sync.security.approval import ApprovalError, ApprovalService
@@ -1171,24 +1172,28 @@ def _handle_set_command(
 
 def _handle_reject_command(
     text: str,
-    config: AppConfig,
     database: StateDatabase,
     identity: TelegramEventIdentity,
+    command: ParsedProposalCommand | None = None,
 ) -> str:
-    command = _parse_proposal_command(text, _REJECT_RE)
+    command = command or _parse_proposal_command(text, _REJECT_RE)
     proposal = database.load_proposal(command.proposal_id)
     _validate_revision_binding(identity, proposal, command.revision)
-    _proposal_service(config, database).reject(
+    database.reject_proposal_atomically(
         proposal.proposal_id,
-        identity.user_id,
-        identity.chat_id,
-    )
-    _audit_gateway_command(
-        database,
-        REJECT_COMMAND,
-        identity,
-        proposal.proposal_id,
-        revision=proposal.revision,
+        expected_revision=command.revision,
+        actor=identity.user_id,
+        chat_id=identity.chat_id,
+        gateway_audit_details={
+            "command": REJECT_COMMAND,
+            "telegram_message_id": identity.message_id,
+            "telegram_update_id": identity.update_id,
+            "telegram_chat_id": identity.chat_id,
+            "telegram_chat_type": identity.chat_type,
+            "telegram_thread_id": identity.thread_id,
+            "telegram_event_timestamp": identity.event_timestamp,
+            "revision": proposal.revision,
+        },
     )
     return (
         f"[NX_PROPOSAL_REJECTED] {proposal.proposal_id} r{proposal.revision}. "
@@ -1314,6 +1319,8 @@ def _handle_nonapproval_command(
     config: AppConfig,
     database: StateDatabase,
     identity: TelegramEventIdentity,
+    *,
+    reject_command: ParsedProposalCommand | None = None,
 ) -> str:
     if command_name == SYNC_COMMAND:
         return _handle_sync_command(text, config, database, identity)
@@ -1322,7 +1329,12 @@ def _handle_nonapproval_command(
     if command_name == SET_COMMAND:
         return _handle_set_command(text, config, database, identity)
     if command_name == REJECT_COMMAND:
-        return _handle_reject_command(text, config, database, identity)
+        return _handle_reject_command(
+            text,
+            database,
+            identity,
+            reject_command,
+        )
     if command_name == RECOVER_COMMAND:
         return _handle_recover_command(text, config, database, identity)
     if command_name == CORRECT_COMMAND:
@@ -1661,6 +1673,8 @@ def _public_denial_message(exc: Exception) -> str:
         return "The Telegram correction event conflicts with an earlier request."
     if isinstance(exc, MutationScopeConflict):
         return "Another active proposal owns the same Notion mutation scope."
+    if isinstance(exc, ProposalRejectionError):
+        return "The proposal state transition was rejected."
     if isinstance(exc, NotionSchemaError):
         return "The Notion target or schema did not match the approved scope."
     if isinstance(exc, ProposalError):
@@ -2153,9 +2167,15 @@ def handle_pre_gateway_dispatch(
         return None
     text = str(text_value)
     approval_command: ParsedApprovalCommand | None = None
+    reject_command: ParsedProposalCommand | None = None
     if command_name == APPROVAL_COMMAND:
         try:
             approval_command = _parse_command(text)
+        except HermesGatewayApprovalError as exc:
+            return _denied("invalid_syntax", exc.public_message)
+    elif command_name == REJECT_COMMAND:
+        try:
+            reject_command = _parse_proposal_command(text, _REJECT_RE)
         except HermesGatewayApprovalError as exc:
             return _denied("invalid_syntax", exc.public_message)
 
@@ -2168,7 +2188,12 @@ def handle_pre_gateway_dispatch(
         config = load_config(config_path)
         _assert_project_authorized(identity, config)
         database = StateDatabase(config.state_db)
-        database.initialize()
+        try:
+            database.initialize()
+        except MutationScopeConflict:
+            if reject_command is None:
+                raise
+            database.initialize_for_legacy_rejection()
         if command_name in SCHEMA_COMMANDS:
             from notion_excel_sync.security.hermes_schema_gateway import (
                 handle_schema_command,
@@ -2182,6 +2207,7 @@ def handle_pre_gateway_dispatch(
                 config,
                 database,
                 identity,
+                reject_command=reject_command,
             )
 
         assert approval_command is not None
@@ -2264,6 +2290,7 @@ def handle_pre_gateway_dispatch(
         MutationScopeConflict,
         NotionSchemaError,
         ProposalError,
+        ProposalRejectionError,
     ) as exc:
         code = (
             "approval_rejected"

@@ -388,6 +388,10 @@ class MutationScopeConflict(RuntimeError):
     """Raised when another live proposal owns the same Notion property."""
 
 
+class ProposalRejectionError(RuntimeError):
+    """Raised when an atomic proposal rejection cannot be completed safely."""
+
+
 _HISTORY_DATABASE = "변경이력"
 _ACTIVE_MUTATION_CLAIM_STATUSES = frozenset(
     {
@@ -675,46 +679,64 @@ class StateDatabase:
         finally:
             connection.close()
 
+    @staticmethod
+    def _initialize_schema_and_migrations(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.executescript(SCHEMA)
+        proposal_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(proposal)"
+            ).fetchall()
+        }
+        if "purpose" not in proposal_columns:
+            connection.execute(
+                "ALTER TABLE proposal ADD COLUMN purpose TEXT NOT NULL "
+                f"DEFAULT '{EXCEL_SYNC_PURPOSE}'"
+            )
+        event_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(schema_gateway_event_claim)"
+            ).fetchall()
+        }
+        if "telegram_user_id" not in event_columns:
+            connection.execute(
+                "ALTER TABLE schema_gateway_event_claim ADD COLUMN "
+                "telegram_user_id TEXT NOT NULL DEFAULT ''"
+            )
+        journal_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(schema_apply_journal)"
+            ).fetchall()
+        }
+        if "attempt_started_at" not in journal_columns:
+            connection.execute(
+                "ALTER TABLE schema_apply_journal ADD COLUMN attempt_started_at TEXT"
+            )
+        if "attempt_finished_at" not in journal_columns:
+            connection.execute(
+                "ALTER TABLE schema_apply_journal ADD COLUMN attempt_finished_at TEXT"
+            )
+
     def initialize(self) -> None:
+        """Create/migrate state and fail closed while rebuilding active claims."""
+
         with self.session() as connection:
-            connection.executescript(SCHEMA)
-            proposal_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(proposal)"
-                ).fetchall()
-            }
-            if "purpose" not in proposal_columns:
-                connection.execute(
-                    "ALTER TABLE proposal ADD COLUMN purpose TEXT NOT NULL "
-                    f"DEFAULT '{EXCEL_SYNC_PURPOSE}'"
-                )
-            event_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(schema_gateway_event_claim)"
-                ).fetchall()
-            }
-            if "telegram_user_id" not in event_columns:
-                connection.execute(
-                    "ALTER TABLE schema_gateway_event_claim ADD COLUMN "
-                    "telegram_user_id TEXT NOT NULL DEFAULT ''"
-                )
-            journal_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(schema_apply_journal)"
-                ).fetchall()
-            }
-            if "attempt_started_at" not in journal_columns:
-                connection.execute(
-                    "ALTER TABLE schema_apply_journal ADD COLUMN attempt_started_at TEXT"
-                )
-            if "attempt_finished_at" not in journal_columns:
-                connection.execute(
-                    "ALTER TABLE schema_apply_journal ADD COLUMN attempt_finished_at TEXT"
-                )
+            self._initialize_schema_and_migrations(connection)
             self._backfill_active_mutation_scope_claims(connection)
+
+    def initialize_for_legacy_rejection(self) -> None:
+        """Create/migrate state without granting or rebuilding mutation claims.
+
+        The trusted gateway may call this only for an exact authenticated
+        rejection after normal initialization raised ``MutationScopeConflict``.
+        """
+
+        with self.session() as connection:
+            self._initialize_schema_and_migrations(connection)
 
     def _backfill_active_mutation_scope_claims(
         self,
@@ -1686,6 +1708,188 @@ class StateDatabase:
                     proposal.created_at.isoformat(),
                 ),
             )
+
+    def reject_proposal_atomically(
+        self,
+        proposal_id: str,
+        *,
+        expected_revision: int,
+        actor: str,
+        chat_id: str,
+        gateway_audit_details: dict[str, Any] | None = None,
+    ) -> ProposalRevision:
+        """Reject one exact proposal head without deriving mutation scopes."""
+
+        now = datetime.now().astimezone().isoformat()
+        with self.transaction() as connection:
+            head = connection.execute(
+                "SELECT * FROM proposal WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if head is None:
+                raise ProposalRejectionError("Proposal was not found")
+            current_revision = int(head["current_revision"])
+            if current_revision != expected_revision:
+                raise ProposalRejectionError(
+                    "Only the current proposal revision can be rejected"
+                )
+            if str(head["requested_by"]) != str(actor):
+                raise ProposalRejectionError(
+                    "Only the request owner can reject the proposal"
+                )
+            if str(head["chat_id"]) != str(chat_id):
+                raise ProposalRejectionError(
+                    "Proposal must be rejected from the original Telegram chat"
+                )
+
+            revision_row = connection.execute(
+                "SELECT digest, payload FROM proposal_revision "
+                "WHERE proposal_id = ? AND revision = ?",
+                (proposal_id, current_revision),
+            ).fetchone()
+            if revision_row is None:
+                raise ProposalRejectionError(
+                    "Current proposal revision is missing"
+                )
+            original_payload = str(revision_row["payload"])
+            stored_digest = str(revision_row["digest"])
+            try:
+                proposal = _proposal_from_dict(json.loads(original_payload))
+                head_status = ProposalStatus(str(head["status"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ProposalRejectionError(
+                    "Current proposal state is invalid"
+                ) from exc
+
+            expected_expires_at = (
+                proposal.expires_at.isoformat()
+                if proposal.expires_at is not None
+                else None
+            )
+            consistent = (
+                proposal.proposal_id == proposal_id
+                and proposal.revision == current_revision
+                and proposal.requested_by == str(head["requested_by"])
+                and proposal.chat_id == str(head["chat_id"])
+                and proposal.source_version_id
+                == str(head["source_version_id"])
+                and proposal.source_file_hash
+                == str(head["source_file_hash"])
+                and proposal.purpose.value == str(head["purpose"])
+                and proposal.status is head_status
+                and expected_expires_at == head["expires_at"]
+                and proposal.digest == stored_digest
+            )
+            if not consistent:
+                raise ProposalRejectionError(
+                    "Proposal head and current revision are inconsistent"
+                )
+            if head_status in {
+                ProposalStatus.APPLYING,
+                ProposalStatus.COMMITTED,
+                ProposalStatus.REJECTED,
+            }:
+                raise ProposalRejectionError(
+                    f"Proposal cannot be rejected in {head_status.value}"
+                )
+            if connection.execute(
+                "SELECT 1 FROM outbox WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone() is not None:
+                raise ProposalRejectionError(
+                    "A proposal with a started apply must be recovered and "
+                    "finalized before it can close"
+                )
+            if connection.execute(
+                "SELECT 1 FROM source_apply_lease "
+                "WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone() is not None:
+                raise ProposalRejectionError(
+                    "A proposal with an active apply lease must be recovered "
+                    "and finalized before it can close"
+                )
+            if connection.execute(
+                "SELECT 1 FROM approval_receipt WHERE proposal_id = ? "
+                "AND used_at IS NOT NULL LIMIT 1",
+                (proposal_id,),
+            ).fetchone() is not None:
+                raise ProposalRejectionError(
+                    "A proposal with a consumed approval must be recovered "
+                    "and finalized before it can close"
+                )
+
+            proposal.status = ProposalStatus.REJECTED
+            rejected_payload = json.dumps(
+                dataclass_to_dict(proposal),
+                ensure_ascii=False,
+            )
+            head_cursor = connection.execute(
+                "UPDATE proposal SET status = ? WHERE proposal_id = ? "
+                "AND current_revision = ? AND status = ? "
+                "AND requested_by = ? AND chat_id = ?",
+                (
+                    ProposalStatus.REJECTED.value,
+                    proposal_id,
+                    current_revision,
+                    head_status.value,
+                    str(actor),
+                    str(chat_id),
+                ),
+            )
+            revision_cursor = connection.execute(
+                "UPDATE proposal_revision SET payload = ? "
+                "WHERE proposal_id = ? AND revision = ? "
+                "AND digest = ? AND payload = ?",
+                (
+                    rejected_payload,
+                    proposal_id,
+                    current_revision,
+                    stored_digest,
+                    original_payload,
+                ),
+            )
+            if head_cursor.rowcount != 1 or revision_cursor.rowcount != 1:
+                raise ProposalRejectionError(
+                    "Proposal state changed before rejection completed"
+                )
+            connection.execute(
+                "DELETE FROM mutation_scope_claim WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            connection.execute(
+                "INSERT INTO audit_log("
+                "event_type, proposal_id, actor, details, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    "proposal_rejected",
+                    proposal_id,
+                    str(actor),
+                    json.dumps(
+                        {"revision": current_revision},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+            if gateway_audit_details is not None:
+                connection.execute(
+                    "INSERT INTO audit_log("
+                    "event_type, proposal_id, actor, details, created_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "telegram_gateway_command",
+                        proposal_id,
+                        str(actor),
+                        json.dumps(
+                            gateway_audit_details,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        now,
+                    ),
+                )
+        return proposal
 
     def load_proposal(self, proposal_id: str, revision: int | None = None) -> ProposalRevision:
         with self.session() as connection:
