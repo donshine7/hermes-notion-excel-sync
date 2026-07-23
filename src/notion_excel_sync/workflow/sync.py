@@ -55,7 +55,7 @@ class PreparationResult:
 
 
 class SyncPreparationService:
-    """Read OneDrive, analyze changed rows, and create a non-mutating proposal."""
+    """Read the configured source, analyze changed rows, and create a proposal."""
 
     def __init__(
         self,
@@ -90,12 +90,12 @@ class SyncPreparationService:
     ) -> tuple[DriveVersion, DriveVersion]:
         versions = self.onedrive.list_versions(drive_id, item_id)
         if not versions:
-            raise RuntimeError("OneDrive returned no retained workbook versions")
+            raise RuntimeError("Configured source returned no retained workbook versions")
         latest_time = max(item.last_modified_at for item in versions)
         latest = [item for item in versions if item.last_modified_at == latest_time]
         if len(latest) != 1:
             raise RuntimeError(
-                "OneDrive returned multiple current versions with the same timestamp"
+                "Configured source returned multiple current versions with the same timestamp"
             )
         current = latest[0]
         checkpoint = self.database.get_checkpoint(drive_id, item_id)
@@ -103,7 +103,7 @@ class SyncPreparationService:
             matching = [item for item in versions if item.id == checkpoint["version_id"]]
             if not matching:
                 raise RuntimeError(
-                    "The last committed OneDrive version is no longer retained; manual baseline "
+                    "The last committed source version is no longer retained; manual baseline "
                     "recovery is required"
                 )
             baseline = matching[0]
@@ -223,7 +223,7 @@ class SyncPreparationService:
             row_changes = diff_snapshots(baseline, current)
         _, current_after_download = self._versions(drive_id, item_id, initial_cutoff)
         if current_after_download.id != current_version.id:
-            raise RuntimeError("OneDrive source changed while the workbook was downloaded")
+            raise RuntimeError("Configured source changed while the workbook was read")
         if self.snapshot_observer is not None:
             self.snapshot_observer(current, full_reconcile)
         if not row_changes and not pending_changes:
@@ -630,7 +630,7 @@ class SyncPreparationService:
                         analyzer="provenance_tracker",
                         analyzer_version="1.0.0",
                         confidence=1.0,
-                        reason="변경 제안의 OneDrive·Excel 원본 위치를 보존합니다.",
+                        reason="변경 제안의 로컬·Excel 원본 위치를 보존합니다.",
                         source_refs=refs,
                     )
                 )

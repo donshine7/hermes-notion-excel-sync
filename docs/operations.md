@@ -21,6 +21,15 @@
 
 검증 중 원본, Wiki와 Notion을 변경하면 안 됩니다.
 
+플러그인 설치·갱신 후에는 프로젝트 아래의 개발용 스크립트가 아니라 보호된 launcher
+사본으로 Gateway를 재시작합니다.
+
+```powershell
+& (Join-Path $env:LOCALAPPDATA `
+  "hermes\secure-gateway-launcher\restart-hermes-gateway-secure.ps1") `
+  -ProjectRoot $PWD
+```
+
 ## 2. 최초 `/nx_sync`
 
 사용자가 새 Telegram 메시지로 `/nx_sync`를 보냅니다.
@@ -74,6 +83,17 @@
 
 수정·제외·보류는 항상 새 revision과 digest를 만듭니다. 이전 digest로는 승인할 수
 없습니다.
+
+검토 화면과 무관한 독립 정정은 엄격한 JSON 명령으로 요청합니다.
+
+```text
+/nx_correct {"database":"한국 특허 사건","entity_key":"SS-SYNTHETIC-001","property":"현재상태","value":"보류","reason":"합성 예시 확인","case_number":"SS-SYNTHETIC-001"}
+```
+
+이 단계는 현재 로컬 Excel 전체 해시와 현재 Notion 값을 읽어 별도 correction proposal을
+만들 뿐 원격 쓰기는 하지 않습니다. 표시된 새 revision과 digest를 `/nx_approve`로 다시
+승인한 뒤에만 Notion과 Wiki 보정 오버레이에 반영합니다. 독립 정정 완료는 Excel
+체크포인트를 전진시키지 않습니다.
 
 ## 5. 최종 승인과 반영
 

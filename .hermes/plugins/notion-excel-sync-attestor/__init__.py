@@ -485,6 +485,7 @@ _COMMANDS = frozenset(
         "/nx_set",
         "/nx_reject",
         "/nx_recover",
+        "/nx_correct",
         "/nx_approve",
         "/nx_schema_plan",
         "/nx_schema_show",
@@ -513,6 +514,8 @@ def _active_key(event: Any) -> str:
     parts = text.split()
     if parts and parts[0] == "/nx_sync":
         return "source-sync"
+    if parts and parts[0] == "/nx_correct":
+        return "correction\n" + hashlib.sha256(text.encode("utf-8")).hexdigest()
     if parts and parts[0] == "/nx_schema_plan":
         template = parts[1] if len(parts) >= 2 else "malformed"
         return "schema-plan\n" + template

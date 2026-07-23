@@ -14,6 +14,7 @@ from notion_excel_sync.models import (
     JsonValue,
     ProposalAction,
     ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
@@ -549,6 +550,150 @@ def decode_property(raw: Any, property_type: str) -> JsonValue:
     return raw.get(property_type)
 
 
+_CORRECTION_TARGET_KEYS = frozenset(
+    {
+        "version",
+        "database",
+        "data_source_id",
+        "entity_key",
+        "property",
+        "page_id",
+        "parent",
+    }
+)
+
+
+def _page_parent_identity(page: Mapping[str, Any]) -> dict[str, str]:
+    parent = page.get("parent")
+    if not isinstance(parent, Mapping):
+        raise NotionSchemaError("Correction target page has no parent binding")
+    parent_type = parent.get("type")
+    if parent_type not in {"data_source_id", "database_id"}:
+        raise NotionSchemaError("Correction target page has an unsupported parent")
+    parent_id = parent.get(str(parent_type))
+    if not isinstance(parent_id, str) or not parent_id.strip():
+        raise NotionSchemaError("Correction target page parent ID is missing")
+    return {"type": str(parent_type), "id": parent_id}
+
+
+def _assert_exact_page_binding(
+    page: Mapping[str, Any],
+    *,
+    page_id: str,
+    data_source_id: str,
+    title_property: str,
+    match_value: str,
+    label: str,
+) -> None:
+    if str(page.get("id") or "") != page_id:
+        raise NotionSchemaError(f"{label} page identity changed")
+    if page.get("archived") is True or page.get("in_trash") is True:
+        raise NotionSchemaError(f"{label} page is archived or in trash")
+    parent = _page_parent_identity(page)
+    if parent["id"] != data_source_id:
+        raise NotionSchemaError(f"{label} page belongs to another data source")
+    properties = page.get("properties")
+    if not isinstance(properties, Mapping):
+        raise NotionSchemaError(f"{label} page has no property values")
+    actual_match = decode_property(properties.get(title_property), "title")
+    if actual_match != match_value:
+        raise NotionSchemaError(f"{label} page title no longer matches its binding")
+
+
+def build_correction_target_binding(
+    page: Mapping[str, Any],
+    *,
+    database_name: str,
+    data_source_id: str,
+    entity_key: str,
+    property_name: str,
+) -> dict[str, JsonValue]:
+    """Bind an independent correction to one exact existing Notion page."""
+
+    page_id = page.get("id")
+    if not isinstance(page_id, str) or not page_id.strip():
+        raise NotionSchemaError("Correction target page ID is missing")
+    if not data_source_id.strip():
+        raise NotionSchemaError("Correction target data source ID is missing")
+    parent = _page_parent_identity(page)
+    if parent["id"] != data_source_id:
+        raise NotionSchemaError(
+            "Correction target page belongs to a different data source"
+        )
+    return {
+        "version": 1,
+        "database": database_name,
+        "data_source_id": data_source_id,
+        "entity_key": entity_key,
+        "property": property_name,
+        "page_id": page_id,
+        "parent": parent,
+    }
+
+
+def _validated_correction_target(
+    proposal: ProposalRevision,
+    operation: ProposalOperation,
+    data_source_id: str,
+) -> Mapping[str, Any]:
+    target = proposal.correction_binding.get("target")
+    if not isinstance(target, Mapping) or set(target) != _CORRECTION_TARGET_KEYS:
+        raise NotionSchemaError(
+            "Independent correction has no exact Notion page binding"
+        )
+    change = operation.change
+    expected = {
+        "version": 1,
+        "database": change.target_database,
+        "data_source_id": data_source_id,
+        "entity_key": change.entity_key,
+        "property": change.property_name,
+    }
+    if any(target.get(key) != value for key, value in expected.items()):
+        raise NotionSchemaError(
+            "Independent correction target differs from its approved operation"
+        )
+    page_id = target.get("page_id")
+    parent = target.get("parent")
+    if (
+        not isinstance(page_id, str)
+        or not page_id.strip()
+        or not isinstance(parent, Mapping)
+        or set(parent) != {"type", "id"}
+        or parent.get("type") not in {"data_source_id", "database_id"}
+        or not isinstance(parent.get("id"), str)
+        or not str(parent.get("id")).strip()
+        or parent.get("id") != data_source_id
+    ):
+        raise NotionSchemaError(
+            "Independent correction target binding is malformed"
+        )
+    return target
+
+
+def _assert_bound_correction_page(
+    page: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> None:
+    if str(page.get("id") or "") != target["page_id"]:
+        raise NotionSchemaError(
+            "Independent correction Notion page identity changed after approval"
+        )
+    if _page_parent_identity(page) != dict(target["parent"]):
+        raise NotionSchemaError(
+            "Independent correction Notion page parent changed after approval"
+        )
+
+
+def _correction_match_value(proposal: ProposalRevision) -> str:
+    case_number = proposal.correction_binding.get("case_number")
+    if not isinstance(case_number, str) or not case_number.strip():
+        raise NotionSchemaError(
+            "Independent correction has no exact title match binding"
+        )
+    return case_number
+
+
 def encode_property(
     value: JsonValue,
     property_type: str,
@@ -642,6 +787,27 @@ class ExactNotionMutationVerifier:
             definition = self.definitions[change.target_database]
             if data_source_id != self.data_source_ids[change.target_database]:
                 return False
+            if proposal.purpose is ProposalPurpose.USER_CORRECTION:
+                target = _validated_correction_target(
+                    proposal,
+                    operation,
+                    data_source_id,
+                )
+                if (
+                    precondition is None
+                    or precondition.page_id != target["page_id"]
+                ):
+                    return False
+            else:
+                mapping = self.database.get_entity_mapping(
+                    change.target_database,
+                    change.entity_key,
+                )
+                if mapping is not None and (
+                    precondition is None
+                    or precondition.page_id != mapping["notion_page_id"]
+                ):
+                    return False
             if (
                 match.property_name != definition.title_property
                 or match.property_type != "title"
@@ -683,6 +849,8 @@ class ExactNotionMutationVerifier:
         definition: DatabaseDefinition,
     ) -> str:
         change = operation.change
+        if proposal.purpose is ProposalPurpose.USER_CORRECTION:
+            return _correction_match_value(proposal)
         mapping = self.database.get_entity_mapping(
             change.target_database,
             change.entity_key,
@@ -774,9 +942,20 @@ class NotionCurrentValueReader:
                     else None
                 )
                 if mapping:
-                    page_cache[cache_key] = self.gateway.get_page(
-                        mapping["notion_page_id"]
+                    page = self.gateway.get_page(mapping["notion_page_id"])
+                    if not isinstance(page, Mapping):
+                        raise NotionSchemaError(
+                            "Mapped Notion page could not be read"
+                        )
+                    _assert_exact_page_binding(
+                        page,
+                        page_id=mapping["notion_page_id"],
+                        data_source_id=data_source_id,
+                        title_property=definition.title_property,
+                        match_value=mapping["match_value"],
+                        label="Mapped Notion",
                     )
+                    page_cache[cache_key] = page
                 else:
                     match_value = title_values.get(cache_key, entity_key)
                     page_cache[cache_key] = self.gateway.find_page(
@@ -907,6 +1086,8 @@ class ApprovedNotionWriter:
 
     def _match_value(self, database_name: str, entity_key: str) -> str:
         definition, _ = self._definition(database_name)
+        if self.proposal.purpose is ProposalPurpose.USER_CORRECTION:
+            return _correction_match_value(self.proposal)
         mapping = self.database.get_entity_mapping(database_name, entity_key)
         if mapping:
             return mapping["match_value"]
@@ -922,6 +1103,57 @@ class ApprovedNotionWriter:
             NotionMatch(definition.title_property, "title"),
             self._match_value(database_name, entity_key),
         )
+
+    def _operation_page(
+        self,
+        operation: ProposalOperation,
+    ) -> Mapping[str, Any] | None:
+        change = operation.change
+        if self.proposal.purpose is not ProposalPurpose.USER_CORRECTION:
+            definition, data_source_id = self._definition(
+                change.target_database
+            )
+            mapping = self.database.get_entity_mapping(
+                change.target_database,
+                change.entity_key,
+            )
+            if mapping is not None:
+                page = self.gateway.get_page(mapping["notion_page_id"])
+                if not isinstance(page, Mapping):
+                    raise NotionSchemaError(
+                        "Mapped Notion page could not be read"
+                    )
+                _assert_exact_page_binding(
+                    page,
+                    page_id=mapping["notion_page_id"],
+                    data_source_id=data_source_id,
+                    title_property=definition.title_property,
+                    match_value=mapping["match_value"],
+                    label="Mapped Notion",
+                )
+                return page
+            return self._find_page(change.target_database, change.entity_key)
+        definition, data_source_id = self._definition(change.target_database)
+        target = _validated_correction_target(
+            self.proposal,
+            operation,
+            data_source_id,
+        )
+        page = self.gateway.get_page(str(target["page_id"]))
+        if not isinstance(page, Mapping):
+            raise NotionSchemaError(
+                "Independent correction target page could not be read"
+            )
+        _assert_bound_correction_page(page, target)
+        _assert_exact_page_binding(
+            page,
+            page_id=str(target["page_id"]),
+            data_source_id=data_source_id,
+            title_property=definition.title_property,
+            match_value=_correction_match_value(self.proposal),
+            label="Independent correction target",
+        )
+        return page
 
     def _resolve_relations(
         self,
@@ -942,7 +1174,22 @@ class ApprovedNotionWriter:
             mapping = self.database.get_entity_mapping(target_database, key)
             if mapping:
                 page_id = mapping["notion_page_id"]
-                self.gateway.get_page(page_id)
+                target_definition, target_data_source_id = self._definition(
+                    target_database
+                )
+                page = self.gateway.get_page(page_id)
+                if not isinstance(page, Mapping):
+                    raise NotionSchemaError(
+                        "Mapped relation target page could not be read"
+                    )
+                _assert_exact_page_binding(
+                    page,
+                    page_id=page_id,
+                    data_source_id=target_data_source_id,
+                    title_property=target_definition.title_property,
+                    match_value=mapping["match_value"],
+                    label="Mapped relation target",
+                )
                 page_ids.append(page_id)
                 continue
             page = self._find_page(target_database, key)
@@ -986,7 +1233,7 @@ class ApprovedNotionWriter:
                 allow_planned=True,
             )
         encode_property(operation.approved_value, property_type, relation_ids)
-        page = self._find_page(change.target_database, change.entity_key)
+        page = self._operation_page(operation)
         raw_property = (
             page.get("properties", {}).get(change.property_name) if page else None
         )

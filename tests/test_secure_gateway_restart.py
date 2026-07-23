@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -375,6 +376,31 @@ class SecureGatewayRestartTest(unittest.TestCase):
         self.assertNotIn("argparse", worker)
         self.assertNotIn("write_text(", worker)
         self.assertNotIn("write_bytes(", worker)
+
+    def test_pinned_plugin_hashes_match_the_lf_repository_files(self) -> None:
+        tree = ast.parse(self.worker.read_text(encoding="utf-8"))
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "EXPECTED_PLUGIN_FILES"
+                for target in node.targets
+            )
+        )
+        expected = ast.literal_eval(assignment.value)
+        plugin_root = (
+            self.project_root
+            / ".hermes"
+            / "plugins"
+            / "notion-excel-sync-attestor"
+        )
+        observed = {
+            name: hashlib.sha256((plugin_root / name).read_bytes()).hexdigest()
+            for name in expected
+        }
+        self.assertEqual(observed, expected)
 
     def test_operations_docs_invoke_only_the_protected_launcher_copy(self) -> None:
         for relative in ("README.md", "docs/operations.md", "docs/configuration.md"):

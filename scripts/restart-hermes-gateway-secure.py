@@ -54,8 +54,8 @@ EXPECTED_HOST_REQUIREMENTS = {
     "portalocker": "==3.2.0",
 }
 EXPECTED_PLUGIN_FILES = {
-    "plugin.yaml": "f4e8ffc1caf9ff820a1c028b50bbaa7e9c53fcd47fad32eae9b2585b06e30f76",
-    "__init__.py": "f2ace76e6ec46cdceb0552656685bed737f17a695b3a28f9a1dacc1385959473",
+    "plugin.yaml": "9b0f7985a748e2afc0419282f465a18530e22325e91ab7c03b299681eb972599",
+    "__init__.py": "6777a4011d06b190fd54ed2613ff7dd04ee11b3d6e3bfbebb9b472bda85349d6",
 }
 MAX_TOKEN_BYTES = 512
 MIN_TOKEN_BYTES = 20

@@ -4,9 +4,11 @@ import pytest
 
 from notion_excel_sync.models import (
     ChangeKind,
+    CORRECTION_OVERLAY_RECOVERY_MODE,
     KnowledgeRef,
     ProposalAction,
     ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
@@ -240,17 +242,56 @@ def test_render_is_deterministic_and_does_not_change_digest_or_revision() -> Non
     assert "Notion과 Wiki는 아직 변경되지 않았습니다." in first
 
 
+def test_overlay_only_recovery_shows_completed_notion_write_and_only_approval() -> None:
+    recovered = operation(
+        "op-overlay-recovery",
+        current="접수",
+        proposed="진행",
+        action=ProposalAction.EXCLUDE,
+        refs=[],
+    )
+    recovered.approved_value = "진행"
+    recovered.user_override = True
+    revision = proposal([recovered])
+    revision.purpose = ProposalPurpose.USER_CORRECTION
+    revision.correction_binding = {
+        "recovery": {
+            "mode": CORRECTION_OVERLAY_RECOVERY_MODE,
+            "notion_writes": "already_done",
+        }
+    }
+
+    rendered = render_review_card_page(revision)
+
+    assert (
+        'Notion: 이전 승인에서 "진행" 반영 완료 '
+        "(이번 승인에서는 재실행하지 않음)"
+    ) in rendered
+    assert "이번 승인 대상: Wiki 승인 오버레이와 최종화 복구" in rendered
+    assert "이번 승인은 Notion을 다시 쓰지 않고 Wiki 승인 오버레이와 " in rendered
+    assert "최종화만 복구합니다." in rendered
+    assert '"접수" → "진행"' not in rendered
+    assert "/nx_set" not in rendered
+    assert "/nx_reject" not in rendered
+    assert f"/nx_approve P-SYNTHETIC 2 {revision.digest}" in rendered
+    assert "Notion과 Wiki는 아직 변경되지 않았습니다." not in rendered
+
+
 def test_orphan_history_is_reported_but_never_consumes_a_card() -> None:
     revision = proposal([history_operation("missing-operation", 1)])
 
     page = review_card_page(revision)
+    rendered = render_review_card_page(revision)
 
     assert page.total_cards == 0
     assert page.total_pages == 1
     assert page.cards == ()
     assert page.automatic_history_operations == 1
     assert page.unmerged_history_operations == 1
-    assert "검토할 논리 변경 카드가 없습니다." in render_review_card_page(revision)
+    assert page.approve_command is None
+    assert "검토할 논리 변경 카드가 없습니다." in rendered
+    assert "승인 불가" in rendered
+    assert "/nx_approve" not in rendered
 
 
 @pytest.mark.parametrize("page", [0, 2])

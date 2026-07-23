@@ -185,7 +185,7 @@ class ApprovalService:
             receipt.source_version_id != current_source_version_id
             or receipt.source_file_hash != current_source_file_hash
         ):
-            raise ApprovalError("OneDrive source changed after approval")
+            raise ApprovalError("Configured source changed after approval")
         if receipt.telegram_user_id != proposal.requested_by or receipt.chat_id != proposal.chat_id:
             raise ApprovalError("Approval routing context does not match the proposal")
         if consume:

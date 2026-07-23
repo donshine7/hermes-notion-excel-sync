@@ -104,6 +104,15 @@ UIDL과 Message-ID를 사용해 중복을 막습니다. `T0`보다 이전 메일
 쓰기 전에 속성 유형, select option, relation 대상과 현재값을 다시 검증합니다. 읽기 토큰과
 쓰기 토큰을 분리하며, 쓰기 토큰은 Gateway 보호 환경에만 둡니다.
 
+설치·설정 변경 뒤 재시작은 보호된 launcher 사본만 사용합니다. Notion 쓰기 토큰은
+마스킹 입력으로 전달되며 파일이나 명령행에 저장하지 않습니다.
+
+```powershell
+& (Join-Path $env:LOCALAPPDATA `
+  "hermes\secure-gateway-launcher\restart-hermes-gateway-secure.ps1") `
+  -ProjectRoot $PWD
+```
+
 필요한 논리 대상 예:
 
 - 한국 특허 사건

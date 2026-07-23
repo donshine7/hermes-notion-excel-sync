@@ -84,11 +84,19 @@ A user may request a correction during review or independently.
 - Require a separate exact Telegram approval.
 - After Notion confirms the approved value, append the same decision to the Wiki's
   approved overlay. Never rewrite the raw Wiki projection.
-- Bind the override to the source hash. If the source changes, surface a conflict
-  instead of silently carrying the override forward.
+- Bind the override to the cited source cells, not the whole workbook hash. Preserve it
+  across unrelated workbook edits, and surface a conflict when the cited source basis
+  changes.
 
-Do not invent a correction command. Use only the exact command and digest displayed
-by the installed gateway.
+For an independent correction, accept only this strict JSON command shape:
+
+```text
+/nx_correct {"database":"...","entity_key":"...","property":"...","value":...,"reason":"...","case_number":"..."}
+```
+
+`case_number` is optional; every other key is required. The request only prepares a
+correction proposal. Use the separate, exact `/nx_approve` command and digest displayed
+by the installed gateway for the write.
 
 ## Provision the government-support evidence database
 

@@ -39,6 +39,25 @@ class ApplyReport:
     committed: bool
 
 
+PUBLIC_APPLY_FAILURE_CODES = frozenset(
+    {
+        "blocked_after_failure",
+        "notion_write_failed",
+        "operation_failed",
+        "source_changed",
+        "wiki_overlay_failed",
+    }
+)
+
+
+def public_apply_failure_code(value: object) -> str:
+    """Return only a stable, non-sensitive apply failure reason code."""
+
+    if isinstance(value, str) and value in PUBLIC_APPLY_FAILURE_CODES:
+        return value
+    return "operation_failed"
+
+
 class ApprovalGatedApplyService:
     def __init__(
         self,
@@ -187,10 +206,19 @@ class ApprovalGatedApplyService:
             if state is WritePreconditionState.CONFLICT
         ]
         if stale:
-            proposal.status = ProposalStatus.STALE
+            # A fresh proposal has not consumed its approval nonce or entered
+            # the outbox, so a global preflight conflict is a clean STALE
+            # outcome.  An APPLYING proposal may already have durable remote
+            # writes (including a write whose acknowledgement was lost), and
+            # must retain its recovery scope instead of being closed as stale.
+            proposal.status = (
+                ProposalStatus.FAILED
+                if resuming
+                else ProposalStatus.STALE
+            )
             self.database.save_proposal(proposal)
             self.database.audit(
-                "proposal_stale",
+                "apply_failed" if resuming else "proposal_stale",
                 {"operations": stale},
                 proposal.proposal_id,
                 proposal.requested_by,
@@ -203,7 +231,9 @@ class ApprovalGatedApplyService:
                 source_version_guard is not None
                 and source_version_guard() != current_source_version_id
             ):
-                raise ApprovalError("OneDrive source changed immediately before a write")
+                raise ApprovalError(
+                    "The configured local source changed immediately before a write"
+                )
 
         verify_latest_source()
         # Perform the first per-write check before consuming the approval nonce
@@ -268,35 +298,48 @@ class ApprovalGatedApplyService:
                 self.database.heartbeat_apply_lease(lease_token)
                 self.database.mark_outbox(operation_id, "done")
                 report.applied.append(operation_id)
-            except Exception as exc:  # adapter errors are persisted and surfaced to Telegram
-                message = str(exc)
-                self.database.mark_outbox(operation_id, "failed", message)
-                report.failed[operation_id] = message
+            except Exception:
+                # Adapter and Notion response details can contain credentials,
+                # local paths, or user data.  Persist only a stable reason code.
+                reason_code = "notion_write_failed"
+                self.database.mark_outbox(operation_id, "failed", reason_code)
+                report.failed[operation_id] = reason_code
                 for remaining in pending_operations[operation_index + 1 :]:
                     remaining_id = remaining.change.operation_id
-                    blocked = "Not attempted after an earlier operation failed"
-                    self.database.mark_outbox(remaining_id, "blocked", blocked)
-                    report.failed[remaining_id] = blocked
+                    reason_code = "blocked_after_failure"
+                    self.database.mark_outbox(
+                        remaining_id,
+                        "blocked",
+                        reason_code,
+                    )
+                    report.failed[remaining_id] = reason_code
                 break
 
         if not report.failed:
             try:
                 verify_latest_source()
-            except ApprovalError as exc:
-                report.failed["__source__"] = str(exc)
+            except ApprovalError:
+                report.failed["__source__"] = "source_changed"
 
         if not report.failed and self.correction_overlay_publisher is not None:
             try:
                 self.correction_overlay_publisher(proposal, receipt)
-            except Exception as exc:
-                report.failed["__wiki_overlay__"] = str(exc)
+            except Exception:
+                report.failed["__wiki_overlay__"] = "wiki_overlay_failed"
 
         if report.failed:
             proposal.status = ProposalStatus.FAILED
             self.database.save_proposal(proposal)
             self.database.audit(
                 "apply_failed",
-                {"applied": report.applied, "failed": report.failed},
+                {
+                    "applied": report.applied,
+                    "failed_operations": sorted(report.failed),
+                    "failure_codes": {
+                        operation_id: public_apply_failure_code(reason)
+                        for operation_id, reason in report.failed.items()
+                    },
+                },
                 proposal.proposal_id,
                 proposal.requested_by,
             )

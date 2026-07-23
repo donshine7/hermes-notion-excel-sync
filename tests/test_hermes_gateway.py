@@ -17,6 +17,8 @@ from notion_excel_sync.knowledge.provider import AnalyzerKnowledgeProvider
 from notion_excel_sync.models import (
     ApprovalReceipt,
     ChangeKind,
+    ProposalAction,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
@@ -32,7 +34,11 @@ from notion_excel_sync.security.hermes_gateway import (
     _resolve_config_path,
     handle_pre_gateway_dispatch,
 )
-from notion_excel_sync.security.receipt_io import load_receipt
+from notion_excel_sync.security.receipt_io import (
+    ReceiptReferenceError,
+    load_receipt,
+    resolve_receipt_reference,
+)
 from notion_excel_sync.workflow.apply import ApplyReport
 from notion_excel_sync.workflow.notion_writer import NOTION_DEFINITIONS
 from notion_excel_sync.workflow.proposals import ProposalService
@@ -193,6 +199,14 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         assert row is not None
         return int(row["count"])
 
+    def receipt_path(self, marker_payload: dict[str, object]) -> Path:
+        reference = marker_payload["receipt_ref"]
+        self.assertIsInstance(reference, str)
+        return resolve_receipt_reference(
+            self.project_root / "data" / "receipts",
+            str(reference),
+        )
+
     def editable_proposal(self, *, status: ProposalStatus | None = None):
         database_name, definition = next(iter(NOTION_DEFINITIONS.items()))
         change = ProposedChange(
@@ -246,7 +260,14 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         receipt_files = list((self.project_root / "data" / "receipts").glob("*.json"))
         self.assertEqual(len(receipt_files), 1)
         marker_payload = self.marker_payload(marker)
-        self.assertEqual(marker_payload["receipt_file"], str(receipt_files[0]))
+        self.assertEqual(self.receipt_path(marker_payload), receipt_files[0])
+        self.assertNotIn("receipt_file", marker_payload)
+        self.assertNotIn(str(self.project_root), marker)
+        self.assertEqual(
+            marker_payload["failure_codes"],
+            {"__test__": "operation_failed"},
+        )
+        self.assertNotIn("remote apply intentionally skipped", marker)
         self.assertFalse(marker_payload["redelivered"])
         receipt = load_receipt(receipt_files[0])
         self.assertEqual(receipt.proposal_id, "P-1")
@@ -263,12 +284,15 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         self.assertEqual(audit["actor"], "123")
         self.assertEqual(details["telegram_message_id"], "42")
         self.assertEqual(details["telegram_update_id"], 314)
+        self.assertEqual(details["receipt_ref"], marker_payload["receipt_ref"])
+        self.assertNotIn("receipt_file", details)
+        self.assertNotIn(str(self.project_root), audit["details"])
         self.apply_mock.assert_called_once()
 
     def test_lost_success_marker_redelivers_same_receipt_without_reissuing(self) -> None:
         first_marker = self.handle(self.event())
         first_payload = self.marker_payload(first_marker)
-        first_receipt = load_receipt(str(first_payload["receipt_file"]))
+        first_receipt = load_receipt(self.receipt_path(first_payload))
         replay = self.event()
         replay.source.message_id = "43"
         replay.platform_update_id = 315
@@ -276,9 +300,9 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         replay_marker = self.handle(replay)
 
         replay_payload = self.marker_payload(replay_marker)
-        replay_receipt = load_receipt(str(replay_payload["receipt_file"]))
+        replay_receipt = load_receipt(self.receipt_path(replay_payload))
         self.assertTrue(replay_payload["redelivered"])
-        self.assertEqual(replay_payload["receipt_file"], first_payload["receipt_file"])
+        self.assertEqual(replay_payload["receipt_ref"], first_payload["receipt_ref"])
         self.assertEqual(replay_receipt.nonce, first_receipt.nonce)
         self.assertEqual(replay_receipt.signature, first_receipt.signature)
         self.assertEqual(self.receipt_count(), 1)
@@ -294,7 +318,14 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         self.assertEqual(approved_count, 1)
         self.assertIsNotNone(redelivered)
         assert redelivered is not None
-        self.assertEqual(json.loads(redelivered["details"])["telegram_update_id"], 315)
+        redelivery_details = json.loads(redelivered["details"])
+        self.assertEqual(redelivery_details["telegram_update_id"], 315)
+        self.assertEqual(
+            redelivery_details["receipt_ref"],
+            first_payload["receipt_ref"],
+        )
+        self.assertNotIn("receipt_file", redelivery_details)
+        self.assertNotIn(str(self.project_root), redelivered["details"])
 
     def test_expired_receipt_redelivers_only_after_apply_has_started(self) -> None:
         approval = ApprovalService(
@@ -321,7 +352,7 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         marker = self.handle(self.event())
 
         payload = self.marker_payload(marker)
-        redelivered = load_receipt(str(payload["receipt_file"]))
+        redelivered = load_receipt(self.receipt_path(payload))
         self.assertTrue(payload["redelivered"])
         self.assertEqual(redelivered.nonce, receipt.nonce)
         self.assertLess(redelivered.expires_at, datetime.now(UTC))
@@ -597,6 +628,158 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         self.assertEqual(revised.operations[0].approved_value, "user-edited")
         self.assertIn(f"/nx_approve {proposal.proposal_id} 2 {revised.digest}", revised_marker)
 
+    def test_independent_correction_rejects_apply_and_defer_set_actions(self) -> None:
+        database_name, definition = next(iter(NOTION_DEFINITIONS.items()))
+        change = ProposedChange(
+            target_database=database_name,
+            entity_key="CASE-CORRECTION",
+            property_name=definition.title_property,
+            kind=ChangeKind.UPDATE,
+            current_value="old",
+            proposed_value="corrected",
+            analyzer="user_correction",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic independent correction",
+            source_refs=[],
+        )
+        service = ProposalService(self.database, ttl_seconds=1800)
+        proposal = service.create(
+            "source-v1",
+            "source-hash",
+            "123",
+            "chat",
+            [change],
+            purpose=ProposalPurpose.USER_CORRECTION,
+            correction_binding={
+                "version": 1,
+                "request_digest": "a" * 64,
+                "event_key": "synthetic-event",
+            },
+        )
+        proposal = service.request_approval(proposal.proposal_id)
+
+        for action in ("apply", "defer"):
+            with self.subTest(action=action):
+                denied = self.handle(
+                    FakeEvent(
+                        text=(
+                            f"/nx_set {proposal.proposal_id} 1 "
+                            f"{change.operation_id} {action}"
+                        ),
+                        source=FakeSource(),
+                    )
+                )
+                self.assertIn("code=command_rejected", denied)
+                self.assertIn("only edit or exclude", denied)
+                unchanged = self.database.load_proposal(proposal.proposal_id)
+                self.assertEqual(unchanged.revision, 1)
+                self.assertIs(
+                    unchanged.status,
+                    ProposalStatus.PENDING_APPROVAL,
+                )
+
+    def test_hidden_history_edit_and_orphan_approval_fail_closed(self) -> None:
+        database_name, definition = next(iter(NOTION_DEFINITIONS.items()))
+        main = ProposedChange(
+            target_database=database_name,
+            entity_key="CASE-HISTORY-BOUNDARY",
+            property_name=definition.title_property,
+            kind=ChangeKind.UPDATE,
+            current_value="old",
+            proposed_value="new",
+            analyzer="synthetic_analyzer",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic visible change",
+            source_refs=[],
+        )
+        history = ProposedChange(
+            target_database="변경이력",
+            entity_key=f"history:{main.operation_id}",
+            property_name="새값",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value="new",
+            analyzer="synthetic_history",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic generated history",
+            source_refs=[],
+        )
+        service = ProposalService(self.database, ttl_seconds=1800)
+        proposal = service.create(
+            "source-v1",
+            "source-hash",
+            "123",
+            "chat",
+            [main, history],
+        )
+        proposal = service.request_approval(proposal.proposal_id)
+
+        denied_edit = self.handle(
+            FakeEvent(
+                text=(
+                    f"/nx_set {proposal.proposal_id} 1 "
+                    f"{history.operation_id} exclude"
+                ),
+                source=FakeSource(),
+            )
+        )
+        self.assertIn("code=command_rejected", denied_edit)
+        self.assertIn(
+            "history operations cannot be edited directly",
+            denied_edit,
+        )
+        self.assertEqual(
+            self.database.load_proposal(proposal.proposal_id).revision,
+            1,
+        )
+
+        orphan = ProposedChange(
+            target_database="변경이력",
+            entity_key="history:missing-operation",
+            property_name="새값",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value="orphaned",
+            analyzer="synthetic_history",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic orphan history",
+            source_refs=[],
+        )
+        orphan_proposal = service.create(
+            "source-v2",
+            "source-hash-2",
+            "123",
+            "chat",
+            [orphan],
+        )
+        orphan_proposal.status = ProposalStatus.PENDING_APPROVAL
+        orphan_proposal.expires_at = datetime.now(UTC) + timedelta(minutes=15)
+        self.database.save_proposal(orphan_proposal)
+
+        shown = self.handle(
+            FakeEvent(
+                text=f"/nx_show {orphan_proposal.proposal_id} 1",
+                source=FakeSource(),
+            )
+        )
+        self.assertIn("승인 불가", shown)
+        self.assertNotIn("/nx_approve", shown)
+        denied_approval = self.handle(
+            FakeEvent(
+                text=(
+                    f"/nx_approve {orphan_proposal.proposal_id} 1 "
+                    f"{orphan_proposal.digest}"
+                ),
+                source=FakeSource(),
+            )
+        )
+        self.assertIn("code=approval_rejected", denied_approval)
+        self.assertIn("not displayed on a review card", denied_approval)
+
     def test_reject_and_recover_are_bound_gateway_commands(self) -> None:
         rejected_proposal, _ = self.editable_proposal()
         rejected = self.handle(
@@ -677,6 +860,231 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         unchanged = self.database.load_proposal(failed.proposal_id)
         self.assertEqual(unchanged.revision, 1)
         self.assertIs(unchanged.status, ProposalStatus.FAILED)
+
+    def test_completed_correction_recovery_tolerates_source_and_wiki_drift(
+        self,
+    ) -> None:
+        database_name, definition = next(iter(NOTION_DEFINITIONS.items()))
+        change = ProposedChange(
+            target_database=database_name,
+            entity_key="CASE-CORRECTION-RECOVERY",
+            property_name=definition.title_property,
+            kind=ChangeKind.UPDATE,
+            current_value="old",
+            proposed_value="corrected",
+            analyzer="user_correction",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic completed correction",
+            source_refs=[
+                SourceRef(
+                    "drive",
+                    "item",
+                    "source-v1",
+                    "source-hash",
+                    "Cases",
+                    3,
+                    "A3",
+                    "corrected",
+                )
+            ],
+        )
+        approval = ApprovalService(
+            secret=SECRET,
+            allowed_users={"123"},
+            nonce_used=self.database.nonce_used,
+            mark_nonce_used=self.database.mark_nonce_used,
+        )
+        service = ProposalService(
+            self.database,
+            approval,
+            ttl_seconds=1800,
+        )
+        proposal = service.create(
+            "source-v1",
+            "source-hash",
+            "123",
+            "chat",
+            [change],
+            purpose=ProposalPurpose.USER_CORRECTION,
+            knowledge_binding={"generation_digest": "old-wiki"},
+            correction_binding={
+                "version": 1,
+                "request_digest": "a" * 64,
+                "event_key": "synthetic-recovery-event",
+                "target": {
+                    "version": 1,
+                    "database": database_name,
+                    "data_source_id": "notion-data-source",
+                    "entity_key": change.entity_key,
+                    "property": change.property_name,
+                    "page_id": "synthetic-page",
+                    "parent": {
+                        "type": "data_source_id",
+                        "id": "notion-data-source",
+                    },
+                },
+            },
+        )
+        proposal = service.request_approval(proposal.proposal_id)
+        receipt = service.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        applying = self.database.load_proposal(proposal.proposal_id)
+        applying.status = ProposalStatus.APPLYING
+        self.database.begin_apply(applying, receipt.nonce)
+        self.database.mark_outbox(change.operation_id, "done")
+        failed = self.database.load_proposal(proposal.proposal_id)
+        failed.status = ProposalStatus.FAILED
+        self.database.save_proposal(failed)
+
+        wiki_guard = MagicMock(
+            side_effect=AssertionError("Wiki guard must not run")
+        )
+        notion_reader = MagicMock(
+            side_effect=AssertionError("Notion reader must not run")
+        )
+        with (
+            patch(
+                "notion_excel_sync.security.hermes_gateway._source_client",
+                return_value=object(),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._capture_current_source",
+                return_value=("source-v2", "new-source-hash"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._wiki_live_binding_guard",
+                wiki_guard,
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._notion_read_gateway",
+                notion_reader,
+            ),
+        ):
+            marker = self.handle(
+                FakeEvent(
+                    text=f"/nx_recover {proposal.proposal_id} 1",
+                    source=FakeSource(),
+                )
+            )
+
+        recovery = self.database.load_proposal(proposal.proposal_id)
+        self.assertIs(recovery.status, ProposalStatus.PENDING_APPROVAL)
+        self.assertEqual(recovery.revision, 2)
+        self.assertEqual(recovery.source_version_id, "source-v2")
+        self.assertEqual(recovery.source_file_hash, "new-source-hash")
+        self.assertEqual(recovery.knowledge_binding, {})
+        self.assertEqual(recovery.operations[0].change.source_refs, [])
+        self.assertIs(
+            recovery.operations[0].action,
+            ProposalAction.EXCLUDE,
+        )
+        self.assertIn("Wiki 승인 오버레이만 복구", marker)
+        self.assertIn("Notion 쓰기는 이전 승인에서 이미 완료", marker)
+        self.assertIn("Wiki 승인 오버레이와 최종화만 복구", marker)
+        self.assertNotIn('Notion: "old" → "corrected"', marker)
+        self.assertNotIn("/nx_set", marker)
+        self.assertNotIn("/nx_reject", marker)
+        self.assertNotIn(
+            "Notion과 Wiki는 아직 변경되지 않았습니다.",
+            marker,
+        )
+        self.assertIn(
+            f"/nx_approve {proposal.proposal_id} 2 {recovery.digest}",
+            marker,
+        )
+        for action in (
+            'edit "changed-again"',
+            "exclude",
+            "defer",
+            "apply",
+        ):
+            with self.subTest(action=action):
+                denied = self.handle(
+                    FakeEvent(
+                        text=(
+                            f"/nx_set {proposal.proposal_id} 2 "
+                            f"{change.operation_id} {action}"
+                        ),
+                        source=FakeSource(),
+                    )
+                )
+                self.assertIn("code=command_rejected", denied)
+                self.assertIn("cannot be revised", denied)
+        rejected = self.handle(
+            FakeEvent(
+                text=f"/nx_reject {proposal.proposal_id} 2",
+                source=FakeSource(),
+            )
+        )
+        self.assertIn("code=command_rejected", rejected)
+        self.assertIn("proposal state transition was rejected", rejected)
+        unchanged = self.database.load_proposal(proposal.proposal_id)
+        self.assertEqual(unchanged.revision, 2)
+        self.assertIs(unchanged.status, ProposalStatus.PENDING_APPROVAL)
+        with self.assertRaises(KeyError):
+            self.database.load_latest_receipt(
+                proposal.proposal_id,
+                recovery.revision,
+            )
+        wiki_guard.assert_not_called()
+        notion_reader.assert_not_called()
+
+    def test_pending_correction_recovery_keeps_strict_source_guard(self) -> None:
+        proposal, change = self.editable_proposal()
+        proposal.purpose = ProposalPurpose.USER_CORRECTION
+        proposal.operations[0].action = ProposalAction.EDIT
+        proposal.operations[0].user_override = True
+        proposal.correction_binding = {
+            "version": 1,
+            "request_digest": "b" * 64,
+            "event_key": "synthetic-pending-recovery",
+        }
+        proposal.status = ProposalStatus.FAILED
+        self.database.save_proposal(proposal)
+
+        wiki_guard = MagicMock()
+        notion_reader = MagicMock()
+        with (
+            patch(
+                "notion_excel_sync.security.hermes_gateway._source_client",
+                return_value=object(),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._capture_current_source",
+                return_value=("source-v2", "new-source-hash"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._wiki_live_binding_guard",
+                wiki_guard,
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._notion_read_gateway",
+                notion_reader,
+            ),
+        ):
+            denied = self.handle(
+                FakeEvent(
+                    text=f"/nx_recover {proposal.proposal_id} 1",
+                    source=FakeSource(),
+                )
+            )
+
+        self.assertIn("configured source changed", denied)
+        unchanged = self.database.load_proposal(proposal.proposal_id)
+        self.assertEqual(unchanged.revision, 1)
+        self.assertIs(unchanged.status, ProposalStatus.FAILED)
+        self.assertEqual(
+            unchanged.operations[0].change.operation_id,
+            change.operation_id,
+        )
+        wiki_guard.assert_not_called()
+        notion_reader.assert_not_called()
 
     def test_committed_result_redelivery_never_replays_apply(self) -> None:
         committed = self.database.load_proposal("P-1")
@@ -791,9 +1199,38 @@ class HermesGatewayApprovalTest(unittest.TestCase):
 
         marker = self.handle(event)
 
-        receipt_path = Path(str(self.marker_payload(marker)["receipt_file"]))
+        payload = self.marker_payload(marker)
+        receipt_path = self.receipt_path(payload)
         self.assertTrue(receipt_path.exists())
         self.assertNotIn(":", receipt_path.name)
+
+    def test_receipt_reference_rejects_path_traversal(self) -> None:
+        receipts = self.project_root / "data" / "receipts"
+        for reference in (
+            "../receipt.json",
+            r"C:\Users\private-user\receipt.json",
+            "nxr-" + ("a" * 63) + ".json",
+        ):
+            with self.subTest(reference=reference):
+                with self.assertRaises(ReceiptReferenceError):
+                    resolve_receipt_reference(receipts, reference)
+
+    def test_apply_error_marker_never_echoes_exception_or_local_path(self) -> None:
+        sensitive = (
+            r"C:\Users\private-user\AppData\Local\secret.txt "
+            "gateway-write-token=do-not-echo"
+        )
+        self.apply_mock.side_effect = RuntimeError(sensitive)
+
+        marker = self.handle(self.event())
+        payload = self.marker_payload(marker)
+
+        self.assertTrue(marker.startswith("[NX_SYNC_ERROR]"))
+        self.assertEqual(payload["error_code"], "apply_worker_failed")
+        self.assertNotIn("RuntimeError", marker)
+        self.assertNotIn("private-user", marker)
+        self.assertNotIn("gateway-write-token", marker)
+        self.assertNotIn(sensitive, marker)
 
     def test_plugin_prefers_explicit_project_root_when_copied(self) -> None:
         plugin_path = (
@@ -833,6 +1270,11 @@ class HermesGatewayApprovalTest(unittest.TestCase):
             "/nx_set P-1 1 op-1 exclude",
             "/nx_reject P-1 1",
             "/nx_recover P-1 1",
+            (
+                '/nx_correct {"database":"한국 특허 사건",'
+                '"entity_key":"SS-SYNTHETIC","property":"현재상태",'
+                '"value":"보류","reason":"합성 확인"}'
+            ),
             f"/nx_approve P-1 1 {self.proposal.digest}",
         ]
 

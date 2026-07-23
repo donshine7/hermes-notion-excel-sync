@@ -95,6 +95,14 @@ digest를 만들며, 최종 반영에는 다음 형식의 별도 Telegram 메시
 
 검토 중 수정뿐 아니라 독립적인 사용자 정정 요청도 별도 제안으로 처리합니다. 원본은
 바꾸지 않으며, 별도 승인을 받은 정정만 Notion과 Wiki의 승인 오버레이에 함께 반영합니다.
+독립 정정 요청 형식은 다음과 같습니다.
+
+```text
+/nx_correct {"database":"한국 특허 사건","entity_key":"SS-SYNTHETIC-001","property":"현재상태","value":"보류","reason":"합성 예시 확인","case_number":"SS-SYNTHETIC-001"}
+```
+
+이 명령 자체는 읽기와 proposal 생성만 수행합니다. 이후 Gateway가 표시한 정확한
+`/nx_approve`가 있어야 반영되며, 정정은 Excel 동기화 체크포인트를 전진시키지 않습니다.
 
 ## 빠른 시작
 
@@ -130,6 +138,15 @@ Copy-Item .\config\sync.example.json .\config\sync.local.json
 Notion 읽기 토큰은 보호된 Windows 자격 증명에 저장하고, 쓰기 토큰과 승인 서명 비밀은
 Hermes Gateway의 보호된 실행 환경에만 둡니다. 모델 프로세스에는 쓰기 자격 증명을
 전달하지 않습니다.
+
+플러그인 설치·갱신 뒤에는 보호된 launcher 사본으로 Gateway를 재시작합니다. 이 단계는
+Notion 쓰기 토큰을 마스킹 입력으로만 받고 파일이나 명령행에 저장하지 않습니다.
+
+```powershell
+& (Join-Path $env:LOCALAPPDATA `
+  "hermes\secure-gateway-launcher\restart-hermes-gateway-secure.ps1") `
+  -ProjectRoot $PWD
+```
 
 Notion 아래에 별도 스키마 생성이 필요한 경우에도 데이터 승인과 분리합니다.
 

@@ -341,6 +341,7 @@ def test_wiki_drift_after_a_partial_apply_is_failed_not_stale(workflow) -> None:
     database, approval, proposals = workflow
     second = deepcopy(proposed_change())
     second.operation_id = "operation-2"
+    second.property_name = "내부상태"
     proposal = proposals.create(
         "excel-etag",
         "excel-hash",

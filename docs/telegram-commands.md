@@ -15,6 +15,7 @@ Hermes의 `notion-excel-sync-attestor` 플러그인이 아래 명령을 Gateway�
 /nx_set <proposal-id> <revision> <operation-id> edit <strict-JSON-value>
 /nx_reject <proposal-id> <revision>
 /nx_recover <proposal-id> <revision>
+/nx_correct {"database":"...","entity_key":"...","property":"...","value":...,"reason":"...","case_number":"..."}
 /nx_approve <proposal-id> <revision> <full-64-character-digest>
 ```
 
@@ -43,15 +44,24 @@ Notion은 준비, 표시, 수정, 거절 또는 복구 단계에서 변경되지
 이를 별도의 correction proposal로 만들고 다음 정보를 표시한 뒤 정확한 별도 승인을
 요구해야 합니다.
 
+```text
+/nx_correct {"database":"한국 특허 사건","entity_key":"SS-SYNTHETIC-001","property":"현재상태","value":"보류","reason":"합성 예시 확인","case_number":"SS-SYNTHETIC-001"}
+```
+
+`case_number`만 선택 항목이며 나머지는 필수입니다. 허용되지 않은 키, 중복 키, 빈 문자열,
+NaN/Infinity 또는 과도하게 큰·깊은 JSON은 거부합니다. 이 명령은 현재 로컬 Excel 해시,
+현재 Notion 값과 정확한 대상 schema를 읽어 proposal을 만들 뿐, Notion이나 Wiki를
+변경하지 않습니다.
+
 - 사건과 대상 property
 - 현재 Notion 값과 정정값
 - 정정 근거
 - Wiki 오버레이 영향
 - proposal revision과 전체 digest
 
-승인된 정정은 원본 파일을 바꾸지 않고 Notion과 Wiki 오버레이에 함께 반영합니다. 실제
-명령 이름과 형식은 설치된 Gateway가 표시한 값을 그대로 사용하며, 문서에 없는
-`/nx_*` 명령을 임의로 만들지 않습니다.
+승인된 정정은 원본 파일을 바꾸지 않고 Notion과 Wiki 오버레이에 함께 반영하며 Excel
+동기화 체크포인트를 전진시키지 않습니다. Gateway가 발급한 proposal의 정확한
+`/nx_approve` 명령을 새 Telegram 메시지로 보내야 합니다.
 
 ## Notion schema provisioning
 

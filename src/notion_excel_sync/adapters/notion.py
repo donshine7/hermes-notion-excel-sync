@@ -553,7 +553,11 @@ class InMemoryNotionGateway:
             now=self._now,
         )
         with self._lock:
-            current = self.find_page(data_source_id, match, entity_key)
+            current = (
+                self.get_page(precondition.page_id)
+                if precondition is not None and precondition.page_id is not None
+                else self.find_page(data_source_id, match, entity_key)
+            )
             _check_precondition(current, precondition)
             if current is None:
                 if match.property_name not in properties:
@@ -990,7 +994,11 @@ class HttpNotionGateway:
             precondition,
             now=self._now,
         )
-        current = self.find_page(data_source_id, match, entity_key)
+        current = (
+            self.get_page(precondition.page_id)
+            if precondition is not None and precondition.page_id is not None
+            else self.find_page(data_source_id, match, entity_key)
+        )
         _check_precondition(current, precondition)
         if current is None:
             if match.property_name not in properties:
