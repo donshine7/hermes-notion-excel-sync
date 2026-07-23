@@ -46,6 +46,10 @@ from notion_excel_sync.workflow.local_wiki import (
     LOCAL_WIKI_DRIVE_ID,
     LocalWikiRefreshOrchestrator,
 )
+from notion_excel_sync.workflow.mail_ingestion import (
+    HiworksMailIngestionService,
+    HiworksMailIngestionStatus,
+)
 from notion_excel_sync.workflow.notion_writer import (
     ApprovedNotionWriter,
     ExactNotionMutationVerifier,
@@ -643,6 +647,36 @@ def _refresh_local_wiki_data(
         ) from exc
 
 
+def _refresh_hiworks_mail(
+    config: AppConfig,
+    database: StateDatabase,
+    identity: TelegramEventIdentity,
+    baseline: Mapping[str, Any] | None,
+) -> None:
+    """Publish only provably post-T0 Hiworks mail before Excel analysis starts."""
+
+    if baseline is None:
+        return
+    try:
+        result = HiworksMailIngestionService(
+            email=config.email,
+            wiki=config.wiki,
+            checkpoints=database,
+            secret_resolver=lambda name: config.secret(name),
+        ).ingest(actor=identity.user_id)
+        if result.status is HiworksMailIngestionStatus.COMPLETED:
+            logger.info(
+                "Hiworks Wiki generation ready: generation=%s messages=%s remaining=%s",
+                result.generation,
+                result.new_count,
+                result.remaining,
+            )
+    except Exception as exc:
+        raise HermesGatewayApprovalError(
+            "Hiworks Wiki refresh failed; Excel and Notion processing did not start"
+        ) from exc
+
+
 def _source_client(
     config: AppConfig,
     database: StateDatabase,
@@ -763,6 +797,7 @@ def _prepare_authenticated_sync(
 ) -> PreparationResult:
     wiki_baseline = _ensure_local_wiki_baseline(config, database, identity)
     _refresh_local_wiki_data(config, database, identity, wiki_baseline)
+    _refresh_hiworks_mail(config, database, identity, wiki_baseline)
     source = _source_client(config, database)
     item = source.get_item(config.onedrive.drive_id, config.onedrive.item_id)
     data_sources = _configured_data_sources(config, database)

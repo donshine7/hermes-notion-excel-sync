@@ -25,6 +25,7 @@ def _message(
     subject: str = "검토 요청",
     body: str = "본문",
     attachment: tuple[str, bytes] | None = None,
+    date_header: str | None = "Wed, 08 Jul 2026 10:30:00 +0900",
 ) -> bytes:
     message = EmailMessage()
     message["From"] = "Sender <sender@example.com>"
@@ -32,7 +33,8 @@ def _message(
     message["Cc"] = "Reviewer <reviewer@example.com>"
     message["Subject"] = subject
     message["Message-ID"] = message_id
-    message["Date"] = "Wed, 08 Jul 2026 10:30:00 +0900"
+    if date_header is not None:
+        message["Date"] = date_header
     message.set_content(body)
     if attachment is not None:
         filename, payload = attachment
@@ -404,6 +406,47 @@ def test_messages_before_command_time_baseline_are_not_retrieved() -> None:
 
     assert session.calls == ["uidl", "list", "top:1:0", "close"]
     assert batch.messages[0].skip_reason == "before_baseline"
+    assert batch.messages[0].body_loaded is False
+    assert batch.checkpoint.seen_uidls == ("uid-1",)
+
+
+@pytest.mark.parametrize(
+    ("date_header", "baseline", "skip_reason"),
+    [
+        (
+            "Wed, 08 Jul 2026 10:30:00 +0900",
+            datetime(2026, 7, 8, 1, 30, tzinfo=UTC),
+            "before_baseline",
+        ),
+        (
+            None,
+            datetime(2026, 7, 8, 1, 29, tzinfo=UTC),
+            "unverifiable_timestamp",
+        ),
+    ],
+)
+def test_only_mail_proven_after_t0_can_be_retrieved(
+    date_header: str | None,
+    baseline: datetime,
+    skip_reason: str,
+) -> None:
+    session = FakePop3Session(
+        {
+            1: _message(
+                message_id="<bounded@example.com>",
+                body="must not be retrieved",
+                date_header=date_header,
+            )
+        }
+    )
+
+    batch = HiworksIncrementalMailReader(
+        lambda: session,
+        max_message_bytes=100_000,
+    ).collect(sent_after=baseline)
+
+    assert session.calls == ["uidl", "list", "top:1:0", "close"]
+    assert batch.messages[0].skip_reason == skip_reason
     assert batch.messages[0].body_loaded is False
     assert batch.checkpoint.seen_uidls == ("uid-1",)
 
