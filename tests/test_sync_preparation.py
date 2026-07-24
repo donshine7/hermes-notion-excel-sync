@@ -25,6 +25,37 @@ from notion_excel_sync.workflow.proposals import ProposalService
 from notion_excel_sync.workflow.sync import SyncPreparationService
 
 
+def test_proposal_batch_keeps_pages_atomic_and_stages_a_bounded_suffix() -> None:
+    changes = [
+        ProposedChange(
+            target_database="Synthetic",
+            entity_key=f"entity-{entity:03d}",
+            property_name=f"property-{property_index:02d}",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value=f"value-{entity}-{property_index}",
+            analyzer="synthetic",
+            analyzer_version="1",
+            confidence=1.0,
+            reason="synthetic batching fixture",
+            source_refs=[],
+            operation_id=f"operation-{entity:03d}-{property_index:02d}",
+        )
+        for property_index in range(20)
+        for entity in range(30)
+    ]
+
+    selected, staged = SyncPreparationService._proposal_batch(changes)
+    selected_entities = {item.entity_key for item in selected}
+    staged_entities = {item.entity_key for item in staged}
+
+    assert len(selected) == 500
+    assert len(staged) == 100
+    assert len(selected_entities) == 25
+    assert len(staged_entities) == 5
+    assert selected_entities.isdisjoint(staged_entities)
+
+
 class FakeOneDrive:
     def __init__(self, content: bytes) -> None:
         self.content = content

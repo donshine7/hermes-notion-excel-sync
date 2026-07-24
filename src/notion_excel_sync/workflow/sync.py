@@ -53,12 +53,15 @@ class PreparationResult:
     checkpoint_advanced: bool = False
     wiki_generation_digest: str | None = None
     wiki_shadow_hits: int = 0
+    pending_staged: int = 0
 
 
 _NOTION_TITLE_TEXT_LIMIT = 2_000
 _REVIEW_IDENTITY_VERSION = 2
 _REVIEW_TITLE_DIGEST_LENGTH = 16
 _REVIEW_LOCATOR_LIMIT = 96
+_PROPOSAL_BATCH_MAX_ENTITIES = 25
+_PROPOSAL_BATCH_MAX_OPERATIONS = 500
 
 
 def _source_ref_identity(ref: SourceRef) -> dict[str, object]:
@@ -536,16 +539,17 @@ class SyncPreparationService:
                 checkpoint_advanced=full_reconcile,
             )
 
+        proposal_changes, staged_pending = self._proposal_batch(all_changes)
         proposal = self.proposals.create(
             source_version_id=current.version_id,
             source_file_hash=current.file_hash,
             requested_by=requested_by,
             chat_id=chat_id,
-            changes=all_changes,
+            changes=proposal_changes,
             defer_databases=(
                 {
                     change.target_database
-                    for change in all_changes
+                    for change in proposal_changes
                     if change.target_database not in self.available_data_sources
                 }
                 if self.available_data_sources is not None
@@ -553,7 +557,7 @@ class SyncPreparationService:
             ),
             notion_binding=(
                 build_notion_binding(
-                    all_changes,
+                    proposal_changes,
                     self.data_source_ids,
                     schema_provider=self.notion_schema_provider,
                 )
@@ -562,9 +566,10 @@ class SyncPreparationService:
             ),
             knowledge_binding=(
                 knowledge.binding
-                if any(change.knowledge_refs for change in all_changes)
+                if any(change.knowledge_refs for change in proposal_changes)
                 else None
             ),
+            staged_pending_changes=staged_pending,
         )
         proposal = self.proposals.request_approval(proposal.proposal_id)
         self.database.audit(
@@ -574,6 +579,7 @@ class SyncPreparationService:
                 "current": current.version_id,
                 "row_changes": len(row_changes),
                 "operations": len(proposal.operations),
+                "staged_pending_operations": len(staged_pending),
                 "wiki_generation_digest": knowledge.binding.get(
                     "generation_digest", ""
                 ),
@@ -595,6 +601,7 @@ class SyncPreparationService:
                 else None
             ),
             wiki_shadow_hits=sum(knowledge.shadow_counts.values()),
+            pending_staged=len(staged_pending),
         )
 
     def _build_evidence_context(
@@ -1001,6 +1008,36 @@ class SyncPreparationService:
                     )
                 )
         return result
+
+    @staticmethod
+    def _proposal_batch(
+        changes: list[ProposedChange],
+    ) -> tuple[list[ProposedChange], list[ProposedChange]]:
+        """Return one reviewable page-atomic prefix and its durable backlog."""
+
+        grouped: dict[tuple[str, str], list[ProposedChange]] = {}
+        for change in changes:
+            grouped.setdefault(
+                (change.target_database, change.entity_key),
+                [],
+            ).append(change)
+
+        selected: list[ProposedChange] = []
+        staged: list[ProposedChange] = []
+        selected_entities = 0
+        boundary_reached = False
+        for group in grouped.values():
+            if not boundary_reached and selected and (
+                selected_entities >= _PROPOSAL_BATCH_MAX_ENTITIES
+                or len(selected) + len(group) > _PROPOSAL_BATCH_MAX_OPERATIONS
+            ):
+                boundary_reached = True
+            if boundary_reached:
+                staged.extend(group)
+                continue
+            selected.extend(group)
+            selected_entities += 1
+        return selected, staged
 
     @staticmethod
     def _sort_changes(changes: list[ProposedChange]) -> list[ProposedChange]:

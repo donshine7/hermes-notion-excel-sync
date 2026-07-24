@@ -873,7 +873,14 @@ def _handle_sync_command(
         revision=result.proposal.revision,
         digest=result.proposal.digest,
     )
-    return _proposal_screen(result.proposal, prefix="NX_SYNC_PROPOSAL_READY")
+    screen = _proposal_screen(result.proposal, prefix="NX_SYNC_PROPOSAL_READY")
+    if result.pending_staged:
+        screen += (
+            "\n[NX_SYNC_BATCH] "
+            f"review_operations={len(result.proposal.operations)} "
+            f"remaining_operations={result.pending_staged}"
+        )
+    return screen
 
 
 def _correction_proposal_id(

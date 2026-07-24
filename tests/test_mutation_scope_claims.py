@@ -159,6 +159,44 @@ def test_large_scope_precomputation_and_sync_use_constant_select_passes(
         )
 
 
+def test_proposal_creation_atomically_stages_review_backlog(tmp_path) -> None:
+    database, proposals = _database(tmp_path)
+    staged = [
+        _change(
+            f"staged-{index}",
+            entity_key=f"SS-STAGED-{index:03d}",
+        )
+        for index in range(3)
+    ]
+
+    proposal = proposals.create(
+        "v1",
+        "a" * 64,
+        "user",
+        "chat",
+        [_change("selected", entity_key="SS-SELECTED")],
+        staged_pending_changes=staged,
+    )
+
+    pending = database.load_pending_operations()
+    assert len(proposal.operations) == 1
+    assert [item.change.operation_id for item in pending] == [
+        "staged-0",
+        "staged-1",
+        "staged-2",
+    ]
+    assert all(item.action is ProposalAction.DEFER for item in pending)
+    with database.session() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM mutation_scope_claim "
+                "WHERE proposal_id = ?",
+                (proposal.proposal_id,),
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_large_foreign_claim_owner_is_loaded_and_indexed_once(
     tmp_path,
     monkeypatch,

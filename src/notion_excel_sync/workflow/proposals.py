@@ -86,6 +86,7 @@ class ProposalService:
         purpose: ProposalPurpose = ProposalPurpose.EXCEL_SYNC,
         proposal_id: str | None = None,
         correction_binding: dict[str, object] | None = None,
+        staged_pending_changes: Iterable[ProposedChange] = (),
     ) -> ProposalRevision:
         deferred = defer_databases or set()
         change_list = list(changes)
@@ -229,12 +230,17 @@ class ProposalService:
                 in retained_override_operation_ids
             ):
                 self._cascade_history(proposal, operation)
-        self.database.save_proposal(proposal)
+        staged_pending = list(staged_pending_changes)
+        self.database.save_proposal(
+            proposal,
+            staged_pending_changes=staged_pending,
+        )
         self.database.audit(
             "proposal_created",
             {
                 "revision": 1,
                 "operations": len(proposal.operations),
+                "staged_pending_operations": len(staged_pending),
                 "deferred_unavailable_databases": sorted(deferred),
                 "digest": proposal.digest,
                 "purpose": proposal.purpose.value,

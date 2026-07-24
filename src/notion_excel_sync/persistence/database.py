@@ -2311,8 +2311,14 @@ class StateDatabase:
                 ),
             )
 
-    def save_proposal(self, proposal: ProposalRevision) -> None:
+    def save_proposal(
+        self,
+        proposal: ProposalRevision,
+        *,
+        staged_pending_changes: Iterable[ProposedChange] = (),
+    ) -> None:
         payload = json.dumps(dataclass_to_dict(proposal), ensure_ascii=False)
+        pending_changes = list(staged_pending_changes)
         now = datetime.now().astimezone().isoformat()
         with self.transaction() as connection:
             connection.execute(
@@ -2361,6 +2367,35 @@ class StateDatabase:
                     proposal.created_at.isoformat(),
                 ),
             )
+            for change in pending_changes:
+                operation = ProposalOperation(
+                    change=change,
+                    action=ProposalAction.DEFER,
+                    approved_value=change.proposed_value,
+                )
+                operation_payload = json.dumps(
+                    dataclass_to_dict(operation),
+                    ensure_ascii=False,
+                    default=str,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO pending_change(
+                        operation_id, proposal_id, payload, created_at, resolved_at
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    ON CONFLICT(operation_id) DO UPDATE SET
+                        proposal_id = excluded.proposal_id,
+                        payload = excluded.payload,
+                        created_at = excluded.created_at,
+                        resolved_at = NULL
+                    """,
+                    (
+                        change.operation_id,
+                        proposal.proposal_id,
+                        operation_payload,
+                        now,
+                    ),
+                )
 
     def reject_proposal_atomically(
         self,
