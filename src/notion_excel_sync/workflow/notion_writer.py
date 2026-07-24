@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from notion_excel_sync.adapters.notion import (
     NotionGateway,
     NotionMatch,
     NotionPrecondition,
+    NotionPropertyMutation,
 )
 from notion_excel_sync.models import (
     ApprovalReceipt,
@@ -20,6 +21,7 @@ from notion_excel_sync.models import (
     ProposedChange,
     WritePreconditionState,
     canonical_json,
+    sha256_json,
 )
 from notion_excel_sync.persistence.database import StateDatabase
 from notion_excel_sync.security.approval import ApprovalService
@@ -739,6 +741,122 @@ class ExactNotionMutationVerifier:
         self.database = database
         self.data_source_ids = data_source_ids
         self.definitions = definitions
+        self._proposal: ProposalRevision | None = None
+        self._operations: dict[str, ProposalOperation] = {}
+        self._title_values: dict[tuple[str, str], JsonValue] = {}
+        self._outbox: dict[str, str] | None = None
+        self._batch_operation_ids: set[str] | None = None
+        self._verified_receipts: set[tuple[str, int, str, str]] = set()
+        self._consumed_operation_ids: set[str] = set()
+        self._binding_verified = False
+        self._mapping_cache: dict[
+            tuple[str, str],
+            dict[str, str] | None,
+        ] = {}
+
+    def begin_batch_verification(self, operation_ids: Sequence[str]) -> None:
+        items = tuple(operation_ids)
+        if (
+            not items
+            or any(not item.strip() for item in items)
+            or len(set(items)) != len(items)
+        ):
+            raise NotionSchemaError("Approved mutation batch is malformed")
+        self._batch_operation_ids = set(items)
+        self._outbox = None
+        self._mapping_cache.clear()
+
+    def end_batch_verification(
+        self,
+        operation_ids: Sequence[str],
+        *,
+        verified: bool,
+    ) -> None:
+        del verified
+        if self._batch_operation_ids != set(operation_ids):
+            raise NotionSchemaError("Approved mutation batch scope changed")
+        self._batch_operation_ids = None
+
+    def _load_proposal(self, receipt: ApprovalReceipt) -> ProposalRevision:
+        if self._proposal is None:
+            proposal = self.database.load_proposal(
+                receipt.proposal_id,
+                receipt.revision,
+            )
+            self._proposal = proposal
+            self._operations = {
+                item.change.operation_id: item
+                for item in proposal.operations
+                if item.action in {ProposalAction.APPLY, ProposalAction.EDIT}
+            }
+            for item in self._operations.values():
+                definition = self.definitions.get(
+                    item.change.target_database
+                )
+                if (
+                    definition is not None
+                    and item.change.property_name
+                    == definition.title_property
+                ):
+                    self._title_values[
+                        (
+                            item.change.target_database,
+                            item.change.entity_key,
+                        )
+                    ] = item.approved_value
+        proposal = self._proposal
+        if (
+            proposal.proposal_id != receipt.proposal_id
+            or proposal.revision != receipt.revision
+        ):
+            raise NotionSchemaError("Approval receipt targets another proposal")
+        return proposal
+
+    def _mapping(
+        self,
+        database_name: str,
+        entity_key: str,
+    ) -> dict[str, str] | None:
+        key = (database_name, entity_key)
+        if key not in self._mapping_cache:
+            self._mapping_cache[key] = self.database.get_entity_mapping(
+                database_name,
+                entity_key,
+            )
+        return self._mapping_cache[key]
+
+    @staticmethod
+    def _approved_schema_provider(
+        proposal: ProposalRevision,
+    ) -> NotionSchemaProvider | None:
+        databases = proposal.notion_binding.get("databases")
+        if not isinstance(databases, Mapping):
+            return None
+        schemas: dict[str, Mapping[str, Any]] = {}
+        for entry in databases.values():
+            if not isinstance(entry, Mapping):
+                continue
+            data_source_id = entry.get("data_source_id")
+            remote_properties = entry.get("remote_properties")
+            if (
+                isinstance(data_source_id, str)
+                and isinstance(remote_properties, Mapping)
+            ):
+                schemas[data_source_id] = {
+                    "properties": remote_properties,
+                }
+        if not schemas:
+            return None
+
+        def provider(data_source_id: str) -> Mapping[str, Any]:
+            try:
+                return schemas[data_source_id]
+            except KeyError as exc:
+                raise NotionSchemaError(
+                    "Approved Notion schema binding is incomplete"
+                ) from exc
+
+        return provider
 
     def __call__(
         self,
@@ -751,38 +869,53 @@ class ExactNotionMutationVerifier:
         precondition: NotionPrecondition | None,
     ) -> bool:
         try:
-            proposal = self.database.load_proposal(
-                receipt.proposal_id,
-                receipt.revision,
-            )
-            if not self.database.nonce_used(receipt.nonce):
+            proposal = self._load_proposal(receipt)
+            if (
+                self._batch_operation_ids is not None
+                and operation_id not in self._batch_operation_ids
+            ):
+                return False
+            if operation_id in self._consumed_operation_ids:
                 return False
             if proposal.status is not ProposalStatus.APPLYING:
                 return False
-            if (
-                self.database.outbox_status(
+            if self._outbox is None:
+                self._outbox = self.database.outbox_statuses(
                     proposal.proposal_id,
                     proposal.revision,
-                    operation_id,
                 )
-                != "pending"
-            ):
+            if self._outbox.get(operation_id) != "pending":
                 return False
-            if not self.approval.verify_operation_scope(
-                receipt, proposal, operation_id
-            ):
+            operation = self._operations.get(operation_id)
+            if operation is None:
                 return False
-            assert_notion_binding_matches(
-                proposal.notion_binding,
-                proposal.operations,
-                self.data_source_ids,
-                self.definitions,
+            receipt_key = (
+                receipt.proposal_id,
+                receipt.revision,
+                receipt.nonce,
+                receipt.signature,
             )
-            operation = next(
-                item
-                for item in proposal.operations
-                if item.change.operation_id == operation_id
-            )
+            if receipt_key not in self._verified_receipts:
+                if not self.database.nonce_used(receipt.nonce):
+                    return False
+                if not self.approval.verify_operation_scope(
+                    receipt,
+                    proposal,
+                    operation_id,
+                ):
+                    return False
+                self._verified_receipts.add(receipt_key)
+            if not self._binding_verified:
+                assert_notion_binding_matches(
+                    proposal.notion_binding,
+                    proposal.operations,
+                    self.data_source_ids,
+                    self.definitions,
+                    schema_provider=self._approved_schema_provider(
+                        proposal
+                    ),
+                )
+                self._binding_verified = True
             change = operation.change
             definition = self.definitions[change.target_database]
             if data_source_id != self.data_source_ids[change.target_database]:
@@ -799,7 +932,7 @@ class ExactNotionMutationVerifier:
                 ):
                     return False
             else:
-                mapping = self.database.get_entity_mapping(
+                mapping = self._mapping(
                     change.target_database,
                     change.entity_key,
                 )
@@ -835,10 +968,13 @@ class ExactNotionMutationVerifier:
                 or precondition.property_name != change.property_name
             ):
                 return False
-            return (
+            verified = (
                 decode_property(precondition.property_value, property_type)
                 == change.current_value
             )
+            if verified:
+                self._consumed_operation_ids.add(operation_id)
+            return verified
         except (KeyError, StopIteration, TypeError, ValueError):
             return False
 
@@ -851,22 +987,17 @@ class ExactNotionMutationVerifier:
         change = operation.change
         if proposal.purpose is ProposalPurpose.USER_CORRECTION:
             return _correction_match_value(proposal)
-        mapping = self.database.get_entity_mapping(
+        mapping = self._mapping(
             change.target_database,
             change.entity_key,
         )
         if mapping:
             return mapping["match_value"]
-        title_value = next(
+        title_value = self._title_values.get(
             (
-                item.approved_value
-                for item in proposal.operations
-                if item.action in {ProposalAction.APPLY, ProposalAction.EDIT}
-                and item.change.target_database == change.target_database
-                and item.change.entity_key == change.entity_key
-                and item.change.property_name == definition.title_property
-            ),
-            None,
+                change.target_database,
+                change.entity_key,
+            )
         )
         if title_value not in (None, ""):
             return str(title_value)
@@ -893,7 +1024,7 @@ class ExactNotionMutationVerifier:
         )
         page_ids: list[str] = []
         for logical_key in logical_keys:
-            mapping = self.database.get_entity_mapping(
+            mapping = self._mapping(
                 target_database,
                 str(logical_key),
             )
@@ -906,17 +1037,183 @@ class ExactNotionMutationVerifier:
 
 
 class NotionCurrentValueReader:
+    DEFAULT_BULK_READ_THRESHOLD = 20
+
     def __init__(
         self,
         gateway: NotionGateway,
         data_source_ids: Mapping[str, str],
         definitions: Mapping[str, DatabaseDefinition] = NOTION_DEFINITIONS,
         database: StateDatabase | None = None,
+        *,
+        bulk_read_threshold: int = DEFAULT_BULK_READ_THRESHOLD,
     ) -> None:
+        if isinstance(bulk_read_threshold, bool) or bulk_read_threshold < 1:
+            raise ValueError("bulk_read_threshold must be a positive integer")
         self.gateway = gateway
         self.data_source_ids = data_source_ids
         self.definitions = definitions
         self.database = database
+        self.bulk_read_threshold = bulk_read_threshold
+        # A reader is constructed once per authenticated prepare command.
+        # These caches intentionally live only for that reader instance so
+        # separate synchronization commands cannot reuse stale Notion state.
+        self._mapping_cache: dict[
+            tuple[str, str],
+            dict[str, Any] | None,
+        ] = {}
+        self._page_cache: dict[
+            tuple[str, str, str, str],
+            Mapping[str, Any] | None,
+        ] = {}
+        self._bulk_title_index: dict[
+            tuple[str, str, str],
+            dict[str, list[Mapping[str, Any]]],
+        ] = {}
+        self._unmapped_title_owner: dict[
+            tuple[str, str],
+            tuple[str, str],
+        ] = {}
+
+    def clear_cache(self) -> None:
+        """Discard the current prepare command's read snapshot."""
+
+        self._mapping_cache.clear()
+        self._page_cache.clear()
+        self._bulk_title_index.clear()
+        self._unmapped_title_owner.clear()
+
+    def _query_all_pages(
+        self,
+        data_source_id: str,
+    ) -> list[Mapping[str, Any]]:
+        query = (
+            self.gateway.query_database
+            if getattr(self.gateway, "uses_data_sources", True) is False
+            else self.gateway.query_data_source
+        )
+        pages = query(data_source_id, page_size=100)
+        if not isinstance(pages, list) or not all(
+            isinstance(page, Mapping) for page in pages
+        ):
+            raise NotionSchemaError(
+                "Notion bulk query returned an invalid page collection"
+            )
+        return pages
+
+    def _load_unmapped_group(
+        self,
+        database_name: str,
+        cache_keys: list[tuple[str, str]],
+        title_values: Mapping[tuple[str, str], str],
+        page_cache: dict[
+            tuple[str, str],
+            Mapping[str, Any] | None,
+        ],
+    ) -> None:
+        definition = self.definitions[database_name]
+        data_source_id = self.data_source_ids[database_name]
+        match_values = {
+            cache_key: title_values.get(cache_key, cache_key[1])
+            for cache_key in cache_keys
+        }
+        requested_by_title: dict[str, tuple[str, str]] = {}
+        pending: list[tuple[str, str]] = []
+        for cache_key, match_value in match_values.items():
+            previous = requested_by_title.get(match_value)
+            if previous is not None and previous != cache_key:
+                raise NotionSchemaError(
+                    "Multiple requested entities resolve to the same "
+                    "Notion title"
+                )
+            previous = self._unmapped_title_owner.get(
+                (database_name, match_value)
+            )
+            if previous is not None and previous != cache_key:
+                raise NotionSchemaError(
+                    "Multiple requested entities resolve to the same "
+                    "Notion title"
+                )
+            requested_by_title[match_value] = cache_key
+        for match_value, cache_key in requested_by_title.items():
+            self._unmapped_title_owner[
+                (database_name, match_value)
+            ] = cache_key
+
+        for cache_key, match_value in match_values.items():
+            resolution_key = (
+                database_name,
+                cache_key[1],
+                "title",
+                match_value,
+            )
+            if resolution_key in self._page_cache:
+                page_cache[cache_key] = self._page_cache[resolution_key]
+            else:
+                pending.append(cache_key)
+        if not pending:
+            return
+
+        bulk_key = (
+            database_name,
+            data_source_id,
+            definition.title_property,
+        )
+        if (
+            bulk_key not in self._bulk_title_index
+            and len(cache_keys) < self.bulk_read_threshold
+        ):
+            match = NotionMatch(definition.title_property, "title")
+            for cache_key in pending:
+                page = self.gateway.find_page(
+                    data_source_id,
+                    match,
+                    match_values[cache_key],
+                )
+                page_cache[cache_key] = page
+                self._page_cache[
+                    (
+                        database_name,
+                        cache_key[1],
+                        "title",
+                        match_values[cache_key],
+                    )
+                ] = page
+            return
+
+        if bulk_key not in self._bulk_title_index:
+            title_index: dict[str, list[Mapping[str, Any]]] = {}
+            for page in self._query_all_pages(data_source_id):
+                properties = page.get("properties")
+                if not isinstance(properties, Mapping):
+                    continue
+                title = decode_property(
+                    properties.get(definition.title_property),
+                    "title",
+                )
+                if not isinstance(title, str):
+                    continue
+                title_index.setdefault(title, []).append(page)
+            self._bulk_title_index[bulk_key] = title_index
+        title_index = self._bulk_title_index[bulk_key]
+
+        for cache_key in pending:
+            match_value = match_values[cache_key]
+            matches = title_index.get(match_value, [])
+            if len(matches) > 1:
+                raise NotionSchemaError(
+                    "Multiple Notion pages match a requested title"
+                )
+            page = matches[0] if matches else None
+            page_cache[cache_key] = page
+            self._page_cache[
+                (
+                    database_name,
+                    cache_key[1],
+                    "title",
+                    match_value,
+                )
+            ] = page
 
     def load(
         self,
@@ -925,6 +1222,7 @@ class NotionCurrentValueReader:
     ) -> dict[tuple[str, str, str], JsonValue]:
         result: dict[tuple[str, str, str], JsonValue] = {}
         page_cache: dict[tuple[str, str], Mapping[str, Any] | None] = {}
+        requested_properties: dict[tuple[str, str], set[str]] = {}
         for database, entity_key, property_name in keys:
             definition = self.definitions.get(database)
             data_source_id = self.data_source_ids.get(database)
@@ -935,39 +1233,80 @@ class NotionCurrentValueReader:
             ):
                 continue
             cache_key = (database, entity_key)
-            if cache_key not in page_cache:
-                mapping = (
-                    self.database.get_entity_mapping(database, entity_key)
+            requested_properties.setdefault(cache_key, set()).add(
+                property_name
+            )
+
+        unmapped_by_database: dict[str, list[tuple[str, str]]] = {}
+        for cache_key in requested_properties:
+            database_name, entity_key = cache_key
+            definition = self.definitions[database_name]
+            data_source_id = self.data_source_ids[database_name]
+            if cache_key not in self._mapping_cache:
+                self._mapping_cache[cache_key] = (
+                    self.database.get_entity_mapping(
+                        database_name,
+                        entity_key,
+                    )
                     if self.database
                     else None
                 )
-                if mapping:
-                    page = self.gateway.get_page(mapping["notion_page_id"])
-                    if not isinstance(page, Mapping):
-                        raise NotionSchemaError(
-                            "Mapped Notion page could not be read"
-                        )
-                    _assert_exact_page_binding(
-                        page,
-                        page_id=mapping["notion_page_id"],
-                        data_source_id=data_source_id,
-                        title_property=definition.title_property,
-                        match_value=mapping["match_value"],
-                        label="Mapped Notion",
-                    )
-                    page_cache[cache_key] = page
-                else:
-                    match_value = title_values.get(cache_key, entity_key)
-                    page_cache[cache_key] = self.gateway.find_page(
-                        data_source_id,
-                        NotionMatch(definition.title_property, "title"),
-                        match_value,
-                    )
-            page = page_cache[cache_key]
-            raw = page.get("properties", {}).get(property_name) if page else None
-            result[(database, entity_key, property_name)] = decode_property(
-                raw, definition.properties[property_name]
+            mapping = self._mapping_cache[cache_key]
+            if mapping is None:
+                unmapped_by_database.setdefault(
+                    database_name,
+                    [],
+                ).append(cache_key)
+                continue
+            resolution_key = (
+                database_name,
+                entity_key,
+                "page",
+                f"{mapping['notion_page_id']}\0{mapping['match_value']}",
             )
+            if resolution_key not in self._page_cache:
+                page = self.gateway.get_page(mapping["notion_page_id"])
+                if not isinstance(page, Mapping):
+                    raise NotionSchemaError(
+                        "Mapped Notion page could not be read"
+                    )
+                _assert_exact_page_binding(
+                    page,
+                    page_id=mapping["notion_page_id"],
+                    data_source_id=data_source_id,
+                    title_property=definition.title_property,
+                    match_value=mapping["match_value"],
+                    label="Mapped Notion",
+                )
+                self._page_cache[resolution_key] = page
+            page = self._page_cache[resolution_key]
+            page_cache[cache_key] = page
+
+        for database_name, cache_keys in unmapped_by_database.items():
+            self._load_unmapped_group(
+                database_name,
+                cache_keys,
+                title_values,
+                page_cache,
+            )
+
+        for cache_key, property_names in requested_properties.items():
+            database_name, entity_key = cache_key
+            definition = self.definitions[database_name]
+            page = page_cache[cache_key]
+            properties = page.get("properties") if page else None
+            for property_name in property_names:
+                raw = (
+                    properties.get(property_name)
+                    if isinstance(properties, Mapping)
+                    else None
+                )
+                result[
+                    (database_name, entity_key, property_name)
+                ] = decode_property(
+                    raw,
+                    definition.properties[property_name],
+                )
         return result
 
 
@@ -988,7 +1327,22 @@ class ApprovedNotionWriter:
         self.data_source_ids = data_source_ids
         self.definitions = definitions
         self.require_exact_schema = require_exact_schema
+        self._defer_live_schema = False
         self._schema_cache: dict[str, Mapping[str, Any] | None] = {}
+        self._binding_cache: set[str] = set()
+        self._mapping_cache: dict[
+            tuple[str, str],
+            dict[str, str] | None,
+        ] = {}
+        self._relation_validation_cache: dict[
+            tuple[str, str, str, str],
+            str,
+        ] = {}
+        self._planned_relation_misses: set[tuple[str, str]] = set()
+        self._mutated_pages: dict[
+            tuple[str, str],
+            tuple[str, bool],
+        ] = {}
         self._intents: dict[str, NotionPrecondition] = {}
         self._values: dict[tuple[str, str, str], JsonValue] = {}
         for operation in proposal.operations:
@@ -1009,17 +1363,78 @@ class ApprovedNotionWriter:
             raise NotionSchemaError(f"Missing Notion data source ID for: {database_name}")
         return self.definitions[database_name], self.data_source_ids[database_name]
 
-    def _assert_destination_binding(self, database_name: str) -> None:
+    def _schema(
+        self,
+        data_source_id: str,
+        *,
+        force_fresh: bool = False,
+    ) -> Mapping[str, Any]:
         getter = getattr(self.gateway, "get_data_source", None)
+        if getter is None:
+            raise NotionSchemaError("Notion gateway cannot read destination schema")
+        if force_fresh:
+            self._schema_cache.pop(data_source_id, None)
+        if data_source_id not in self._schema_cache:
+            self._schema_cache[data_source_id] = getter(data_source_id)
+        schema = self._schema_cache[data_source_id]
+        if not isinstance(schema, Mapping):
+            raise NotionSchemaError(
+                f"Notion returned no schema for data source {data_source_id}"
+            )
+        return schema
+
+    def _approved_bound_schema(
+        self,
+        data_source_id: str,
+    ) -> Mapping[str, Any] | None:
+        databases = self.proposal.notion_binding.get("databases")
+        if not isinstance(databases, Mapping):
+            return None
+        for entry in databases.values():
+            if (
+                isinstance(entry, Mapping)
+                and entry.get("data_source_id") == data_source_id
+                and isinstance(entry.get("remote_properties"), Mapping)
+            ):
+                return {"properties": entry["remote_properties"]}
+        return None
+
+    def begin_global_preflight(self) -> None:
+        """Use the approved schema projection until the forced live check."""
+
+        self._defer_live_schema = True
+        self._schema_cache.clear()
+        self._binding_cache.clear()
+
+    def _assert_destination_binding(
+        self,
+        database_name: str,
+        *,
+        force_fresh: bool = False,
+    ) -> None:
+        if force_fresh:
+            self._binding_cache.discard(database_name)
+        if database_name in self._binding_cache:
+            return
+        getter = getattr(self.gateway, "get_data_source", None)
+        if self._defer_live_schema:
+            provider = self._approved_bound_schema
+        else:
+            provider = (
+                (lambda data_source_id: self._schema(data_source_id))
+                if getter is not None
+                else None
+            )
         assert_notion_binding_matches(
             self.proposal.notion_binding,
             self.proposal.operations,
             self.data_source_ids,
             self.definitions,
-            schema_provider=getter,
+            schema_provider=provider,
             database_name=database_name,
             require_exact_schema=self.require_exact_schema,
         )
+        self._binding_cache.add(database_name)
 
     def _validate_remote_schema(
         self,
@@ -1029,15 +1444,14 @@ class ApprovedNotionWriter:
     ) -> None:
         definition, data_source_id = self._definition(database_name)
         getter = getattr(self.gateway, "get_data_source", None)
-        if getter is None:
+        if self._defer_live_schema:
+            schema = self._approved_bound_schema(data_source_id)
+            if schema is None:
+                return
+        elif getter is None:
             return
-        if data_source_id not in self._schema_cache:
-            self._schema_cache[data_source_id] = getter(data_source_id)
-        schema = self._schema_cache[data_source_id]
-        if not isinstance(schema, Mapping):
-            raise NotionSchemaError(
-                f"Notion returned no schema for data source {data_source_id}"
-            )
+        else:
+            schema = self._schema(data_source_id)
         properties = schema.get("properties")
         if not isinstance(properties, Mapping):
             raise NotionSchemaError(
@@ -1084,11 +1498,89 @@ class ApprovedNotionWriter:
                         f"Relation target mismatch for {database_name}.{property_name}"
                     )
 
+    def prepare_apply(self, operations: Sequence[ProposalOperation]) -> None:
+        """Force one fresh exact schema/binding check before nonce consumption."""
+
+        items = tuple(operations)
+        self._defer_live_schema = False
+        self._schema_cache.clear()
+        self._binding_cache.clear()
+        self._mapping_cache.clear()
+        self._relation_validation_cache.clear()
+        databases: list[str] = []
+        seen_databases: set[str] = set()
+        for operation in items:
+            if operation.action not in {ProposalAction.APPLY, ProposalAction.EDIT}:
+                raise NotionSchemaError("Apply preparation contains a non-write action")
+            database_name = operation.change.target_database
+            if database_name not in seen_databases:
+                databases.append(database_name)
+                seen_databases.add(database_name)
+        for database_name in databases:
+            _, data_source_id = self._definition(database_name)
+            if getattr(self.gateway, "get_data_source", None) is not None:
+                self._schema(data_source_id, force_fresh=True)
+            self._assert_destination_binding(database_name)
+        for operation in items:
+            change = operation.change
+            self._validate_remote_schema(
+                change.target_database,
+                change.property_name,
+                operation.approved_value,
+            )
+
+    @staticmethod
+    def _validated_operation_batch(
+        operations: Sequence[ProposalOperation],
+    ) -> tuple[ProposalOperation, ...]:
+        items = tuple(operations)
+        if not items:
+            raise NotionSchemaError("Notion operation batch must not be empty")
+        first = items[0].change
+        if not first.target_database.strip() or not first.entity_key.strip():
+            raise NotionSchemaError("Notion operation batch has an empty target")
+        operation_ids: set[str] = set()
+        property_names: set[str] = set()
+        for operation in items:
+            change = operation.change
+            if operation.action not in {ProposalAction.APPLY, ProposalAction.EDIT}:
+                raise NotionSchemaError("Notion operation batch contains a non-write")
+            if (
+                change.target_database != first.target_database
+                or change.entity_key != first.entity_key
+            ):
+                raise NotionSchemaError("Notion operation batch has mixed page targets")
+            if (
+                not change.operation_id.strip()
+                or not change.property_name.strip()
+                or change.operation_id in operation_ids
+                or change.property_name in property_names
+            ):
+                raise NotionSchemaError(
+                    "Notion operation batch has duplicate or empty scope"
+                )
+            operation_ids.add(change.operation_id)
+            property_names.add(change.property_name)
+        return items
+
+    def _mapping(
+        self,
+        database_name: str,
+        entity_key: str,
+    ) -> dict[str, str] | None:
+        key = (database_name, entity_key)
+        if key not in self._mapping_cache:
+            self._mapping_cache[key] = self.database.get_entity_mapping(
+                database_name,
+                entity_key,
+            )
+        return self._mapping_cache[key]
+
     def _match_value(self, database_name: str, entity_key: str) -> str:
         definition, _ = self._definition(database_name)
         if self.proposal.purpose is ProposalPurpose.USER_CORRECTION:
             return _correction_match_value(self.proposal)
-        mapping = self.database.get_entity_mapping(database_name, entity_key)
+        mapping = self._mapping(database_name, entity_key)
         if mapping:
             return mapping["match_value"]
         title = self._values.get((database_name, entity_key, definition.title_property))
@@ -1113,7 +1605,7 @@ class ApprovedNotionWriter:
             definition, data_source_id = self._definition(
                 change.target_database
             )
-            mapping = self.database.get_entity_mapping(
+            mapping = self._mapping(
                 change.target_database,
                 change.entity_key,
             )
@@ -1123,14 +1615,87 @@ class ApprovedNotionWriter:
                     raise NotionSchemaError(
                         "Mapped Notion page could not be read"
                     )
-                _assert_exact_page_binding(
-                    page,
-                    page_id=mapping["notion_page_id"],
-                    data_source_id=data_source_id,
-                    title_property=definition.title_property,
-                    match_value=mapping["match_value"],
-                    label="Mapped Notion",
-                )
+                try:
+                    _assert_exact_page_binding(
+                        page,
+                        page_id=mapping["notion_page_id"],
+                        data_source_id=data_source_id,
+                        title_property=definition.title_property,
+                        match_value=mapping["match_value"],
+                        label="Mapped Notion",
+                    )
+                except NotionSchemaError:
+                    properties = page.get("properties")
+                    approved_title = self._values.get(
+                        (
+                            change.target_database,
+                            change.entity_key,
+                            definition.title_property,
+                        )
+                    )
+                    actual_title = (
+                        decode_property(
+                            properties.get(definition.title_property),
+                            "title",
+                        )
+                        if isinstance(properties, Mapping)
+                        else None
+                    )
+                    if (
+                        self.proposal.status
+                        not in {ProposalStatus.APPLYING, ProposalStatus.FAILED}
+                        or approved_title in (None, "")
+                        or actual_title != approved_title
+                        or str(page.get("id") or "")
+                        != mapping["notion_page_id"]
+                        or page.get("archived") is True
+                        or page.get("in_trash") is True
+                        or _page_parent_identity(page)["id"] != data_source_id
+                    ):
+                        raise
+                    try:
+                        started_receipt = self.database.load_latest_receipt(
+                            self.proposal.proposal_id,
+                            self.proposal.revision,
+                        )
+                    except KeyError:
+                        raise
+                    title_operation = next(
+                        (
+                            item
+                            for item in self.proposal.operations
+                            if item.action
+                            in {ProposalAction.APPLY, ProposalAction.EDIT}
+                            and item.change.target_database
+                            == change.target_database
+                            and item.change.entity_key == change.entity_key
+                            and item.change.property_name
+                            == definition.title_property
+                        ),
+                        None,
+                    )
+                    title_outbox = (
+                        self.database.operation_outbox_state(
+                            title_operation.change.operation_id
+                        )
+                        if title_operation is not None
+                        else None
+                    )
+                    if (
+                        title_operation is None
+                        or title_outbox is None
+                        or title_outbox["proposal_id"]
+                        != self.proposal.proposal_id
+                        or int(title_outbox["revision"])
+                        != self.proposal.revision
+                        or title_outbox["status"] == "done"
+                        or started_receipt.proposal_digest
+                        != self.proposal.digest
+                        or started_receipt.notion_binding_digest
+                        != sha256_json(self.proposal.notion_binding)
+                        or not self.database.nonce_used(started_receipt.nonce)
+                    ):
+                        raise
                 return page
             return self._find_page(change.target_database, change.entity_key)
         definition, data_source_id = self._definition(change.target_database)
@@ -1171,25 +1736,33 @@ class ApprovedNotionWriter:
         page_ids: list[str] = []
         for logical_key in logical_keys:
             key = str(logical_key)
-            mapping = self.database.get_entity_mapping(target_database, key)
+            mapping = self._mapping(target_database, key)
             if mapping:
                 page_id = mapping["notion_page_id"]
                 target_definition, target_data_source_id = self._definition(
                     target_database
                 )
-                page = self.gateway.get_page(page_id)
-                if not isinstance(page, Mapping):
-                    raise NotionSchemaError(
-                        "Mapped relation target page could not be read"
-                    )
-                _assert_exact_page_binding(
-                    page,
-                    page_id=page_id,
-                    data_source_id=target_data_source_id,
-                    title_property=target_definition.title_property,
-                    match_value=mapping["match_value"],
-                    label="Mapped relation target",
+                cache_key = (
+                    target_database,
+                    key,
+                    page_id,
+                    mapping["match_value"],
                 )
+                if cache_key not in self._relation_validation_cache:
+                    page = self.gateway.get_page(page_id)
+                    if not isinstance(page, Mapping):
+                        raise NotionSchemaError(
+                            "Mapped relation target page could not be read"
+                        )
+                    _assert_exact_page_binding(
+                        page,
+                        page_id=page_id,
+                        data_source_id=target_data_source_id,
+                        title_property=target_definition.title_property,
+                        match_value=mapping["match_value"],
+                        label="Mapped relation target",
+                    )
+                    self._relation_validation_cache[cache_key] = page_id
                 page_ids.append(page_id)
                 continue
             page = self._find_page(target_database, key)
@@ -1199,6 +1772,7 @@ class ApprovedNotionWriter:
                     (target_database, key, target_definition.title_property)
                 )
                 if allow_planned and planned_title not in (None, ""):
+                    self._planned_relation_misses.add((target_database, key))
                     continue
                 raise NotionSchemaError(
                     f"Related entity does not exist: {target_database}/{key}"
@@ -1207,77 +1781,285 @@ class ApprovedNotionWriter:
             self.database.save_entity_mapping(
                 target_database, key, page_id, self._match_value(target_database, key)
             )
+            self._mapping_cache[(target_database, key)] = {
+                "database_name": target_database,
+                "entity_key": key,
+                "notion_page_id": page_id,
+                "match_value": self._match_value(target_database, key),
+            }
+            self._planned_relation_misses.discard((target_database, key))
             page_ids.append(page_id)
         return page_ids
 
-    def inspect(self, operation: ProposalOperation) -> WritePreconditionState:
-        change = operation.change
-        self._assert_destination_binding(change.target_database)
-        definition, _ = self._definition(change.target_database)
-        property_type = definition.properties.get(change.property_name)
-        if not property_type:
-            raise NotionSchemaError(
-                f"Unknown property: {change.target_database}.{change.property_name}"
-            )
-        self._validate_remote_schema(
-            change.target_database,
-            change.property_name,
-            operation.approved_value,
-        )
-        relation_ids = None
-        if property_type == "relation":
-            relation_ids = self._resolve_relations(
+    def inspect_batch(
+        self,
+        operations: Sequence[ProposalOperation],
+    ) -> dict[str, WritePreconditionState]:
+        items = self._validated_operation_batch(operations)
+        first_change = items[0].change
+        self._assert_destination_binding(first_change.target_database)
+        definition, _ = self._definition(first_change.target_database)
+        relation_ids_by_operation: dict[str, list[str] | None] = {}
+        for operation in items:
+            change = operation.change
+            property_type = definition.properties.get(change.property_name)
+            if not property_type:
+                raise NotionSchemaError(
+                    f"Unknown property: {change.target_database}.{change.property_name}"
+                )
+            self._validate_remote_schema(
                 change.target_database,
                 change.property_name,
                 operation.approved_value,
-                allow_planned=True,
             )
-        encode_property(operation.approved_value, property_type, relation_ids)
-        page = self._operation_page(operation)
-        raw_property = (
-            page.get("properties", {}).get(change.property_name) if page else None
-        )
-        self._intents[change.operation_id] = NotionPrecondition(
-            page_id=str(page["id"]) if page else None,
-            last_edited_time=(
-                str(page["last_edited_time"])
-                if page and page.get("last_edited_time") is not None
-                else None
-            ),
-            property_name=change.property_name,
-            property_value=deepcopy(raw_property),
-        )
-        if not page:
-            if change.property_name != definition.title_property:
-                title_key = (
+            relation_ids = None
+            if property_type == "relation":
+                relation_ids = self._resolve_relations(
                     change.target_database,
-                    change.entity_key,
-                    definition.title_property,
+                    change.property_name,
+                    operation.approved_value,
+                    allow_planned=True,
                 )
-                if title_key not in self._values:
+            encode_property(
+                operation.approved_value,
+                property_type,
+                relation_ids,
+            )
+            relation_ids_by_operation[change.operation_id] = relation_ids
+        page = self._operation_page(items[0])
+        page_id = str(page["id"]) if page else None
+        last_edited_time = (
+            str(page["last_edited_time"])
+            if page and page.get("last_edited_time") is not None
+            else None
+        )
+        properties = page.get("properties") if page else None
+        states: dict[str, WritePreconditionState] = {}
+        for operation in items:
+            change = operation.change
+            property_type = definition.properties[change.property_name]
+            raw_property = (
+                properties.get(change.property_name)
+                if isinstance(properties, Mapping)
+                else None
+            )
+            self._intents[change.operation_id] = NotionPrecondition(
+                page_id=page_id,
+                last_edited_time=last_edited_time,
+                property_name=change.property_name,
+                property_value=deepcopy(raw_property),
+            )
+            if not page:
+                if (
+                    change.property_name != definition.title_property
+                    and (
+                        change.target_database,
+                        change.entity_key,
+                        definition.title_property,
+                    )
+                    not in self._values
+                ):
                     raise NotionSchemaError(
                         "A new Notion page cannot be created without an approved title"
                     )
-            return (
-                WritePreconditionState.PENDING
-                if change.current_value is None
+                states[change.operation_id] = (
+                    WritePreconditionState.PENDING
+                    if change.current_value is None
+                    else WritePreconditionState.CONFLICT
+                )
+                continue
+            current = decode_property(raw_property, property_type)
+            if current == change.current_value:
+                states[change.operation_id] = WritePreconditionState.PENDING
+                continue
+            approved_value: JsonValue = operation.approved_value
+            planned_relation = False
+            if property_type == "relation":
+                approved_value = (
+                    relation_ids_by_operation[change.operation_id] or []
+                )
+                target_database = definition.relations[change.property_name]
+                logical_keys = (
+                    operation.approved_value
+                    if isinstance(operation.approved_value, list)
+                    else (
+                        []
+                        if operation.approved_value is None
+                        else [operation.approved_value]
+                    )
+                )
+                planned_relation = any(
+                    (target_database, str(key)) in self._planned_relation_misses
+                    for key in logical_keys
+                )
+            states[change.operation_id] = (
+                WritePreconditionState.ALREADY_APPLIED
+                if not planned_relation and current == approved_value
                 else WritePreconditionState.CONFLICT
             )
-        current = decode_property(
-            raw_property,
-            property_type,
-        )
-        if current == change.current_value:
-            return WritePreconditionState.PENDING
-        approved_value: JsonValue = operation.approved_value
-        if property_type == "relation":
-            approved_value = relation_ids or []
-        if current == approved_value:
-            return WritePreconditionState.ALREADY_APPLIED
-        return WritePreconditionState.CONFLICT
+        return states
+
+    def inspect(self, operation: ProposalOperation) -> WritePreconditionState:
+        return self.inspect_batch([operation])[operation.change.operation_id]
 
     def preflight(self, operation: ProposalOperation) -> bool:
         return self.inspect(operation) is WritePreconditionState.PENDING
+
+    def apply_batch(
+        self,
+        operations: Sequence[ProposalOperation],
+        receipt: ApprovalReceipt,
+    ) -> str:
+        items = self._validated_operation_batch(operations)
+        # A relation target can be moved, archived, or retitled between page
+        # mutations. Reuse validation only within this single atomic Notion
+        # request; every later page mutation must re-read the exact target.
+        self._relation_validation_cache.clear()
+        first_change = items[0].change
+        definition, data_source_id = self._definition(
+            first_change.target_database
+        )
+        mutated = self._mutated_pages.get(
+            (first_change.target_database, first_change.entity_key)
+        )
+        if mutated is not None:
+            mutated_page_id, created_in_command = mutated
+            for operation in items:
+                operation_id = operation.change.operation_id
+                intent = self._intents.get(operation_id)
+                if intent is None:
+                    raise NotionSchemaError(
+                        "Notion batch has no global preflight intent"
+                    )
+                if intent.page_id is None:
+                    if (
+                        not created_in_command
+                        or operation.change.current_value is not None
+                        or intent.property_value is not None
+                    ):
+                        raise NotionSchemaError(
+                            "A planned Notion page cannot be rebound safely"
+                        )
+                elif intent.page_id != mutated_page_id:
+                    raise NotionSchemaError(
+                        "Notion page identity changed between approved batches"
+                    )
+                self._intents[operation_id] = NotionPrecondition(
+                    page_id=mutated_page_id,
+                    last_edited_time=None,
+                    property_name=intent.property_name,
+                    property_value=deepcopy(intent.property_value),
+                )
+        mutations: list[NotionPropertyMutation] = []
+        for operation in items:
+            change = operation.change
+            intent = self._intents.get(change.operation_id)
+            if intent is None:
+                raise NotionSchemaError(
+                    "Notion batch has no global preflight intent"
+                )
+            property_type = definition.properties.get(change.property_name)
+            if not property_type:
+                raise NotionSchemaError(
+                    f"Unknown property: {change.target_database}.{change.property_name}"
+                )
+            relation_ids = None
+            if property_type == "relation":
+                relation_ids = self._resolve_relations(
+                    change.target_database,
+                    change.property_name,
+                    operation.approved_value,
+                )
+            encoded = encode_property(
+                operation.approved_value,
+                property_type,
+                relation_ids,
+            )
+            mutations.append(
+                NotionPropertyMutation(
+                    operation_id=change.operation_id,
+                    property_name=change.property_name,
+                    property_value=encoded,
+                    precondition=intent,
+                )
+            )
+        self._assert_destination_binding(first_change.target_database)
+        result = self.gateway.upsert_page_batch(
+            data_source_id,
+            NotionMatch(definition.title_property, "title"),
+            self._match_value(
+                first_change.target_database,
+                first_change.entity_key,
+            ),
+            mutations,
+            approval=receipt,
+        )
+        previous = self._mutated_pages.get(
+            (first_change.target_database, first_change.entity_key)
+        )
+        self._mutated_pages[
+            (first_change.target_database, first_change.entity_key)
+        ] = (
+            result.page_id,
+            result.created or (previous[1] if previous is not None else False),
+        )
+        return result.page_id
+
+    def complete_batch(
+        self,
+        operations: Sequence[ProposalOperation],
+        page_id: str | None = None,
+    ) -> None:
+        """Atomically persist remote acknowledgement, outbox, and title mapping."""
+
+        items = self._validated_operation_batch(operations)
+        first_change = items[0].change
+        definition, _ = self._definition(first_change.target_database)
+        if page_id is None:
+            page_ids = {
+                self._intents[item.change.operation_id].page_id
+                for item in items
+                if item.change.operation_id in self._intents
+            }
+            if len(page_ids) != 1 or None in page_ids:
+                raise NotionSchemaError(
+                    "Reconciled Notion batch has no exact page identity"
+                )
+            page_id = str(next(iter(page_ids)))
+        if not page_id.strip():
+            raise NotionSchemaError("Notion batch returned an empty page identity")
+        match_value = self._match_value(
+            first_change.target_database,
+            first_change.entity_key,
+        )
+        for operation in items:
+            if (
+                operation.change.property_name == definition.title_property
+                and operation.approved_value not in (None, "")
+            ):
+                match_value = str(operation.approved_value)
+                break
+        mapping = {
+            "database_name": first_change.target_database,
+            "entity_key": first_change.entity_key,
+            "notion_page_id": page_id,
+            "match_value": match_value,
+        }
+        self.database.mark_outbox_batch_done(
+            self.proposal.proposal_id,
+            self.proposal.revision,
+            [item.change.operation_id for item in items],
+            entity_mapping=mapping,
+            allow_reconciliation=(
+                self.proposal.status is ProposalStatus.FAILED
+            ),
+        )
+        self._mapping_cache[
+            (first_change.target_database, first_change.entity_key)
+        ] = mapping
+        self._planned_relation_misses.discard(
+            (first_change.target_database, first_change.entity_key)
+        )
 
     def apply(self, operation: ProposalOperation, receipt: ApprovalReceipt) -> str:
         if not self.preflight(operation):

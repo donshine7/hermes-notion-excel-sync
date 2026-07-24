@@ -25,6 +25,7 @@ from notion_excel_sync.models import (
     RecordChange,
     ReviewItem,
     SourceRecord,
+    SourceRef,
     WorkbookSnapshot,
     sha256_json,
 )
@@ -52,6 +53,211 @@ class PreparationResult:
     checkpoint_advanced: bool = False
     wiki_generation_digest: str | None = None
     wiki_shadow_hits: int = 0
+
+
+_NOTION_TITLE_TEXT_LIMIT = 2_000
+_REVIEW_IDENTITY_VERSION = 2
+_REVIEW_TITLE_DIGEST_LENGTH = 16
+_REVIEW_LOCATOR_LIMIT = 96
+
+
+def _source_ref_identity(ref: SourceRef) -> dict[str, object]:
+    return {
+        "drive_id": ref.drive_id,
+        "item_id": ref.item_id,
+        "version_id": ref.version_id,
+        "file_hash": ref.file_hash,
+        "sheet": ref.sheet,
+        "row": ref.row,
+        "cells": ref.cells,
+        "raw_value": ref.raw_value,
+    }
+
+
+def _knowledge_ref_identity(ref: KnowledgeRef) -> dict[str, object]:
+    return {
+        "drive_id": ref.drive_id,
+        "item_id": ref.item_id,
+        "version_id": ref.version_id,
+        "content_hash": ref.content_hash,
+        "chunk_locator": ref.chunk_locator,
+        "chunk_hash": ref.chunk_hash,
+        "security_classification": ref.security_classification,
+        "display_name": ref.display_name,
+        "etag": ref.etag,
+        "extractor_version": ref.extractor_version,
+        "policy_version": ref.policy_version,
+        "effective_from": ref.effective_from,
+        "effective_to": ref.effective_to,
+        "authority": ref.authority,
+        "status": ref.status,
+    }
+
+
+def _identity_item_key(item: dict[str, object]) -> str:
+    return json.dumps(
+        item,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _normalized_identity_items(
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Sort citations as before while removing exact semantic duplicates."""
+
+    unique = {_identity_item_key(item): item for item in items}
+    return sorted(
+        unique.values(),
+        key=lambda item: (sha256_json(item), _identity_item_key(item)),
+    )
+
+
+def _normalized_source_refs(refs: list[SourceRef]) -> list[SourceRef]:
+    unique = {
+        _identity_item_key(_source_ref_identity(ref)): ref
+        for ref in refs
+    }
+    return sorted(
+        unique.values(),
+        key=lambda ref: (
+            sha256_json(_source_ref_identity(ref)),
+            _identity_item_key(_source_ref_identity(ref)),
+        ),
+    )
+
+
+def _normalized_knowledge_refs(refs: list[KnowledgeRef]) -> list[KnowledgeRef]:
+    unique = {
+        _identity_item_key(_knowledge_ref_identity(ref)): ref
+        for ref in refs
+    }
+    return sorted(
+        unique.values(),
+        key=lambda ref: (
+            sha256_json(_knowledge_ref_identity(ref)),
+            _identity_item_key(_knowledge_ref_identity(ref)),
+        ),
+    )
+
+
+def _review_identity_payload(review: ReviewItem, version_id: str) -> dict[str, object]:
+    """Bind one review page to every fact that distinguishes its meaning."""
+
+    return {
+        "identity_version": _REVIEW_IDENTITY_VERSION,
+        "version": version_id,
+        "review_type": review.review_type,
+        "title": review.title,
+        "reason": review.reason,
+        "current_value": review.current_value,
+        "proposed_value": review.proposed_value,
+        "confidence": review.confidence,
+        "source_refs": _normalized_identity_items(
+            [_source_ref_identity(ref) for ref in review.source_refs]
+        ),
+        "knowledge_refs": _normalized_identity_items(
+            [_knowledge_ref_identity(ref) for ref in review.knowledge_refs]
+        ),
+    }
+
+
+def _legacy_review_entity_key_for_refs(
+    review: ReviewItem,
+    version_id: str,
+    refs: list[SourceRef],
+) -> str:
+    identity = sha256_json(
+        {
+            "version": version_id,
+            "title": review.title,
+            "refs": [
+                (item.sheet, item.row, item.cells) for item in refs
+            ],
+        }
+    )[:20]
+    return f"review:{identity}"
+
+
+def _legacy_review_entity_key(review: ReviewItem, version_id: str) -> str:
+    """Reproduce the pre-v2 key for the citation order received today."""
+
+    return _legacy_review_entity_key_for_refs(
+        review,
+        version_id,
+        review.source_refs,
+    )
+
+
+def _legacy_review_entity_key_candidates(
+    review: ReviewItem,
+    version_id: str,
+) -> tuple[str, ...]:
+    """Return a bounded set of old order-sensitive keys for safe migration."""
+
+    current_order = _legacy_review_entity_key(review, version_id)
+    canonical_order = _legacy_review_entity_key_for_refs(
+        review,
+        version_id,
+        _normalized_source_refs(review.source_refs),
+    )
+    return tuple(dict.fromkeys((current_order, canonical_order)))
+
+
+def _compact_title_part(value: object, limit: int) -> str:
+    normalized = " ".join(str(value).split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 1].rstrip()}…"
+
+
+def _review_source_locator(review: ReviewItem) -> str:
+    if review.source_refs:
+        ref = min(review.source_refs, key=lambda item: sha256_json(_source_ref_identity(item)))
+        locator = f"{ref.sheet}!{ref.cells}" if ref.cells else f"{ref.sheet} {ref.row}행"
+    elif review.knowledge_refs:
+        ref = min(
+            review.knowledge_refs,
+            key=lambda item: sha256_json(_knowledge_ref_identity(item)),
+        )
+        locator = f"Wiki {ref.display_name or ref.chunk_locator}"
+    else:
+        locator = review.review_type
+    return _compact_title_part(locator or "근거 미지정", _REVIEW_LOCATOR_LIMIT)
+
+
+def _bounded_review_title(review: ReviewItem, identity: str) -> str:
+    """Keep the visible title readable while making title matching deterministic."""
+
+    base = " ".join(str(review.title).split()) or "검토 항목"
+    suffix = (
+        f" · {_review_source_locator(review)}"
+        f" · {identity[:_REVIEW_TITLE_DIGEST_LENGTH]}"
+    )
+    available = _NOTION_TITLE_TEXT_LIMIT - len(suffix)
+    if len(base) > available:
+        base = f"{base[: max(available - 1, 0)].rstrip()}…"
+    return f"{base}{suffix}"
+
+
+def _bounded_history_title(change: ProposedChange) -> str:
+    """Give each append-only history row a readable, operation-unique title."""
+
+    operation_id = " ".join(str(change.operation_id).split())
+    if len(operation_id) > _REVIEW_LOCATOR_LIMIT:
+        operation_id = (
+            f"{operation_id[: _REVIEW_LOCATOR_LIMIT - 18].rstrip()}…"
+            f"{sha256_json({'operation_id': change.operation_id})[:16]}"
+        )
+    suffix = f" · op {operation_id}"
+    base = f"{change.entity_key} · {change.property_name}"
+    available = _NOTION_TITLE_TEXT_LIMIT - len(suffix)
+    if len(base) > available:
+        base = f"{base[: max(available - 1, 0)].rstrip()}…"
+    return f"{base}{suffix}"
 
 
 class SyncPreparationService:
@@ -138,6 +344,9 @@ class SyncPreparationService:
         chat_id: str,
         source_web_url: str | None = None,
     ) -> PreparationResult:
+        clear_reader_cache = getattr(self.notion_reader, "clear_cache", None)
+        if callable(clear_reader_cache):
+            clear_reader_cache()
         first_run = self.database.get_checkpoint(drive_id, item_id) is None
         baseline_version, current_version = self._versions(
             drive_id, item_id, initial_cutoff
@@ -299,9 +508,15 @@ class SyncPreparationService:
         ]
         all_changes = self._merge_pending(all_changes, pending_regular)
         self._refresh_current_values(all_changes)
-        history_changes = self._history_changes(all_changes)
+        # The command-time T0 snapshot establishes the initial Notion state; it
+        # is not a sequence of post-baseline changes. Detailed history begins
+        # with later incremental syncs. Previously deferred history is retained.
+        history_changes = [] if full_reconcile else self._history_changes(all_changes)
         history_changes = self._merge_pending(history_changes, pending_history)
-        self._refresh_current_values(history_changes)
+        # Fresh history rows are append-only and carry an operation-bound unique
+        # title, so they cannot have a current value before approval. Deferred
+        # history may already be mapped to a page and still needs an exact read.
+        self._refresh_pending_history_values(history_changes, pending_history)
         all_changes.extend(history_changes)
         all_changes = self._sort_changes(all_changes)
         if not all_changes:
@@ -472,6 +687,32 @@ class SyncPreparationService:
             if key in current_values:
                 change.current_value = current_values[key]
 
+    def _refresh_pending_history_values(
+        self,
+        history_changes: list[ProposedChange],
+        pending_history: list[ProposedChange],
+    ) -> None:
+        pending_keys = {
+            (
+                change.target_database,
+                change.entity_key,
+                change.property_name,
+            )
+            for change in pending_history
+        }
+        self._refresh_current_values(
+            [
+                change
+                for change in history_changes
+                if (
+                    change.target_database,
+                    change.entity_key,
+                    change.property_name,
+                )
+                in pending_keys
+            ]
+        )
+
     @staticmethod
     def _merge_pending(
         fresh: list[ProposedChange], pending: list[ProposedChange]
@@ -545,23 +786,103 @@ class SyncPreparationService:
         self, reviews: list[ReviewItem], version_id: str
     ) -> list[ProposedChange]:
         result: list[ProposedChange] = []
+        unique: dict[str, ReviewItem] = {}
+        legacy_noncanonical_key_by_identity: dict[str, str] = {}
+        legacy_canonical_key_by_identity: dict[str, str] = {}
+        legacy_keys_by_identity: dict[str, set[str]] = {}
+        legacy_groups: dict[str, set[str]] = {}
+        mapping_cache: dict[str, dict[str, str] | None] = {}
+
+        def mapping_for(entity_key: str) -> dict[str, str] | None:
+            if entity_key not in mapping_cache:
+                mapping_cache[entity_key] = self.database.get_entity_mapping(
+                    "검토함",
+                    entity_key,
+                )
+            return mapping_cache[entity_key]
+
         for review in reviews:
-            identity = sha256_json(
-                {
-                    "version": version_id,
-                    "title": review.title,
-                    "refs": [
-                        (item.sheet, item.row, item.cells) for item in review.source_refs
-                    ],
-                }
-            )[:20]
+            identity = sha256_json(_review_identity_payload(review, version_id))
+            unique.setdefault(identity, review)
+            legacy_keys = _legacy_review_entity_key_candidates(
+                review,
+                version_id,
+            )
+            current_key = legacy_keys[0]
+            canonical_key = legacy_keys[-1]
+            legacy_canonical_key_by_identity[identity] = canonical_key
+            if current_key != canonical_key:
+                legacy_noncanonical_key_by_identity[identity] = min(
+                    current_key,
+                    legacy_noncanonical_key_by_identity.get(
+                        identity,
+                        current_key,
+                    ),
+                )
+
+        for identity in unique:
+            legacy_keys = {legacy_canonical_key_by_identity[identity]}
+            noncanonical_key = legacy_noncanonical_key_by_identity.get(
+                identity
+            )
+            if noncanonical_key is not None:
+                legacy_keys.add(noncanonical_key)
+            legacy_keys_by_identity[identity] = legacy_keys
+            for legacy_key in legacy_keys:
+                legacy_groups.setdefault(legacy_key, set()).add(identity)
+
+        for identity in sorted(unique):
+            review = unique[identity]
             entity_key = f"review:{identity}"
+            title = _bounded_review_title(review, identity)
+            source_refs = _normalized_source_refs(review.source_refs)
+            knowledge_refs = _normalized_knowledge_refs(
+                review.knowledge_refs
+            )
+
+            # New-style mappings are exact. A legacy mapping is reused only
+            # when every order-sensitive legacy key belongs only to this
+            # semantic review and every stored mapping resolves to one
+            # identical page/title target.
+            mapping = mapping_for(entity_key)
+            legacy_keys = sorted(legacy_keys_by_identity[identity])
+            if mapping is None and all(
+                legacy_groups[legacy_key] == {identity}
+                for legacy_key in legacy_keys
+            ):
+                legacy_mappings = [
+                    (legacy_key, legacy_mapping)
+                    for legacy_key in legacy_keys
+                    if (
+                        legacy_mapping := mapping_for(legacy_key)
+                    )
+                    is not None
+                ]
+                mapping_targets = {
+                    (
+                        legacy_mapping.get("notion_page_id"),
+                        legacy_mapping.get("match_value"),
+                    )
+                    for _, legacy_mapping in legacy_mappings
+                }
+                valid_mapping_target = bool(mapping_targets) and all(
+                    isinstance(page_id, str)
+                    and bool(page_id)
+                    and isinstance(match_value, str)
+                    and bool(match_value)
+                    for page_id, match_value in mapping_targets
+                )
+                if valid_mapping_target and len(mapping_targets) == 1:
+                    entity_key, mapping = legacy_mappings[0]
+            if mapping is not None and mapping.get("match_value"):
+                title = str(mapping["match_value"])
+
             evidence = "; ".join(
                 f"{item.sheet}!{item.cells} (v{item.version_id})"
-                for item in review.source_refs
+                for item in source_refs
             )
             fields: list[tuple[str, object, float]] = [
-                ("검토항목", review.title, 1.0),
+                ("검토항목", title, 1.0),
                 ("검토유형", self._review_type(review.review_type), 1.0),
                 ("상태", "대기", 1.0),
                 ("현재값", _display_value(review.current_value), review.confidence),
@@ -584,8 +905,8 @@ class SyncPreparationService:
                         analyzer_version="1.0.0",
                         confidence=confidence,
                         reason="분석 결과의 불확실성을 사용자 승인 후 검토함에 기록합니다.",
-                        source_refs=review.source_refs,
-                        knowledge_refs=review.knowledge_refs,
+                        source_refs=source_refs,
+                        knowledge_refs=knowledge_refs,
                     )
                 )
         return result
@@ -646,7 +967,7 @@ class SyncPreparationService:
             change_type = "생성" if change.kind is ChangeKind.CREATE else "값변경"
             area = _history_area(change.target_database)
             fields: list[tuple[str, object]] = [
-                ("변경명", f"{change.entity_key} · {change.property_name}"),
+                ("변경명", _bounded_history_title(change)),
                 ("변경유형", change_type),
                 ("변경영역", area),
                 ("이전값", _display_value(change.current_value)),

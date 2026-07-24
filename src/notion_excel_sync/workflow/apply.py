@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 
 from notion_excel_sync.models import (
     ApprovalReceipt,
@@ -26,6 +26,24 @@ class NotionOperationWriter(Protocol):
 
     def apply(self, operation: ProposalOperation, receipt: ApprovalReceipt) -> str:
         """Apply an approved operation idempotently and return the Notion page URL or ID."""
+
+
+def _consecutive_page_batches(
+    operations: Sequence[ProposalOperation],
+) -> list[list[ProposalOperation]]:
+    """Preserve proposal order while grouping only adjacent exact page targets."""
+
+    batches: list[list[ProposalOperation]] = []
+    for operation in operations:
+        change = operation.change
+        key = (change.target_database, change.entity_key)
+        if batches:
+            previous = batches[-1][0].change
+            if key == (previous.target_database, previous.entity_key):
+                batches[-1].append(operation)
+                continue
+        batches.append([operation])
+    return batches
 
 
 @dataclass(slots=True)
@@ -178,28 +196,102 @@ class ApprovalGatedApplyService:
             for item in proposal.operations
             if item.action in {ProposalAction.APPLY, ProposalAction.EDIT}
         ]
+
+        def record_prewrite_failure(reason_code: str) -> None:
+            """Close an unstarted run or preserve recovery for a started run."""
+
+            proposal.status = (
+                ProposalStatus.FAILED
+                if resuming
+                else ProposalStatus.STALE
+            )
+            self.database.save_proposal(proposal)
+            self.database.audit(
+                "apply_failed" if resuming else "proposal_stale",
+                {"preflight": reason_code},
+                proposal.proposal_id,
+                proposal.requested_by,
+            )
+
+        begin_global_preflight = getattr(
+            self.writer,
+            "begin_global_preflight",
+            None,
+        )
+        if callable(begin_global_preflight):
+            try:
+                begin_global_preflight()
+            except Exception as exc:
+                record_prewrite_failure("notion_preflight_setup_failed")
+                if resuming:
+                    raise ApprovalError(
+                        "Notion preflight could not be initialized"
+                    ) from exc
+                raise
         inspections: dict[str, WritePreconditionState] = {}
-        for item in write_operations:
-            self.database.heartbeat_apply_lease(lease_token)
-            operation_id = item.change.operation_id
-            outbox_status = self.database.outbox_status(
+        existing_outbox = (
+            self.database.outbox_statuses(
                 proposal.proposal_id,
                 proposal.revision,
-                operation_id,
             )
-            if resuming and outbox_status == "done":
-                inspections[operation_id] = WritePreconditionState.ALREADY_APPLIED
-                continue
-            inspect = getattr(self.writer, "inspect", None)
-            if inspect is None:
-                state = (
-                    WritePreconditionState.PENDING
-                    if self.writer.preflight(item)
-                    else WritePreconditionState.CONFLICT
-                )
-            else:
-                state = inspect(item)
-            inspections[operation_id] = state
+            if resuming
+            else {}
+        )
+        inspect_batch = getattr(self.writer, "inspect_batch", None)
+        try:
+            for original_batch in _consecutive_page_batches(write_operations):
+                self.database.heartbeat_apply_lease(lease_token)
+                candidates: list[ProposalOperation] = []
+                for item in original_batch:
+                    operation_id = item.change.operation_id
+                    if resuming and existing_outbox.get(operation_id) == "done":
+                        inspections[operation_id] = (
+                            WritePreconditionState.ALREADY_APPLIED
+                        )
+                    else:
+                        candidates.append(item)
+                if not candidates:
+                    continue
+                if callable(inspect_batch):
+                    batch_states = inspect_batch(candidates)
+                    expected_ids = {
+                        item.change.operation_id for item in candidates
+                    }
+                    if (
+                        not isinstance(batch_states, Mapping)
+                        or set(batch_states) != expected_ids
+                        or any(
+                            not isinstance(state, WritePreconditionState)
+                            for state in batch_states.values()
+                        )
+                    ):
+                        raise ApprovalError(
+                            "Notion batch preflight returned an invalid scope"
+                        )
+                    inspections.update(batch_states)
+                    continue
+                inspect = getattr(self.writer, "inspect", None)
+                for item in candidates:
+                    if inspect is None:
+                        state = (
+                            WritePreconditionState.PENDING
+                            if self.writer.preflight(item)
+                            else WritePreconditionState.CONFLICT
+                        )
+                    else:
+                        state = inspect(item)
+                    inspections[item.change.operation_id] = state
+        except Exception as exc:
+            # A reader/schema/binding failure is just as unsafe as an explicit
+            # value conflict. Preserve zero-write semantics for a fresh run,
+            # while making a consumed APPLYING run recoverable instead of
+            # leaving its mutation scope permanently owned.
+            record_prewrite_failure("notion_inspection_failed")
+            if resuming:
+                raise ApprovalError(
+                    "Notion targets could not be verified during global preflight"
+                ) from exc
+            raise
         stale = [
             operation_id
             for operation_id, state in inspections.items()
@@ -235,11 +327,30 @@ class ApprovalGatedApplyService:
                     "The configured local source changed immediately before a write"
                 )
 
-        verify_latest_source()
+        try:
+            verify_latest_source()
+        except Exception as exc:
+            record_prewrite_failure("source_guard_failed")
+            if resuming:
+                raise ApprovalError(
+                    "The configured local source could not be verified"
+                ) from exc
+            raise
         # Perform the first per-write check before consuming the approval nonce
         # or creating outbox state, so drift here is a clean STALE/zero-write
         # outcome.
         verify_latest_knowledge(clean_stale_allowed=not resuming)
+        prepare_apply = getattr(self.writer, "prepare_apply", None)
+        if callable(prepare_apply):
+            try:
+                prepare_apply(write_operations)
+            except Exception as exc:
+                record_prewrite_failure("notion_apply_preparation_failed")
+                if resuming:
+                    raise ApprovalError(
+                        "Notion apply preparation could not be verified"
+                    ) from exc
+                raise
         if not resuming:
             proposal.status = ProposalStatus.APPLYING
             self.database.begin_apply(proposal, receipt.nonce)
@@ -261,22 +372,40 @@ class ApprovalGatedApplyService:
             failed={},
             committed=False,
         )
+        current_outbox = self.database.outbox_statuses(
+            proposal.proposal_id,
+            proposal.revision,
+        )
+        complete_batch = getattr(self.writer, "complete_batch", None)
         pending_operations: list[ProposalOperation] = []
-        for operation in write_operations:
-            operation_id = operation.change.operation_id
-            if (
-                inspections[operation_id]
+        for original_batch in _consecutive_page_batches(write_operations):
+            already = [
+                operation
+                for operation in original_batch
+                if inspections[operation.change.operation_id]
                 is WritePreconditionState.ALREADY_APPLIED
-            ):
-                if self.database.outbox_status(
-                    proposal.proposal_id,
-                    proposal.revision,
-                    operation_id,
-                ) != "done":
-                    self.database.mark_outbox(operation_id, "done")
-                report.already_applied.append(operation_id)
-            else:
-                pending_operations.append(operation)
+                and current_outbox.get(operation.change.operation_id) != "done"
+            ]
+            if already:
+                if callable(complete_batch):
+                    complete_batch(already)
+                else:
+                    self.database.mark_outbox_batch_done(
+                        proposal.proposal_id,
+                        proposal.revision,
+                        [item.change.operation_id for item in already],
+                    )
+                for operation in already:
+                    current_outbox[operation.change.operation_id] = "done"
+            for operation in original_batch:
+                operation_id = operation.change.operation_id
+                if (
+                    inspections[operation_id]
+                    is WritePreconditionState.ALREADY_APPLIED
+                ):
+                    report.already_applied.append(operation_id)
+                else:
+                    pending_operations.append(operation)
 
         if resuming:
             self.database.reset_outbox_for_resume(
@@ -285,34 +414,75 @@ class ApprovalGatedApplyService:
                 [item.change.operation_id for item in pending_operations],
             )
 
-        for operation_index, operation in enumerate(pending_operations):
-            operation_id = operation.change.operation_id
+        apply_batch = getattr(self.writer, "apply_batch", None)
+        pending_batches = (
+            _consecutive_page_batches(pending_operations)
+            if callable(apply_batch)
+            else [[operation] for operation in pending_operations]
+        )
+        for batch_index, batch in enumerate(pending_batches):
+            operation_ids = [item.change.operation_id for item in batch]
             try:
-                # Revalidate immediately before every mutation. Once APPLYING
+                # Revalidate immediately before every page mutation. Once APPLYING
                 # has started, drift is a recoverable failure rather than a
                 # clean stale proposal, even if no operation in this process
                 # has completed yet.
                 verify_latest_knowledge(clean_stale_allowed=False)
                 verify_latest_source()
-                self.writer.apply(operation, receipt)
+                if callable(apply_batch):
+                    page_id = apply_batch(batch, receipt)
+                    self.database.heartbeat_apply_lease(lease_token)
+                    if callable(complete_batch):
+                        complete_batch(batch, str(page_id))
+                    else:
+                        self.database.mark_outbox_batch_done(
+                            proposal.proposal_id,
+                            proposal.revision,
+                            operation_ids,
+                        )
+                else:
+                    operation = batch[0]
+                    self.writer.apply(operation, receipt)
+                    self.database.heartbeat_apply_lease(lease_token)
+                    self.database.mark_outbox_batch_done(
+                        proposal.proposal_id,
+                        proposal.revision,
+                        operation_ids,
+                    )
                 self.database.heartbeat_apply_lease(lease_token)
-                self.database.mark_outbox(operation_id, "done")
-                report.applied.append(operation_id)
+                report.applied.extend(operation_ids)
             except Exception:
                 # Adapter and Notion response details can contain credentials,
                 # local paths, or user data.  Persist only a stable reason code.
                 reason_code = "notion_write_failed"
-                self.database.mark_outbox(operation_id, "failed", reason_code)
-                report.failed[operation_id] = reason_code
-                for remaining in pending_operations[operation_index + 1 :]:
-                    remaining_id = remaining.change.operation_id
-                    reason_code = "blocked_after_failure"
-                    self.database.mark_outbox(
-                        remaining_id,
-                        "blocked",
-                        reason_code,
+                # Persist FAILED before changing any outbox state. If the
+                # process stops after this point, /nx_recover can reconcile a
+                # remote success whose acknowledgement was lost.
+                proposal.status = ProposalStatus.FAILED
+                self.database.save_proposal(proposal)
+                self.database.mark_outbox_batch_failed(
+                    proposal.proposal_id,
+                    proposal.revision,
+                    operation_ids,
+                    reason_code,
+                )
+                for operation_id in operation_ids:
+                    report.failed[operation_id] = reason_code
+                remaining_ids = [
+                    item.change.operation_id
+                    for remaining_batch in pending_batches[batch_index + 1 :]
+                    for item in remaining_batch
+                ]
+                if remaining_ids:
+                    blocked_reason = "blocked_after_failure"
+                    self.database.mark_outbox_batch_blocked(
+                        proposal.proposal_id,
+                        proposal.revision,
+                        remaining_ids,
+                        blocked_reason,
                     )
-                    report.failed[remaining_id] = reason_code
+                    for remaining_id in remaining_ids:
+                        report.failed[remaining_id] = blocked_reason
                 break
 
         if not report.failed:

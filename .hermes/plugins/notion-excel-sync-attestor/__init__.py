@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -495,8 +496,38 @@ _COMMANDS = frozenset(
     }
 )
 _ACTIVE: set[str] = set()
+_ACTIVE_STARTED: dict[str, float] = {}
+_ACTIVE_STAGE: dict[str, str] = {}
+_ACTIVE_PROGRESS: dict[str, asyncio.Task[None]] = {}
 _ACTIVE_LOCK = threading.RLock()
 logger = logging.getLogger(__name__)
+_SYNC_ACCEPTED_MARKER = (
+    "[NX_SYNC_ACCEPTED] stage=preparing elapsed_seconds=0. "
+    "인증된 동기화 요청을 접수했습니다. 준비 중에는 Notion을 변경하지 않으며, "
+    "모든 Notion 변경에는 별도의 정확한 Telegram 승인이 필요합니다."
+)
+
+
+def _release_active(key: str) -> None:
+    """Release one command only after its trusted worker has really stopped."""
+
+    with _ACTIVE_LOCK:
+        _ACTIVE.discard(key)
+        _ACTIVE_STARTED.pop(key, None)
+        _ACTIVE_STAGE.pop(key, None)
+
+
+async def _await_shielded_completion(task: asyncio.Task[Any]) -> Any:
+    """Ignore wrapper cancellation while a trusted worker or delivery is active."""
+
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            if task.done():
+                return task.result()
 
 
 def _recognized(event: Any) -> bool:
@@ -525,13 +556,13 @@ def _active_key(event: Any) -> str:
     return "malformed\n" + str(getattr(source, "chat_id", "") or "") + "\n" + text
 
 
-async def _send_result(event: Any, gateway: Any, marker: str) -> None:
+async def _send_result(event: Any, gateway: Any, marker: str) -> bool:
     source = getattr(event, "source", None)
     adapter_for_source = getattr(gateway, "_adapter_for_source", None)
     adapter = adapter_for_source(source) if callable(adapter_for_source) else None
     if adapter is None:
         logger.error("Cannot deliver notion-excel-sync result: no Telegram adapter")
-        return
+        return False
     metadata: dict[str, str] = {}
     thread_id = str(getattr(source, "thread_id", "") or "").strip()
     if thread_id:
@@ -544,27 +575,65 @@ async def _send_result(event: Any, gateway: Any, marker: str) -> None:
     )
     if getattr(result, "success", True) is not True:
         logger.error("Telegram delivery failed for notion-excel-sync result")
+        return False
+    return True
+
+
+def _verified_gateway_module() -> Any:
+    """Load the trusted gateway only after validating the installed runtime."""
+
+    if _RUNTIME_MODE == "vendored":
+        _verify_vendored_runtime(expected_manifest_digest=_MANIFEST_DIGEST)
+        _assert_no_project_modules(_IMPORT_ROOT)
+        _verify_host_dependencies()
+        assert _RUNTIME_MANIFEST is not None
+        _verify_vendored_dependencies(_IMPORT_ROOT, _RUNTIME_MANIFEST)
+    _assert_package_origin(_IMPORT_ROOT)
+    from notion_excel_sync.security import hermes_gateway
+
+    return hermes_gateway
 
 
 async def _run_guarded(event: Any, gateway: Any, key: str) -> None:
-    try:
-        if _RUNTIME_MODE == "vendored":
-            _verify_vendored_runtime(expected_manifest_digest=_MANIFEST_DIGEST)
-            _assert_no_project_modules(_IMPORT_ROOT)
-            _verify_host_dependencies()
-            assert _RUNTIME_MANIFEST is not None
-            _verify_vendored_dependencies(_IMPORT_ROOT, _RUNTIME_MANIFEST)
-        _assert_package_origin(_IMPORT_ROOT)
-        from notion_excel_sync.security.hermes_gateway import (
-            handle_pre_gateway_dispatch,
-        )
+    loop = asyncio.get_running_loop()
 
-        marker = await asyncio.to_thread(
-            handle_pre_gateway_dispatch,
-            event=event,
-            gateway=gateway,
-            project_root=_PROJECT_ROOT,
+    def notify_authenticated_sync_start() -> None:
+        with _ACTIVE_LOCK:
+            if key in _ACTIVE:
+                _ACTIVE_STAGE[key] = "preparing"
+        delivery = asyncio.run_coroutine_threadsafe(
+            _send_result(event, gateway, _SYNC_ACCEPTED_MARKER),
+            loop,
         )
+        try:
+            if not delivery.result(timeout=10.0):
+                logger.error(
+                    "Could not deliver authenticated synchronization start marker"
+                )
+        except Exception:
+            delivery.cancel()
+            logger.error(
+                "Could not deliver authenticated synchronization start marker"
+            )
+
+    def execute_trusted_command() -> str | None:
+        try:
+            hermes_gateway = _verified_gateway_module()
+            return hermes_gateway.handle_pre_gateway_dispatch(
+                event=event,
+                gateway=gateway,
+                project_root=_PROJECT_ROOT,
+                on_authenticated_sync_start=notify_authenticated_sync_start,
+            )
+        finally:
+            # asyncio cancellation cannot stop a thread started by to_thread.
+            # Keep the command scope owned until that thread actually exits.
+            _release_active(key)
+
+    worker: asyncio.Task[str | None] | None = None
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(execute_trusted_command))
+        marker = await _await_shielded_completion(worker)
         if not marker:
             raise RuntimeError("Recognized workflow command produced no decision")
     except Exception:
@@ -574,12 +643,93 @@ async def _run_guarded(event: Any, gateway: Any, key: str) -> None:
             "검증되지 않은 Notion 쓰기는 허용되지 않았습니다."
         )
     finally:
-        with _ACTIVE_LOCK:
-            _ACTIVE.discard(key)
+        if worker is None:
+            _release_active(key)
     try:
-        await _send_result(event, gateway, marker)
+        delivery = asyncio.create_task(_send_result(event, gateway, marker))
+        await _await_shielded_completion(delivery)
     except Exception:
         logger.exception("Could not deliver trusted notion-excel-sync result")
+
+
+async def _report_sync_in_progress(
+    event: Any,
+    gateway: Any,
+    key: str,
+    active_started: float,
+) -> None:
+    with _ACTIVE_LOCK:
+        if _ACTIVE_STARTED.get(key) != active_started:
+            return
+        stage = _ACTIVE_STAGE.get(key, "authenticating")
+    elapsed_seconds = min(
+        max(int(time.monotonic() - active_started), 0),
+        86_400,
+    )
+
+    def authenticated_progress_marker() -> str:
+        hermes_gateway = _verified_gateway_module()
+        return hermes_gateway.authenticated_sync_progress_marker(
+            event=event,
+            gateway=gateway,
+            project_root=_PROJECT_ROOT,
+            stage=stage,
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    try:
+        worker = asyncio.create_task(
+            asyncio.to_thread(authenticated_progress_marker)
+        )
+        marker = await _await_shielded_completion(worker)
+        with _ACTIVE_LOCK:
+            if _ACTIVE_STARTED.get(key) != active_started:
+                return
+        delivery = asyncio.create_task(_send_result(event, gateway, marker))
+        await _await_shielded_completion(delivery)
+    except Exception:
+        logger.error("Could not deliver synchronization progress marker")
+
+
+def _forget_progress_task(
+    key: str,
+    task: asyncio.Task[None],
+) -> None:
+    with _ACTIVE_LOCK:
+        if _ACTIVE_PROGRESS.get(key) is task:
+            _ACTIVE_PROGRESS.pop(key, None)
+
+
+def _schedule_sync_progress(
+    event: Any,
+    gateway: Any,
+    key: str,
+) -> None:
+    """Coalesce a burst of duplicate sync requests into one authenticated read."""
+
+    loop = asyncio.get_running_loop()
+    with _ACTIVE_LOCK:
+        active_started = _ACTIVE_STARTED.get(key)
+        if active_started is None:
+            return
+        existing = _ACTIVE_PROGRESS.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = loop.create_task(
+            _report_sync_in_progress(
+                event,
+                gateway,
+                key,
+                active_started,
+            )
+        )
+        _ACTIVE_PROGRESS[key] = task
+    task.add_done_callback(
+        lambda finished, active_key=key: _forget_progress_task(
+            active_key,
+            finished,
+        )
+    )
 
 
 def _pre_gateway_dispatch(*, event: Any, gateway: Any, **_: Any) -> dict[str, str] | None:
@@ -596,13 +746,30 @@ def _pre_gateway_dispatch(*, event: Any, gateway: Any, **_: Any) -> dict[str, st
         key = _active_key(event)
         with _ACTIVE_LOCK:
             if key in _ACTIVE:
+                if str(getattr(event, "text", "") or "").strip().split(
+                    maxsplit=1
+                )[0] == "/nx_sync":
+                    try:
+                        _schedule_sync_progress(event, gateway, key)
+                    except Exception:
+                        logger.error(
+                            "Could not schedule synchronization progress marker"
+                        )
                 return {"action": "skip", "reason": "nx-command-in-progress"}
             _ACTIVE.add(key)
-        asyncio.get_running_loop().create_task(_run_guarded(event, gateway, key))
+            _ACTIVE_STARTED[key] = time.monotonic()
+            _ACTIVE_STAGE[key] = "authenticating"
+        guarded = asyncio.get_running_loop().create_task(
+            _run_guarded(event, gateway, key)
+        )
+        guarded.add_done_callback(
+            lambda task, active_key=key: (
+                _release_active(active_key) if task.cancelled() else None
+            )
+        )
     except Exception:
         logger.exception("Could not schedule trusted notion-excel-sync worker")
-        with _ACTIVE_LOCK:
-            _ACTIVE.discard(locals().get("key", ""))
+        _release_active(locals().get("key", ""))
     return {"action": "skip", "reason": "nx-command-consumed"}
 
 

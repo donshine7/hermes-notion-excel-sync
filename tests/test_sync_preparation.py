@@ -109,6 +109,20 @@ class FakeKnowledgeProvider:
         return self.snapshot
 
 
+class RecordingNotionReader:
+    def __init__(self) -> None:
+        self.clear_calls = 0
+        self.load_calls: list[set[tuple[str, str, str]]] = []
+
+    def clear_cache(self) -> None:
+        self.clear_calls += 1
+
+    def load(self, keys, title_values):
+        del title_values
+        self.load_calls.append(set(keys))
+        return {}
+
+
 def knowledge_ref() -> KnowledgeRef:
     return KnowledgeRef(
         drive_id="wiki-drive",
@@ -543,6 +557,7 @@ class SyncPreparationTest(unittest.TestCase):
                     shadow_counts={"government_support_evidence": 1},
                 )
             )
+            notion_reader = RecordingNotionReader()
             service = SyncPreparationService(
                 database,
                 VersionedWorkbookOneDrive(
@@ -552,6 +567,7 @@ class SyncPreparationTest(unittest.TestCase):
                 ExcelSnapshotReader([SheetSpec("지원사업", ("ID",))]),
                 AnalysisPipeline(build_default_registry()),
                 ProposalService(database, approval),
+                notion_reader=notion_reader,
                 knowledge_provider=knowledge,
             )
 
@@ -601,6 +617,15 @@ class SyncPreparationTest(unittest.TestCase):
             self.assertTrue(evidence_history)
             self.assertTrue(
                 all(operation.change.knowledge_refs == [ref] for operation in evidence_history)
+            )
+            self.assertEqual(notion_reader.clear_calls, 1)
+            self.assertTrue(notion_reader.load_calls)
+            self.assertTrue(
+                all(
+                    key[0] != "변경이력"
+                    for call in notion_reader.load_calls
+                    for key in call
+                )
             )
 
     def test_noop_new_version_advances_checkpoint_without_a_proposal(self) -> None:
@@ -673,6 +698,19 @@ class SyncPreparationTest(unittest.TestCase):
             self.assertEqual(result.current_version_id, "2.0")
             self.assertEqual(result.changes_detected, 1)
             self.assertIsNotNone(result.proposal)
+            assert result.proposal is not None
+            self.assertTrue(
+                any(
+                    operation.change.target_database != "변경이력"
+                    for operation in result.proposal.operations
+                )
+            )
+            self.assertFalse(
+                any(
+                    operation.change.target_database == "변경이력"
+                    for operation in result.proposal.operations
+                )
+            )
             self.assertIsNone(database.get_checkpoint("local", "local:item"))
 
     def test_pending_item_reappears_without_a_new_onedrive_version(self) -> None:

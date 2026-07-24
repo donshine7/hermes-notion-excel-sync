@@ -119,6 +119,16 @@ class NotionUpsertResult:
     page: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class NotionPropertyMutation:
+    """One exactly approved property mutation within a page-level request."""
+
+    operation_id: str
+    property_name: str
+    property_value: Any
+    precondition: NotionPrecondition
+
+
 class NotionGateway(Protocol):
     def get_page(self, page_id: str) -> Mapping[str, Any]: ...
 
@@ -152,6 +162,16 @@ class NotionGateway(Protocol):
         operation_id: str,
         approval: ApprovalReceipt,
         precondition: NotionPrecondition | None = None,
+    ) -> NotionUpsertResult: ...
+
+    def upsert_page_batch(
+        self,
+        data_source_id: str,
+        match: NotionMatch,
+        entity_key: JsonValue,
+        mutations: Sequence[NotionPropertyMutation],
+        *,
+        approval: ApprovalReceipt,
     ) -> NotionUpsertResult: ...
 
 
@@ -438,6 +458,123 @@ def _check_precondition(
         raise NotionError("Notion property changed before mutation", status=409)
 
 
+def _check_exact_page_target(
+    current: Mapping[str, Any] | None,
+    data_source_id: str,
+    match: NotionMatch,
+    entity_key: JsonValue,
+) -> None:
+    if current is None:
+        return
+    if current.get("archived") is True or current.get("in_trash") is True:
+        raise NotionError("Notion page is archived or in trash", status=409)
+    parent = current.get("parent")
+    if not isinstance(parent, Mapping):
+        raise NotionError("Notion page parent binding is missing", status=409)
+    parent_type = parent.get("type")
+    parent_id = (
+        parent.get(str(parent_type))
+        if parent_type in {"data_source_id", "database_id"}
+        else None
+    )
+    if str(parent_id or "") != data_source_id:
+        raise NotionError("Notion page target changed before mutation", status=409)
+    actual_match = _plain_property_value(
+        current.get("properties", {}).get(match.property_name),
+        match.property_type,
+    )
+    if actual_match != entity_key:
+        raise NotionError("Notion page match value changed before mutation", status=409)
+
+
+def _validated_property_mutations(
+    mutations: Sequence[NotionPropertyMutation],
+) -> tuple[NotionPropertyMutation, ...]:
+    """Validate a page mutation group before an approval verifier or HTTP call."""
+
+    items = tuple(mutations)
+    if not items:
+        raise ApprovalRequiredError("A page mutation batch must not be empty")
+    operation_ids: set[str] = set()
+    property_names: set[str] = set()
+    page_ids: set[str | None] = set()
+    edited_times: set[str | None] = set()
+    for item in items:
+        if not isinstance(item, NotionPropertyMutation):
+            raise ApprovalRequiredError("A page mutation batch is malformed")
+        if not item.operation_id.strip() or not item.property_name.strip():
+            raise ApprovalRequiredError(
+                "A page mutation batch requires operation and property identities"
+            )
+        if item.operation_id in operation_ids:
+            raise ApprovalRequiredError(
+                "A page mutation batch contains a duplicate operation"
+            )
+        if item.property_name in property_names:
+            raise ApprovalRequiredError(
+                "A page mutation batch contains a duplicate property"
+            )
+        if item.precondition.property_name != item.property_name:
+            raise ApprovalRequiredError(
+                "A page mutation precondition targets a different property"
+            )
+        operation_ids.add(item.operation_id)
+        property_names.add(item.property_name)
+        page_ids.add(item.precondition.page_id)
+        edited_times.add(item.precondition.last_edited_time)
+    if len(page_ids) != 1 or len(edited_times) != 1:
+        raise ApprovalRequiredError(
+            "A page mutation batch contains mixed page preconditions"
+        )
+    return items
+
+
+def _prepare_batch_mutation(
+    verifier: ApprovalVerifier,
+    receipt: ApprovalReceipt,
+    data_source_id: str,
+    match: NotionMatch,
+    entity_key: JsonValue,
+    mutations: Sequence[NotionPropertyMutation],
+    *,
+    now: Callable[[], datetime],
+) -> tuple[tuple[NotionPropertyMutation, ...], dict[str, Any]]:
+    if not data_source_id.strip() or entity_key in (None, ""):
+        raise ApprovalRequiredError("A page mutation batch has an empty target")
+    items = _validated_property_mutations(mutations)
+    properties: dict[str, Any] = {}
+    begin_batch = getattr(verifier, "begin_batch_verification", None)
+    end_batch = getattr(verifier, "end_batch_verification", None)
+    if callable(begin_batch):
+        begin_batch([item.operation_id for item in items])
+    verified = False
+    try:
+        for item in items:
+            single_property = {
+                item.property_name: copy.deepcopy(item.property_value)
+            }
+            _require_approval(
+                verifier,
+                receipt,
+                item.operation_id,
+                data_source_id,
+                match,
+                entity_key,
+                single_property,
+                item.precondition,
+                now=now,
+            )
+            properties[item.property_name] = single_property[item.property_name]
+        verified = True
+        return items, properties
+    finally:
+        if callable(end_batch):
+            end_batch(
+                [item.operation_id for item in items],
+                verified=verified,
+            )
+
+
 class InMemoryNotionGateway:
     """Approval-gated Notion substitute for tests and dry-run integration."""
 
@@ -559,6 +696,12 @@ class InMemoryNotionGateway:
                 else self.find_page(data_source_id, match, entity_key)
             )
             _check_precondition(current, precondition)
+            _check_exact_page_target(
+                current,
+                data_source_id,
+                match,
+                entity_key,
+            )
             if current is None:
                 if match.property_name not in properties:
                     raise ApprovalRequiredError(
@@ -580,6 +723,72 @@ class InMemoryNotionGateway:
                 return NotionUpsertResult(page_id, True, copy.deepcopy(page))
             clean_properties = _prepare_update_properties(
                 properties, match, entity_key
+            )
+            page_id = str(current["id"])
+            stored = self._pages[page_id]
+            stored.setdefault("properties", {}).update(clean_properties)
+            return NotionUpsertResult(page_id, False, copy.deepcopy(stored))
+
+    def upsert_page_batch(
+        self,
+        data_source_id: str,
+        match: NotionMatch,
+        entity_key: JsonValue,
+        mutations: Sequence[NotionPropertyMutation],
+        *,
+        approval: ApprovalReceipt,
+    ) -> NotionUpsertResult:
+        items, properties = _prepare_batch_mutation(
+            self._approval_verifier,
+            approval,
+            data_source_id,
+            match,
+            entity_key,
+            mutations,
+            now=self._now,
+        )
+        with self._lock:
+            first = items[0].precondition
+            current = (
+                self.get_page(first.page_id)
+                if first.page_id is not None
+                else self.find_page(data_source_id, match, entity_key)
+            )
+            for item in items:
+                _check_precondition(current, item.precondition)
+            _check_exact_page_target(
+                current,
+                data_source_id,
+                match,
+                entity_key,
+            )
+            if current is None:
+                if match.property_name not in properties:
+                    raise ApprovalRequiredError(
+                        "Creating a page requires an explicitly approved title property"
+                    )
+                clean_properties = _prepare_properties(
+                    properties,
+                    match,
+                    entity_key,
+                )
+                page_id = str(uuid4())
+                page = {
+                    "object": "page",
+                    "id": page_id,
+                    "parent": {
+                        "type": "data_source_id",
+                        "data_source_id": data_source_id,
+                    },
+                    "properties": clean_properties,
+                }
+                self._pages[page_id] = page
+                self._data_source_pages.setdefault(data_source_id, []).append(page_id)
+                return NotionUpsertResult(page_id, True, copy.deepcopy(page))
+            clean_properties = _prepare_update_properties(
+                properties,
+                match,
+                entity_key,
             )
             page_id = str(current["id"])
             stored = self._pages[page_id]
@@ -1000,6 +1209,12 @@ class HttpNotionGateway:
             else self.find_page(data_source_id, match, entity_key)
         )
         _check_precondition(current, precondition)
+        _check_exact_page_target(
+            current,
+            data_source_id,
+            match,
+            entity_key,
+        )
         if current is None:
             if match.property_name not in properties:
                 raise ApprovalRequiredError(
@@ -1022,6 +1237,75 @@ class HttpNotionGateway:
             return NotionUpsertResult(str(page["id"]), True, page)
         clean_properties = _prepare_update_properties(
             properties, match, entity_key
+        )
+        page_id = str(current["id"])
+        page = self._request(
+            "PATCH",
+            f"pages/{quote(page_id, safe='')}",
+            {"properties": clean_properties},
+        )
+        return NotionUpsertResult(page_id, False, page)
+
+    def upsert_page_batch(
+        self,
+        data_source_id: str,
+        match: NotionMatch,
+        entity_key: JsonValue,
+        mutations: Sequence[NotionPropertyMutation],
+        *,
+        approval: ApprovalReceipt,
+    ) -> NotionUpsertResult:
+        items, properties = _prepare_batch_mutation(
+            self._approval_verifier,
+            approval,
+            data_source_id,
+            match,
+            entity_key,
+            mutations,
+            now=self._now,
+        )
+        first = items[0].precondition
+        current = (
+            self.get_page(first.page_id)
+            if first.page_id is not None
+            else self.find_page(data_source_id, match, entity_key)
+        )
+        for item in items:
+            _check_precondition(current, item.precondition)
+        _check_exact_page_target(
+            current,
+            data_source_id,
+            match,
+            entity_key,
+        )
+        if current is None:
+            if match.property_name not in properties:
+                raise ApprovalRequiredError(
+                    "Creating a page requires an explicitly approved title property"
+                )
+            clean_properties = _prepare_properties(
+                properties,
+                match,
+                entity_key,
+            )
+            parent = (
+                {"type": "data_source_id", "data_source_id": data_source_id}
+                if self.uses_data_sources
+                else {"database_id": data_source_id}
+            )
+            page = self._request(
+                "POST",
+                "pages",
+                {
+                    "parent": parent,
+                    "properties": clean_properties,
+                },
+            )
+            return NotionUpsertResult(str(page["id"]), True, page)
+        clean_properties = _prepare_update_properties(
+            properties,
+            match,
+            entity_key,
         )
         page_id = str(current["id"])
         page = self._request(

@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
+import notion_excel_sync.persistence.database as database_module
 from notion_excel_sync.models import (
     ChangeKind,
     ProposalAction,
+    ProposalOperation,
     ProposalPurpose,
+    ProposalRevision,
     ProposalStatus,
     ProposedChange,
     SourceRef,
     source_basis_digest,
 )
-from notion_excel_sync.persistence.database import StateDatabase
+from notion_excel_sync.persistence.database import (
+    MutationScopeConflict,
+    StateDatabase,
+)
 from notion_excel_sync.workflow.proposals import ProposalError, ProposalService
+from notion_excel_sync.workflow.review_cards import HISTORY_DATABASE
 
 
 DATABASE = "한국 특허 사건"
@@ -122,6 +131,356 @@ def _seed_override(
     operation.user_override = True
     _commit(database, proposal)
     return database.get_approved_override(DATABASE, ENTITY, PROPERTY)
+
+
+class _CountingOperationList(list[ProposalOperation]):
+    def __init__(self, values: list[ProposalOperation]) -> None:
+        super().__init__(values)
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+
+def test_large_bulk_override_lookup_indexes_one_owner_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database, _proposals = _state(tmp_path)
+    owner_operations: list[ProposalOperation] = []
+    for index in range(1480):
+        operation = ProposalOperation(
+            _change(
+                f"owner-override-operation-{index}",
+                entity_key=f"case:SS-OVERRIDE-{index:05d}",
+            )
+        )
+        operation.action = ProposalAction.EDIT
+        operation.approved_value = f"approved-{index}"
+        operation.user_override = True
+        owner_operations.append(operation)
+    owner = ProposalRevision(
+        proposal_id="P-LARGE-OVERRIDE-OWNER",
+        revision=1,
+        source_version_id="v1",
+        source_file_hash="a" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=owner_operations,
+        status=ProposalStatus.COMMITTED,
+    )
+    database.save_proposal(owner)
+    now = "2026-07-23T00:00:00+00:00"
+    with database.session() as connection:
+        connection.executemany(
+            """
+            INSERT INTO approved_override(
+                scope_digest, case_number, database_name, entity_key,
+                property_name, approved_value, source_basis_digest,
+                observed_basis_digest, source_file_hash, proposal_id,
+                revision, operation_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    database_module._mutation_scope_digest(
+                        DATABASE,
+                        PROPERTY,
+                        (
+                            "notion_page",
+                            f"synthetic-page-{index:05d}",
+                        ),
+                    ),
+                    f"SS-OVERRIDE-{index:05d}",
+                    DATABASE,
+                    f"case:SS-OVERRIDE-{index:05d}",
+                    PROPERTY,
+                    json.dumps(f"approved-{index}"),
+                    f"basis-{index}",
+                    f"basis-{index}",
+                    "a" * 64,
+                    owner.proposal_id,
+                    owner.revision,
+                    f"owner-override-operation-{index}",
+                    now,
+                    now,
+                )
+                for index in range(1480)
+            ],
+        )
+
+    current_operations = [
+        ProposalOperation(
+            _change(
+                f"current-override-operation-{index}",
+                entity_key=f"SS-OVERRIDE-{index:05d}",
+            )
+        )
+        for index in range(1480)
+    ]
+    current = ProposalRevision(
+        proposal_id="P-LARGE-OVERRIDE-LOOKUP",
+        revision=1,
+        source_version_id="v2",
+        source_file_hash="b" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=current_operations,
+    )
+    parse_calls = 0
+    parsed_operation_lists: list[_CountingOperationList] = []
+    original_parser = database_module._proposal_from_dict
+
+    def counted_parser(payload):
+        nonlocal parse_calls
+        parse_calls += 1
+        proposal = original_parser(payload)
+        operations = _CountingOperationList(list(proposal.operations))
+        proposal.operations = operations
+        parsed_operation_lists.append(operations)
+        return proposal
+
+    monkeypatch.setattr(
+        database_module,
+        "_proposal_from_dict",
+        counted_parser,
+    )
+    candidate_visits = 0
+    original_find = database._find_approved_override
+
+    def counted_find(connection, proposal, operation, **kwargs):
+        nonlocal candidate_visits
+        candidate_visits += len(kwargs.get("candidate_rows") or [])
+        return original_find(
+            connection,
+            proposal,
+            operation,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        database,
+        "_find_approved_override",
+        counted_find,
+    )
+    statements: list[str] = []
+    original_connect = database.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    results = database.get_approved_overrides_for_operations(
+        current,
+        current.operations,
+    )
+
+    assert len(results) == 1480
+    assert all(result is not None for result in results)
+    assert results[0]["approved_value"] == "approved-0"
+    assert results[-1]["approved_value"] == "approved-1479"
+    assert candidate_visits == 1480
+    assert parse_calls == 1
+    assert len(parsed_operation_lists) == 1
+    assert parsed_operation_lists[0].iterations <= 2
+    selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+    ]
+    assert sum(
+        "FROM APPROVED_OVERRIDE" in statement.upper()
+        for statement in selects
+    ) == 1
+    assert sum(
+        "FROM PROPOSAL_REVISION" in statement.upper()
+        for statement in selects
+    ) == 1
+    assert sum(
+        "FROM ENTITY_MAPPING" in statement.upper()
+        for statement in selects
+    ) <= 3
+
+
+def test_bulk_override_conflicting_signatures_still_fail_closed(
+    tmp_path,
+) -> None:
+    database, _proposals = _state(tmp_path)
+    owner = ProposalRevision(
+        proposal_id="P-CONFLICTING-OVERRIDE-OWNER",
+        revision=1,
+        source_version_id="v1",
+        source_file_hash="a" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=[
+            ProposalOperation(
+                _change(
+                    "conflicting-override-one",
+                    entity_key=f"case:{ENTITY}",
+                )
+            ),
+            ProposalOperation(
+                _change(
+                    "conflicting-override-two",
+                    entity_key=f"alias:{ENTITY}",
+                )
+            ),
+        ],
+        status=ProposalStatus.COMMITTED,
+    )
+    database.save_proposal(owner)
+    now = "2026-07-23T00:00:00+00:00"
+    with database.session() as connection:
+        connection.executemany(
+            """
+            INSERT INTO approved_override(
+                scope_digest, case_number, database_name, entity_key,
+                property_name, approved_value, source_basis_digest,
+                observed_basis_digest, source_file_hash, proposal_id,
+                revision, operation_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    database_module._mutation_scope_digest(
+                        DATABASE,
+                        PROPERTY,
+                        ("notion_page", f"synthetic-page-{index}"),
+                    ),
+                    ENTITY,
+                    DATABASE,
+                    entity_key,
+                    PROPERTY,
+                    json.dumps(f"approved-{index}"),
+                    f"basis-{index}",
+                    f"basis-{index}",
+                    "a" * 64,
+                    owner.proposal_id,
+                    owner.revision,
+                    operation_id,
+                    now,
+                    now,
+                )
+                for index, (entity_key, operation_id) in enumerate(
+                    (
+                        (f"case:{ENTITY}", "conflicting-override-one"),
+                        (f"alias:{ENTITY}", "conflicting-override-two"),
+                    )
+                )
+            ],
+        )
+    current_operation = ProposalOperation(
+        _change("conflicting-override-current")
+    )
+    current = ProposalRevision(
+        proposal_id="P-CONFLICTING-OVERRIDE-LOOKUP",
+        revision=1,
+        source_version_id="v2",
+        source_file_hash="b" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=[current_operation],
+    )
+
+    with pytest.raises(
+        MutationScopeConflict,
+        match="Conflicting approved overrides",
+    ):
+        database.get_approved_override_for_operation(
+            current,
+            current_operation,
+        )
+
+
+def test_large_create_uses_one_bulk_override_session_and_skips_history(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database, proposals = _state(tmp_path)
+    regular_changes = [
+        _change(
+            f"bulk-operation-{index}",
+            entity_key=f"SS-BULK-{index:05d}",
+        )
+        for index in range(1480)
+    ]
+    history_changes = [
+        ProposedChange(
+            target_database=HISTORY_DATABASE,
+            entity_key=f"history:bulk-operation-{index}",
+            property_name="Synthetic history value",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value=f"value-{index}",
+            analyzer="synthetic_history",
+            analyzer_version="1",
+            confidence=1.0,
+            reason="Synthetic generated history",
+            source_refs=[],
+            operation_id=f"history-operation-{index}",
+        )
+        for index in range(20)
+    ]
+    original_bulk_lookup = (
+        database.get_approved_overrides_for_operations
+    )
+    bulk_calls: list[list[str]] = []
+
+    def tracked_bulk_lookup(proposal, operations):
+        operation_list = list(operations)
+        bulk_calls.append(
+            [
+                operation.change.target_database
+                for operation in operation_list
+            ]
+        )
+        return original_bulk_lookup(proposal, operation_list)
+
+    monkeypatch.setattr(
+        database,
+        "get_approved_overrides_for_operations",
+        tracked_bulk_lookup,
+    )
+    monkeypatch.setattr(
+        database,
+        "get_approved_override_for_operation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("per-operation override lookup was used")
+        ),
+    )
+    connect_count = 0
+    statements: list[str] = []
+    original_connect = database.connect
+
+    def traced_connect():
+        nonlocal connect_count
+        connect_count += 1
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    proposal = proposals.create(
+        "v-large",
+        "a" * 64,
+        "synthetic-user",
+        "synthetic-chat",
+        [*regular_changes, *history_changes],
+    )
+
+    assert len(proposal.operations) == 1500
+    assert len(bulk_calls) == 1
+    assert len(bulk_calls[0]) == 1480
+    assert set(bulk_calls[0]) == {DATABASE}
+    assert connect_count == 3
+    assert sum(
+        "FROM APPROVED_OVERRIDE" in statement.upper()
+        for statement in statements
+    ) == 1
 
 
 def test_source_basis_ignores_workbook_identity_but_detects_cited_cell_change() -> None:

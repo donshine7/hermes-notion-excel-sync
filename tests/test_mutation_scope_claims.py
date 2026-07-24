@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import pytest
 
+import notion_excel_sync.persistence.database as database_module
 from notion_excel_sync.models import (
     ChangeKind,
     ProposalAction,
+    ProposalOperation,
     ProposalPurpose,
+    ProposalRevision,
     ProposalStatus,
     ProposedChange,
 )
 from notion_excel_sync.persistence.database import (
     MutationScopeConflict,
+    ProposalInternalScopeConflict,
     ProposalRejectionError,
     StateDatabase,
 )
@@ -64,6 +68,200 @@ def _correction_binding(
     }
 
 
+class _CountingOperationList(list[ProposalOperation]):
+    def __init__(self, values: list[ProposalOperation]) -> None:
+        super().__init__(values)
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+
+def test_large_scope_precomputation_and_sync_use_constant_select_passes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = StateDatabase(tmp_path / "state.db")
+    database.initialize()
+    operations = _CountingOperationList(
+        [
+            ProposalOperation(
+                _change(
+                    f"large-operation-{index}",
+                    entity_key=f"SS-LARGE-{index:05d}",
+                )
+            )
+            for index in range(1480)
+        ]
+    )
+    proposal = ProposalRevision(
+        proposal_id="P-LARGE-SYNTHETIC",
+        revision=1,
+        source_version_id="v1",
+        source_file_hash="a" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=operations,
+    )
+
+    with database.session() as connection:
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        desired = database._desired_mutation_scope_claims(
+            connection,
+            proposal,
+        )
+
+    assert len(desired) == 1480
+    assert operations.iterations <= 3
+    assert sum(
+        "FROM ENTITY_MAPPING" in statement.upper()
+        for statement in statements
+    ) == 1
+    assert not any(
+        "FROM OUTBOX" in statement.upper()
+        for statement in statements
+    )
+
+    sync_statements: list[str] = []
+    original_connect = database.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(sync_statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    database.save_proposal(proposal)
+
+    selects = [
+        statement
+        for statement in sync_statements
+        if statement.lstrip().upper().startswith("SELECT")
+    ]
+    assert len(selects) <= 3
+    assert sum(
+        "FROM MUTATION_SCOPE_CLAIM" in statement.upper()
+        for statement in selects
+    ) == 1
+    with database.session() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM mutation_scope_claim "
+                "WHERE proposal_id = ?",
+                (proposal.proposal_id,),
+            ).fetchone()[0]
+            == 1480
+        )
+
+
+def test_large_foreign_claim_owner_is_loaded_and_indexed_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = StateDatabase(tmp_path / "state.db")
+    database.initialize()
+    owner = ProposalRevision(
+        proposal_id="P-LARGE-FOREIGN-OWNER",
+        revision=1,
+        source_version_id="v1",
+        source_file_hash="a" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=[
+            ProposalOperation(
+                _change(
+                    f"foreign-operation-{index}",
+                    entity_key=f"SS-FOREIGN-{index:05d}",
+                )
+            )
+            for index in range(1480)
+        ],
+    )
+    database.save_proposal(owner)
+
+    parse_calls = 0
+    parsed_operation_lists: list[_CountingOperationList] = []
+    original_parser = database_module._proposal_from_dict
+
+    def counted_parser(payload):
+        nonlocal parse_calls
+        parse_calls += 1
+        proposal = original_parser(payload)
+        operations = _CountingOperationList(list(proposal.operations))
+        proposal.operations = operations
+        parsed_operation_lists.append(operations)
+        return proposal
+
+    monkeypatch.setattr(
+        database_module,
+        "_proposal_from_dict",
+        counted_parser,
+    )
+    statements: list[str] = []
+    original_connect = database.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    colliding = ProposalRevision(
+        proposal_id="P-COLLIDING-FOREIGN-CLAIM",
+        revision=1,
+        source_version_id="v2",
+        source_file_hash="b" * 64,
+        requested_by="synthetic-user",
+        chat_id="synthetic-chat",
+        operations=[
+            ProposalOperation(
+                _change(
+                    "colliding-foreign-operation",
+                    entity_key="SS-FOREIGN-01479",
+                )
+            )
+        ],
+    )
+
+    with pytest.raises(MutationScopeConflict, match="already owns"):
+        database.save_proposal(colliding)
+
+    selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+    ]
+    assert parse_calls == 1
+    assert len(parsed_operation_lists) == 1
+    assert parsed_operation_lists[0].iterations <= 2
+    assert sum(
+        "FROM PROPOSAL_REVISION" in statement.upper()
+        for statement in selects
+    ) == 1
+    assert sum(
+        "FROM ENTITY_MAPPING" in statement.upper()
+        for statement in selects
+    ) <= 2
+    with database.session() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM mutation_scope_claim "
+                "WHERE proposal_id = ?",
+                (owner.proposal_id,),
+            ).fetchone()[0]
+            == 1480
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM proposal WHERE proposal_id = ?",
+                (colliding.proposal_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_excel_and_correction_proposals_block_the_same_scope_both_ways(
     tmp_path,
 ) -> None:
@@ -101,6 +299,7 @@ def test_excel_and_correction_proposals_block_the_same_scope_both_ways(
             )
         except MutationScopeConflict as exc:
             assert "already owns" in str(exc)
+            assert not isinstance(exc, ProposalInternalScopeConflict)
         else:
             raise AssertionError("conflicting property proposal was accepted")
 
@@ -662,7 +861,7 @@ def test_non_identical_duplicate_scope_in_one_proposal_is_rejected(
     _database_state, proposals = _database(tmp_path)
 
     with pytest.raises(
-        MutationScopeConflict,
+        ProposalInternalScopeConflict,
         match="multiple non-identical mutations",
     ):
         proposals.create(

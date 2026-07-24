@@ -131,15 +131,32 @@ class ProposalService:
         effective_changes: list[ProposedChange] = []
         operations: list[ProposalOperation] = []
         retained_override_operation_ids: set[str] = set()
+        override_by_operation: dict[int, dict[str, object] | None] = {}
+        if purpose is ProposalPurpose.EXCEL_SYNC:
+            override_candidates = [
+                operation
+                for operation in identity_operations
+                if operation.change.target_database != HISTORY_DATABASE
+            ]
+            override_by_operation = {
+                id(operation): override
+                for operation, override in zip(
+                    override_candidates,
+                    self.database.get_approved_overrides_for_operations(
+                        identity_context,
+                        override_candidates,
+                    ),
+                    strict=True,
+                )
+            }
         for identity_operation in identity_operations:
             change = identity_operation.change
             action = identity_operation.action
             approved_value = identity_operation.approved_value
             user_override = identity_operation.user_override
             if purpose is ProposalPurpose.EXCEL_SYNC:
-                override = self.database.get_approved_override_for_operation(
-                    identity_context,
-                    identity_operation,
+                override = override_by_operation.get(
+                    id(identity_operation)
                 )
                 if override is not None:
                     observed_basis = (

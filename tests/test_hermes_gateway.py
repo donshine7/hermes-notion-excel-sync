@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
 import unittest
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,7 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
+from notion_excel_sync.adapters.notion import InMemoryNotionGateway
 from notion_excel_sync.config import load_config
 from notion_excel_sync.knowledge.provider import AnalyzerKnowledgeProvider
 from notion_excel_sync.models import (
@@ -30,6 +32,7 @@ from notion_excel_sync.models import (
 from notion_excel_sync.persistence.database import (
     ApplyLeaseError,
     MutationScopeConflict,
+    ProposalInternalScopeConflict,
     StateDatabase,
 )
 from notion_excel_sync.security.approval import ApprovalService
@@ -38,6 +41,7 @@ from notion_excel_sync.security.hermes_gateway import (
     _apply_gateway_receipt,
     _prepare_authenticated_sync,
     _resolve_config_path,
+    authenticated_sync_progress_marker,
     handle_pre_gateway_dispatch,
 )
 from notion_excel_sync.security.receipt_io import (
@@ -46,7 +50,10 @@ from notion_excel_sync.security.receipt_io import (
     resolve_receipt_reference,
 )
 from notion_excel_sync.workflow.apply import ApplyReport
-from notion_excel_sync.workflow.notion_writer import NOTION_DEFINITIONS
+from notion_excel_sync.workflow.notion_writer import (
+    NOTION_DEFINITIONS,
+    build_notion_binding,
+)
 from notion_excel_sync.workflow.proposals import ProposalService
 from notion_excel_sync.workflow.sync import PreparationResult
 
@@ -428,6 +435,129 @@ class HermesGatewayApprovalTest(unittest.TestCase):
             "v-noop",
         )
 
+    def test_sync_start_callback_requires_exact_authenticated_command(self) -> None:
+        starts: list[str] = []
+
+        def mark_started() -> None:
+            starts.append("started")
+
+        def prepared_after_marker(config, database, identity):
+            self.assertEqual(starts, ["started"])
+            return PreparationResult("v1", "v1", 0, None)
+
+        event = FakeEvent(text="/nx_sync", source=FakeSource())
+        with patch(
+            "notion_excel_sync.security.hermes_gateway._prepare_authenticated_sync",
+            side_effect=prepared_after_marker,
+        ) as prepare:
+            denied = handle_pre_gateway_dispatch(
+                event=event,
+                gateway=FakeGateway(authorized=False),
+                project_root=self.project_root,
+                on_authenticated_sync_start=mark_started,
+            )
+            self.assertIn("code=command_rejected", str(denied))
+            self.assertEqual(starts, [])
+            prepare.assert_not_called()
+
+            malformed = handle_pre_gateway_dispatch(
+                event=FakeEvent(text="/nx_sync extra", source=FakeSource()),
+                gateway=FakeGateway(authorized=True),
+                project_root=self.project_root,
+                on_authenticated_sync_start=mark_started,
+            )
+            self.assertIn("code=command_rejected", str(malformed))
+            self.assertEqual(starts, [])
+            prepare.assert_not_called()
+
+            marker = handle_pre_gateway_dispatch(
+                event=event,
+                gateway=FakeGateway(authorized=True),
+                project_root=self.project_root,
+                on_authenticated_sync_start=mark_started,
+            )
+
+        self.assertTrue(str(marker).startswith("[NX_SYNC_NO_CHANGES]"))
+        self.assertEqual(starts, ["started"])
+        prepare.assert_called_once()
+
+    def test_sync_progress_marker_repeats_auth_without_sensitive_context(self) -> None:
+        source = FakeSource(
+            user_id="123",
+            chat_id="private-chat-value",
+            message_id="private-message-value",
+        )
+        event = FakeEvent(text="/nx_sync", source=source)
+
+        with patch.object(
+            StateDatabase,
+            "initialize",
+            side_effect=AssertionError(
+                "progress reporting must not initialize workflow state"
+            ),
+        ) as initialize:
+            marker = authenticated_sync_progress_marker(
+                event=event,
+                gateway=FakeGateway(authorized=True),
+                project_root=self.project_root,
+                stage="authenticating",
+                elapsed_seconds=17,
+            )
+        initialize.assert_not_called()
+
+        self.assertIn("[NX_SYNC_IN_PROGRESS]", marker)
+        self.assertIn("stage=authenticating", marker)
+        self.assertIn("elapsed_seconds=17", marker)
+        self.assertNotIn(source.chat_id, marker)
+        self.assertNotIn(source.message_id, marker)
+        self.assertNotIn(source.user_id, marker)
+        self.assertNotIn(str(self.project_root), marker)
+
+        unauthorized = authenticated_sync_progress_marker(
+            event=event,
+            gateway=FakeGateway(authorized=False),
+            project_root=self.project_root,
+        )
+        self.assertIn("code=command_rejected", unauthorized)
+        self.assertNotIn("[NX_SYNC_IN_PROGRESS]", unauthorized)
+
+        malformed = authenticated_sync_progress_marker(
+            event=FakeEvent(text="/nx_sync extra", source=source),
+            gateway=FakeGateway(authorized=True),
+            project_root=self.project_root,
+        )
+        self.assertIn("code=invalid_syntax", malformed)
+        self.assertNotIn("[NX_SYNC_IN_PROGRESS]", malformed)
+
+    def test_sync_scope_conflicts_have_distinct_safe_codes(self) -> None:
+        sensitive = r"C:\private\proposal.json token=never-echo"
+        cases = (
+            (
+                ProposalInternalScopeConflict(sensitive),
+                "code=proposal_duplicate_scope",
+                "multiple changes for the same Notion mutation scope",
+            ),
+            (
+                MutationScopeConflict(sensitive),
+                "code=active_proposal_scope_conflict",
+                "Another active proposal owns",
+            ),
+        )
+
+        for exc, code, message in cases:
+            with self.subTest(code=code), patch(
+                "notion_excel_sync.security.hermes_gateway._prepare_authenticated_sync",
+                side_effect=exc,
+            ):
+                marker = self.handle(
+                    FakeEvent(text="/nx_sync", source=FakeSource())
+                )
+            self.assertIn(code, marker)
+            self.assertIn(message, marker)
+            self.assertNotIn(sensitive, marker)
+            self.assertNotIn("private", marker)
+            self.assertNotIn("token", marker)
+
     def test_authenticated_prepare_wires_wiki_provider_only_when_index_exists(
         self,
     ) -> None:
@@ -800,9 +930,13 @@ class HermesGatewayApprovalTest(unittest.TestCase):
             ProposalStatus.REJECTED,
         )
 
-        failed, _ = self.editable_proposal(status=ProposalStatus.FAILED)
+        failed, failed_change = self.editable_proposal(
+            status=ProposalStatus.FAILED
+        )
         writer = MagicMock()
-        writer.inspect.return_value = WritePreconditionState.PENDING
+        writer.inspect_batch.return_value = {
+            failed_change.operation_id: WritePreconditionState.PENDING
+        }
         with (
             patch(
                 "notion_excel_sync.security.hermes_gateway._capture_current_source",
@@ -827,6 +961,459 @@ class HermesGatewayApprovalTest(unittest.TestCase):
         self.assertEqual(recovery.revision, 2)
         self.assertIs(recovery.status, ProposalStatus.PENDING_APPROVAL)
         self.assertTrue(recovered.startswith("[NX_RECOVERY_PROPOSAL_READY]"))
+
+    def test_recover_atomically_reconciles_title_ack_loss_mapping(self) -> None:
+        database_name, definition = next(iter(NOTION_DEFINITIONS.items()))
+        data_sources = {database_name: "synthetic-data-source"}
+        schema = {
+            "properties": {
+                definition.title_property: {
+                    "type": "title",
+                    "title": {},
+                }
+            }
+        }
+        change = ProposedChange(
+            target_database=database_name,
+            entity_key="case:stable-recovery-key",
+            property_name=definition.title_property,
+            kind=ChangeKind.UPDATE,
+            current_value="CASE-OLD",
+            proposed_value="CASE-NEW",
+            analyzer="synthetic_recovery",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic title acknowledgement loss",
+            source_refs=[
+                SourceRef(
+                    "drive",
+                    "item",
+                    "source-v1",
+                    "source-hash",
+                    "Cases",
+                    2,
+                    "A2",
+                    "CASE-NEW",
+                )
+            ],
+        )
+        approval = ApprovalService(
+            SECRET,
+            {"123"},
+            nonce_used=self.database.nonce_used,
+            mark_nonce_used=self.database.mark_nonce_used,
+        )
+        service = ProposalService(
+            self.database,
+            approval,
+            notion_data_sources=data_sources,
+        )
+        self.database.save_entity_mapping(
+            database_name,
+            change.entity_key,
+            "page-title",
+            "CASE-OLD",
+        )
+        proposal = service.create(
+            "source-v1",
+            "source-hash",
+            "123",
+            "chat",
+            [change],
+            notion_binding=build_notion_binding(
+                [change],
+                data_sources,
+                schema_provider=lambda _data_source_id: schema,
+            ),
+        )
+        proposal = service.request_approval(proposal.proposal_id)
+        receipt = service.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        applying = self.database.load_proposal(proposal.proposal_id)
+        applying.status = ProposalStatus.APPLYING
+        self.database.begin_apply(applying, receipt.nonce)
+        failed = self.database.load_proposal(proposal.proposal_id)
+        failed.status = ProposalStatus.FAILED
+        self.database.save_proposal(failed)
+        self.database.mark_outbox(
+            change.operation_id,
+            "failed",
+            "notion_write_failed",
+        )
+        read_gateway = InMemoryNotionGateway(
+            lambda *_: True,
+            initial_pages={
+                "synthetic-data-source": [
+                    {
+                        "id": "page-title",
+                        "properties": {
+                            definition.title_property: {
+                                "title": [{"plain_text": "CASE-NEW"}]
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+        read_gateway.get_data_source = lambda _data_source_id: schema
+        read_gateway.upsert_page = MagicMock(
+            side_effect=AssertionError("recovery must not write to Notion")
+        )
+        read_gateway.upsert_page_batch = MagicMock(
+            side_effect=AssertionError("recovery must not write to Notion")
+        )
+
+        with (
+            patch(
+                "notion_excel_sync.security.hermes_gateway._capture_current_source",
+                return_value=("source-v1", "source-hash"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._notion_read_gateway",
+                return_value=read_gateway,
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._configured_data_sources",
+                return_value=data_sources,
+            ),
+        ):
+            marker = self.handle(
+                FakeEvent(
+                    text=f"/nx_recover {proposal.proposal_id} 1",
+                    source=FakeSource(),
+                )
+            )
+
+        self.assertTrue(marker.startswith("[NX_RECOVERY_PROPOSAL_READY]"))
+        read_gateway.upsert_page.assert_not_called()
+        read_gateway.upsert_page_batch.assert_not_called()
+        mapping = self.database.get_entity_mapping(
+            database_name,
+            change.entity_key,
+        )
+        self.assertEqual(mapping["notion_page_id"], "page-title")
+        self.assertEqual(mapping["match_value"], "CASE-NEW")
+        self.assertEqual(
+            self.database.operation_outbox_state(change.operation_id)["status"],
+            "done",
+        )
+        recovery = self.database.load_proposal(proposal.proposal_id)
+        self.assertEqual(recovery.revision, 2)
+        self.assertIs(
+            recovery.operations[0].action,
+            ProposalAction.EXCLUDE,
+        )
+
+    def test_recover_adopts_crashed_apply_after_secret_rotation_read_only(
+        self,
+    ) -> None:
+        database_name, definition = next(iter(NOTION_DEFINITIONS.items()))
+        data_sources = {database_name: "synthetic-data-source"}
+        schema = {
+            "properties": {
+                definition.title_property: {
+                    "type": "title",
+                    "title": {},
+                }
+            }
+        }
+        change = ProposedChange(
+            target_database=database_name,
+            entity_key="case:rotated-secret-recovery",
+            property_name=definition.title_property,
+            kind=ChangeKind.UPDATE,
+            current_value="CASE-OLD",
+            proposed_value="CASE-NEW",
+            analyzer="synthetic_recovery",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic signer rotation after acknowledgement loss",
+            source_refs=[
+                SourceRef(
+                    "drive",
+                    "item",
+                    "source-v1",
+                    "source-hash",
+                    "Cases",
+                    2,
+                    "A2",
+                    "CASE-NEW",
+                )
+            ],
+        )
+        old_approval = ApprovalService(
+            SECRET,
+            {"123"},
+            nonce_used=self.database.nonce_used,
+            mark_nonce_used=self.database.mark_nonce_used,
+        )
+        service = ProposalService(
+            self.database,
+            old_approval,
+            notion_data_sources=data_sources,
+        )
+        self.database.save_entity_mapping(
+            database_name,
+            change.entity_key,
+            "page-title",
+            "CASE-OLD",
+        )
+        proposal = service.create(
+            "source-v1",
+            "source-hash",
+            "123",
+            "chat",
+            [change],
+            notion_binding=build_notion_binding(
+                [change],
+                data_sources,
+                schema_provider=lambda _data_source_id: schema,
+            ),
+        )
+        proposal = service.request_approval(proposal.proposal_id)
+        receipt = service.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        applying = self.database.load_proposal(proposal.proposal_id)
+        applying.status = ProposalStatus.APPLYING
+        self.database.begin_apply(applying, receipt.nonce)
+        crashed_owner = self.database.acquire_apply_lease(
+            drive_id="drive",
+            item_id="item",
+            proposal_id=proposal.proposal_id,
+            revision=proposal.revision,
+        )
+        with self.database.session() as connection:
+            connection.execute(
+                "UPDATE source_apply_lease SET owner_pid = ? "
+                "WHERE owner_token = ?",
+                (2_147_483_647, crashed_owner),
+            )
+        read_gateway = InMemoryNotionGateway(
+            lambda *_: True,
+            initial_pages={
+                "synthetic-data-source": [
+                    {
+                        "id": "page-title",
+                        "properties": {
+                            definition.title_property: {
+                                "title": [{"plain_text": "CASE-NEW"}]
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+        read_gateway.get_data_source = lambda _data_source_id: schema
+        read_gateway.upsert_page = MagicMock(
+            side_effect=AssertionError("recovery must not write to Notion")
+        )
+        read_gateway.upsert_page_batch = MagicMock(
+            side_effect=AssertionError("recovery must not write to Notion")
+        )
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    SECRET_ENV: (
+                        "synthetic-rotated-approval-secret-at-least-24-characters"
+                    )
+                },
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._capture_current_source",
+                return_value=("source-v1", "source-hash"),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._notion_read_gateway",
+                return_value=read_gateway,
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway._configured_data_sources",
+                return_value=data_sources,
+            ),
+        ):
+            denied = self.handle(
+                FakeEvent(
+                    text=(
+                        f"/nx_approve {proposal.proposal_id} 1 "
+                        f"{proposal.digest}"
+                    ),
+                    source=FakeSource(),
+                )
+            )
+            self.assertIn("code=approval_rejected", denied)
+            marker = self.handle(
+                FakeEvent(
+                    text=f"/nx_recover {proposal.proposal_id} 1",
+                    source=FakeSource(),
+                )
+            )
+
+        self.assertTrue(marker.startswith("[NX_RECOVERY_PROPOSAL_READY]"))
+        read_gateway.upsert_page.assert_not_called()
+        read_gateway.upsert_page_batch.assert_not_called()
+        mapping = self.database.get_entity_mapping(
+            database_name,
+            change.entity_key,
+        )
+        self.assertEqual(mapping["notion_page_id"], "page-title")
+        self.assertEqual(mapping["match_value"], "CASE-NEW")
+        self.assertEqual(
+            self.database.operation_outbox_state(change.operation_id)["status"],
+            "done",
+        )
+        recovery = self.database.load_proposal(proposal.proposal_id)
+        self.assertEqual(recovery.revision, 2)
+        self.assertIs(
+            recovery.operations[0].action,
+            ProposalAction.EXCLUDE,
+        )
+        with self.database.session() as connection:
+            lease = connection.execute(
+                "SELECT 1 FROM source_apply_lease "
+                "WHERE drive_id = ? AND item_id = ?",
+                ("drive", "item"),
+            ).fetchone()
+        self.assertIsNone(lease)
+
+    def test_recover_refuses_to_preempt_live_apply_owner(self) -> None:
+        proposal, change = self.editable_proposal()
+        approval = ApprovalService(
+            SECRET,
+            {"123"},
+            nonce_used=self.database.nonce_used,
+            mark_nonce_used=self.database.mark_nonce_used,
+        )
+        proposal_service = ProposalService(
+            self.database,
+            approval,
+        )
+        receipt = proposal_service.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        applying = self.database.load_proposal(proposal.proposal_id)
+        applying.status = ProposalStatus.APPLYING
+        self.database.begin_apply(applying, receipt.nonce)
+        owner_token = self.database.acquire_apply_lease(
+            drive_id="drive",
+            item_id="item",
+            proposal_id=proposal.proposal_id,
+            revision=proposal.revision,
+        )
+        try:
+            with (
+                patch(
+                    "notion_excel_sync.security.hermes_gateway."
+                    "_capture_current_source",
+                    side_effect=AssertionError(
+                        "live-owner denial must not inspect the source"
+                    ),
+                ),
+                patch(
+                    "notion_excel_sync.security.hermes_gateway."
+                    "_notion_read_gateway",
+                    side_effect=AssertionError(
+                        "live-owner denial must not inspect or write Notion"
+                    ),
+                ),
+            ):
+                denied = self.handle(
+                    FakeEvent(
+                        text=f"/nx_recover {proposal.proposal_id} 1",
+                        source=FakeSource(),
+                    )
+                )
+        finally:
+            self.database.release_apply_lease(owner_token)
+
+        self.assertIn("code=command_rejected", denied)
+        self.assertIn("live apply worker", denied)
+        current = self.database.load_proposal(proposal.proposal_id)
+        self.assertEqual(current.revision, 1)
+        self.assertIs(current.status, ProposalStatus.APPLYING)
+        self.assertEqual(
+            self.database.operation_outbox_state(change.operation_id)["status"],
+            "pending",
+        )
+
+    def test_recover_rejects_started_apply_with_incomplete_outbox(self) -> None:
+        proposal, change = self.editable_proposal()
+        approval = ApprovalService(
+            SECRET,
+            {"123"},
+            nonce_used=self.database.nonce_used,
+            mark_nonce_used=self.database.mark_nonce_used,
+        )
+        proposal_service = ProposalService(
+            self.database,
+            approval,
+        )
+        receipt = proposal_service.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        applying = self.database.load_proposal(proposal.proposal_id)
+        applying.status = ProposalStatus.APPLYING
+        self.database.begin_apply(applying, receipt.nonce)
+        with self.database.session() as connection:
+            connection.execute(
+                "DELETE FROM outbox WHERE operation_id = ?",
+                (change.operation_id,),
+            )
+
+        with (
+            patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "_capture_current_source",
+                side_effect=AssertionError(
+                    "invalid evidence must not inspect the source"
+                ),
+            ),
+            patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "_notion_read_gateway",
+                side_effect=AssertionError(
+                    "invalid evidence must not inspect or write Notion"
+                ),
+            ),
+        ):
+            denied = self.handle(
+                FakeEvent(
+                    text=f"/nx_recover {proposal.proposal_id} 1",
+                    source=FakeSource(),
+                )
+            )
+
+        self.assertIn("code=command_rejected", denied)
+        self.assertIn("outbox", denied)
+        current = self.database.load_proposal(proposal.proposal_id)
+        self.assertEqual(current.revision, 1)
+        self.assertIs(current.status, ProposalStatus.APPLYING)
+        with self.database.session() as connection:
+            lease = connection.execute(
+                "SELECT 1 FROM source_apply_lease "
+                "WHERE drive_id = ? AND item_id = ?",
+                ("drive", "item"),
+            ).fetchone()
+        self.assertIsNone(lease)
 
     def test_reject_can_close_invalid_legacy_scope_without_relaxing_others(
         self,
@@ -1615,6 +2202,558 @@ class HermesGatewayApprovalTest(unittest.TestCase):
             with module._ACTIVE_LOCK:
                 module._ACTIVE.discard(proposal_key)
         self.assertEqual(blocked["reason"], "nx-command-in-progress")
+
+    def test_plugin_sync_ack_duplicate_progress_and_final_are_nonblocking(
+        self,
+    ) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1]
+            / ".hermes"
+            / "plugins"
+            / "notion-excel-sync-attestor"
+            / "__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "test_nx_sync_progress_plugin",
+            plugin_path,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        adapter = FakeAdapter()
+        gateway = FakeGateway()
+        gateway._adapter_for_source = lambda _source: adapter  # type: ignore[attr-defined]
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+        worker_calls: list[str] = []
+        final_marker = "[NX_SYNC_NO_CHANGES] {}"
+
+        def blocking_sync(
+            *,
+            event,
+            gateway,
+            project_root,
+            on_authenticated_sync_start,
+        ):
+            del event, gateway, project_root
+            worker_calls.append("started")
+            on_authenticated_sync_start()
+            worker_entered.set()
+            if not release_worker.wait(timeout=5.0):
+                raise RuntimeError("synthetic worker release timed out")
+            return final_marker
+
+        async def wait_for_sent(count: int) -> None:
+            for _ in range(200):
+                if len(adapter.sent) >= count:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail(f"expected {count} Telegram messages, got {len(adapter.sent)}")
+
+        async def exercise() -> None:
+            first = FakeEvent(text="/nx_sync", source=FakeSource(message_id="201"))
+            duplicate = FakeEvent(
+                text="/nx_sync",
+                source=FakeSource(message_id="202"),
+                platform_update_id=315,
+            )
+            with patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "handle_pre_gateway_dispatch",
+                side_effect=blocking_sync,
+            ):
+                decision = module._pre_gateway_dispatch(
+                    event=first,
+                    gateway=gateway,
+                )
+                self.assertEqual(decision["reason"], "nx-command-consumed")
+                await wait_for_sent(1)
+                self.assertTrue(adapter.sent[0][1].startswith("[NX_SYNC_ACCEPTED]"))
+                for _ in range(200):
+                    if worker_entered.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(worker_entered.is_set())
+
+                heartbeat = False
+
+                async def beat() -> None:
+                    nonlocal heartbeat
+                    await asyncio.sleep(0)
+                    heartbeat = True
+
+                await beat()
+                self.assertTrue(heartbeat)
+
+                duplicate_decision = module._pre_gateway_dispatch(
+                    event=duplicate,
+                    gateway=gateway,
+                )
+                self.assertEqual(
+                    duplicate_decision["reason"],
+                    "nx-command-in-progress",
+                )
+                await wait_for_sent(2)
+                self.assertTrue(
+                    adapter.sent[1][1].startswith("[NX_SYNC_IN_PROGRESS]")
+                )
+                self.assertEqual(worker_calls, ["started"])
+
+                release_worker.set()
+                await wait_for_sent(3)
+
+        asyncio.run(exercise())
+
+        self.assertEqual(worker_calls, ["started"])
+        self.assertEqual(adapter.sent[-1], ("chat", final_marker))
+        with module._ACTIVE_LOCK:
+            self.assertFalse(module._ACTIVE)
+            self.assertFalse(module._ACTIVE_STARTED)
+            self.assertFalse(module._ACTIVE_STAGE)
+
+    def test_plugin_cancelled_wrapper_keeps_sync_owned_until_worker_finishes(
+        self,
+    ) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1]
+            / ".hermes"
+            / "plugins"
+            / "notion-excel-sync-attestor"
+            / "__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "test_nx_sync_cancel_plugin",
+            plugin_path,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        adapter = FakeAdapter()
+        gateway = FakeGateway()
+        gateway._adapter_for_source = lambda _source: adapter  # type: ignore[attr-defined]
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+        worker_calls: list[str] = []
+        final_marker = "[NX_SYNC_NO_CHANGES] {}"
+
+        def blocking_sync(
+            *,
+            event,
+            gateway,
+            project_root,
+            on_authenticated_sync_start,
+        ):
+            del event, gateway, project_root
+            worker_calls.append("started")
+            on_authenticated_sync_start()
+            worker_entered.set()
+            if not release_worker.wait(timeout=5.0):
+                raise RuntimeError("synthetic worker release timed out")
+            return final_marker
+
+        async def wait_until(predicate, message: str) -> None:
+            for _ in range(300):
+                if predicate():
+                    return
+                await asyncio.sleep(0.01)
+            self.fail(message)
+
+        async def exercise() -> None:
+            first = FakeEvent(
+                text="/nx_sync",
+                source=FakeSource(message_id="cancel-301"),
+                platform_update_id=401,
+            )
+            duplicate = FakeEvent(
+                text="/nx_sync",
+                source=FakeSource(message_id="cancel-302"),
+                platform_update_id=402,
+            )
+            after_completion = FakeEvent(
+                text="/nx_sync",
+                source=FakeSource(message_id="cancel-303"),
+                platform_update_id=403,
+            )
+            with patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "handle_pre_gateway_dispatch",
+                side_effect=blocking_sync,
+            ):
+                first_decision = module._pre_gateway_dispatch(
+                    event=first,
+                    gateway=gateway,
+                )
+                self.assertEqual(
+                    first_decision["reason"],
+                    "nx-command-consumed",
+                )
+                await wait_until(
+                    worker_entered.is_set,
+                    "trusted synchronization worker did not start",
+                )
+                await wait_until(
+                    lambda: any(
+                        marker.startswith("[NX_SYNC_ACCEPTED]")
+                        for _, marker in adapter.sent
+                    ),
+                    "authenticated synchronization acknowledgement was not sent",
+                )
+
+                current = asyncio.current_task()
+                guarded_tasks = [
+                    task
+                    for task in asyncio.all_tasks()
+                    if task is not current
+                    and getattr(
+                        task.get_coro(),
+                        "__name__",
+                        "",
+                    )
+                    == "_run_guarded"
+                ]
+                self.assertEqual(len(guarded_tasks), 1)
+                guarded = guarded_tasks[0]
+                guarded.cancel()
+                await asyncio.sleep(0)
+                guarded.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(guarded.done())
+
+                duplicate_decision = module._pre_gateway_dispatch(
+                    event=duplicate,
+                    gateway=gateway,
+                )
+                self.assertEqual(
+                    duplicate_decision["reason"],
+                    "nx-command-in-progress",
+                )
+                await wait_until(
+                    lambda: any(
+                        marker.startswith("[NX_SYNC_IN_PROGRESS]")
+                        for _, marker in adapter.sent
+                    ),
+                    "duplicate synchronization did not report in-progress",
+                )
+                self.assertEqual(worker_calls, ["started"])
+
+                release_worker.set()
+                await asyncio.wait_for(asyncio.shield(guarded), timeout=5.0)
+                self.assertEqual(worker_calls, ["started"])
+                self.assertIn(("chat", final_marker), adapter.sent)
+                with module._ACTIVE_LOCK:
+                    self.assertFalse(module._ACTIVE)
+                    self.assertFalse(module._ACTIVE_STARTED)
+                    self.assertFalse(module._ACTIVE_STAGE)
+
+                next_decision = module._pre_gateway_dispatch(
+                    event=after_completion,
+                    gateway=gateway,
+                )
+                self.assertEqual(next_decision["reason"], "nx-command-consumed")
+                await wait_until(
+                    lambda: len(worker_calls) == 2,
+                    "a new synchronization was not admitted after completion",
+                )
+                await wait_until(
+                    lambda: adapter.sent.count(("chat", final_marker)) == 2,
+                    "the second synchronization result was not delivered",
+                )
+
+        asyncio.run(exercise())
+
+        self.assertEqual(worker_calls, ["started", "started"])
+        with module._ACTIVE_LOCK:
+            self.assertFalse(module._ACTIVE)
+            self.assertFalse(module._ACTIVE_STARTED)
+            self.assertFalse(module._ACTIVE_STAGE)
+
+    def test_plugin_coalesces_parallel_sync_progress_burst_per_active_key(
+        self,
+    ) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1]
+            / ".hermes"
+            / "plugins"
+            / "notion-excel-sync-attestor"
+            / "__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "test_nx_sync_progress_burst_plugin",
+            plugin_path,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        adapter = FakeAdapter()
+        gateway = FakeGateway()
+        gateway._adapter_for_source = lambda _source: adapter  # type: ignore[attr-defined]
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+        progress_entered = threading.Event()
+        release_progress = threading.Event()
+        worker_calls: list[str] = []
+        progress_calls: list[str] = []
+        runtime_verifications: list[str] = []
+        final_marker = "[NX_SYNC_NO_CHANGES] {}"
+        progress_marker = (
+            "[NX_SYNC_IN_PROGRESS] stage=preparing elapsed_seconds=1. "
+            "No additional worker was started."
+        )
+
+        trusted_module = ModuleType("synthetic_trusted_gateway")
+
+        def blocking_sync(
+            *,
+            event,
+            gateway,
+            project_root,
+            on_authenticated_sync_start,
+        ):
+            del event, gateway, project_root
+            worker_calls.append("started")
+            on_authenticated_sync_start()
+            worker_entered.set()
+            if not release_worker.wait(timeout=5.0):
+                raise RuntimeError("synthetic worker release timed out")
+            return final_marker
+
+        def blocking_progress(
+            *,
+            event,
+            gateway,
+            project_root,
+            stage,
+            elapsed_seconds,
+        ):
+            del gateway, project_root, stage, elapsed_seconds
+            progress_calls.append(event.source.message_id)
+            progress_entered.set()
+            if not release_progress.wait(timeout=5.0):
+                raise RuntimeError("synthetic progress release timed out")
+            return progress_marker
+
+        trusted_module.handle_pre_gateway_dispatch = blocking_sync  # type: ignore[attr-defined]
+        trusted_module.authenticated_sync_progress_marker = blocking_progress  # type: ignore[attr-defined]
+
+        def verified_module():
+            runtime_verifications.append("verified")
+            return trusted_module
+
+        async def wait_until(predicate, message: str) -> None:
+            for _ in range(300):
+                if predicate():
+                    return
+                await asyncio.sleep(0.01)
+            self.fail(message)
+
+        async def dispatch_duplicate(event: FakeEvent) -> dict[str, str]:
+            await asyncio.sleep(0)
+            return module._pre_gateway_dispatch(event=event, gateway=gateway)
+
+        async def exercise() -> None:
+            first = FakeEvent(
+                text="/nx_sync",
+                source=FakeSource(message_id="burst-owner"),
+                platform_update_id=500,
+            )
+            duplicates = [
+                FakeEvent(
+                    text="/nx_sync",
+                    source=FakeSource(message_id=f"burst-{index}"),
+                    platform_update_id=501 + index,
+                )
+                for index in range(20)
+            ]
+            with patch.object(
+                module,
+                "_verified_gateway_module",
+                side_effect=verified_module,
+            ):
+                try:
+                    first_decision = module._pre_gateway_dispatch(
+                        event=first,
+                        gateway=gateway,
+                    )
+                    self.assertEqual(
+                        first_decision["reason"],
+                        "nx-command-consumed",
+                    )
+                    await wait_until(
+                        worker_entered.is_set,
+                        "trusted synchronization worker did not start",
+                    )
+                    await wait_until(
+                        lambda: any(
+                            marker.startswith("[NX_SYNC_ACCEPTED]")
+                            for _, marker in adapter.sent
+                        ),
+                        "authenticated synchronization acknowledgement was not sent",
+                    )
+
+                    decisions = await asyncio.gather(
+                        *(
+                            dispatch_duplicate(event)
+                            for event in duplicates
+                        )
+                    )
+                    self.assertTrue(
+                        all(
+                            decision["reason"] == "nx-command-in-progress"
+                            for decision in decisions
+                        )
+                    )
+                    await wait_until(
+                        progress_entered.is_set,
+                        "coalesced progress authentication did not start",
+                    )
+                    with module._ACTIVE_LOCK:
+                        progress_task = module._ACTIVE_PROGRESS["source-sync"]
+                    progress_task.cancel()
+                    await asyncio.sleep(0)
+                    progress_task.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(progress_task.done())
+                    await asyncio.sleep(0.05)
+
+                    self.assertEqual(worker_calls, ["started"])
+                    self.assertEqual(progress_calls, ["burst-0"])
+                    self.assertEqual(runtime_verifications, ["verified", "verified"])
+                    with module._ACTIVE_LOCK:
+                        self.assertEqual(
+                            list(module._ACTIVE_PROGRESS),
+                            ["source-sync"],
+                        )
+                    self.assertFalse(
+                        any(
+                            marker.startswith("[NX_SYNC_IN_PROGRESS]")
+                            for _, marker in adapter.sent
+                        )
+                    )
+
+                    release_progress.set()
+                    await wait_until(
+                        lambda: adapter.sent.count(
+                            ("chat", progress_marker)
+                        )
+                        == 1,
+                        "coalesced progress marker was not delivered exactly once",
+                    )
+                    await wait_until(
+                        lambda: not module._ACTIVE_PROGRESS,
+                        "completed progress task was not removed",
+                    )
+
+                    release_worker.set()
+                    await wait_until(
+                        lambda: adapter.sent.count(("chat", final_marker)) == 1,
+                        "synchronization final marker was not delivered",
+                    )
+                finally:
+                    release_progress.set()
+                    release_worker.set()
+
+        asyncio.run(exercise())
+
+        self.assertEqual(worker_calls, ["started"])
+        self.assertEqual(progress_calls, ["burst-0"])
+        self.assertEqual(runtime_verifications, ["verified", "verified"])
+        self.assertEqual(
+            sum(
+                marker.startswith("[NX_SYNC_IN_PROGRESS]")
+                for _, marker in adapter.sent
+            ),
+            1,
+        )
+        with module._ACTIVE_LOCK:
+            self.assertFalse(module._ACTIVE)
+            self.assertFalse(module._ACTIVE_STARTED)
+            self.assertFalse(module._ACTIVE_STAGE)
+            self.assertFalse(module._ACTIVE_PROGRESS)
+
+    def test_plugin_ack_delivery_failure_does_not_abort_sync_or_leak_context(
+        self,
+    ) -> None:
+        plugin_path = (
+            Path(__file__).resolve().parents[1]
+            / ".hermes"
+            / "plugins"
+            / "notion-excel-sync-attestor"
+            / "__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "test_nx_sync_ack_failure_plugin",
+            plugin_path,
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class FirstDeliveryFails:
+            def __init__(self) -> None:
+                self.attempts: list[str] = []
+                self.sent: list[str] = []
+
+            async def send(self, chat_id: str, content: str, **_: object):
+                del chat_id
+                self.attempts.append(content)
+                if len(self.attempts) == 1:
+                    raise RuntimeError("private-adapter-secret")
+                self.sent.append(content)
+                return type("SendResult", (), {"success": True})()
+
+        adapter = FirstDeliveryFails()
+        gateway = FakeGateway()
+        gateway._adapter_for_source = lambda _source: adapter  # type: ignore[attr-defined]
+        final_marker = "[NX_SYNC_NO_CHANGES] {}"
+        worker_calls: list[str] = []
+
+        def completed_sync(
+            *,
+            event,
+            gateway,
+            project_root,
+            on_authenticated_sync_start,
+        ):
+            del event, gateway, project_root
+            worker_calls.append("started")
+            on_authenticated_sync_start()
+            return final_marker
+
+        async def exercise() -> None:
+            event = FakeEvent(
+                text="/nx_sync",
+                source=FakeSource(
+                    chat_id="private-chat-secret",
+                    message_id="private-message-secret",
+                ),
+            )
+            with patch(
+                "notion_excel_sync.security.hermes_gateway."
+                "handle_pre_gateway_dispatch",
+                side_effect=completed_sync,
+            ):
+                decision = module._pre_gateway_dispatch(
+                    event=event,
+                    gateway=gateway,
+                )
+                self.assertEqual(decision["reason"], "nx-command-consumed")
+                for _ in range(200):
+                    if final_marker in adapter.sent:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    self.fail("final synchronization result was not delivered")
+
+        with self.assertLogs(module.logger.name, level="ERROR") as captured:
+            asyncio.run(exercise())
+
+        self.assertEqual(worker_calls, ["started"])
+        self.assertEqual(adapter.sent, [final_marker])
+        self.assertEqual(len(adapter.attempts), 2)
+        logs = "\n".join(captured.output)
+        self.assertNotIn("private-adapter-secret", logs)
+        self.assertNotIn("private-chat-secret", logs)
+        self.assertNotIn("private-message-secret", logs)
 
 
 if __name__ == "__main__":
