@@ -159,7 +159,7 @@ print(json.dumps({
             ):
                 self.assertIn(schema_runtime_file, actual)
             self.assertIn(
-                'version: "0.6.1"',
+                'version: "0.6.2"',
                 (plugin_dir / "plugin.yaml").read_text(encoding="utf-8"),
             )
             self.assertEqual(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 import notion_excel_sync.persistence.database as database_module
@@ -129,6 +131,7 @@ def test_large_scope_precomputation_and_sync_use_constant_select_passes(
 
     def traced_connect():
         connection = original_connect()
+        connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
         connection.set_trace_callback(sync_statements.append)
         return connection
 
@@ -140,11 +143,11 @@ def test_large_scope_precomputation_and_sync_use_constant_select_passes(
         for statement in sync_statements
         if statement.lstrip().upper().startswith("SELECT")
     ]
-    assert len(selects) <= 3
+    assert len(selects) <= 4
     assert sum(
         "FROM MUTATION_SCOPE_CLAIM" in statement.upper()
         for statement in selects
-    ) == 1
+    ) == 2
     with database.session() as connection:
         assert (
             connection.execute(

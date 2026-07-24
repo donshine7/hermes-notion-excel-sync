@@ -2119,17 +2119,28 @@ class StateDatabase:
             proposal,
         )
 
-        if desired:
-            placeholders = ",".join("?" for _ in desired)
-            connection.execute(
+        existing_owned = connection.execute(
+            "SELECT scope_digest FROM mutation_scope_claim "
+            "WHERE proposal_id = ?",
+            (proposal.proposal_id,),
+        ).fetchall()
+        stale_digests = [
+            str(row["scope_digest"])
+            for row in existing_owned
+            if str(row["scope_digest"]) not in desired
+        ]
+        if stale_digests:
+            # Do not construct one unbounded ``NOT IN`` expression. Production
+            # SQLite builds may retain the legacy 999-variable limit, while an
+            # initial full reconcile can legitimately claim many thousands of
+            # independent Notion properties.
+            connection.executemany(
                 "DELETE FROM mutation_scope_claim "
-                f"WHERE proposal_id = ? AND scope_digest NOT IN ({placeholders})",
-                (proposal.proposal_id, *desired),
-            )
-        else:
-            connection.execute(
-                "DELETE FROM mutation_scope_claim WHERE proposal_id = ?",
-                (proposal.proposal_id,),
+                "WHERE proposal_id = ? AND scope_digest = ?",
+                (
+                    (proposal.proposal_id, scope_digest)
+                    for scope_digest in stale_digests
+                ),
             )
 
         claim_state = (
