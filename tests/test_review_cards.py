@@ -234,9 +234,9 @@ def test_render_is_deterministic_and_does_not_change_digest_or_revision() -> Non
     assert revision == before
     assert revision.digest == digest
     assert "사건번호: SS-2026-001" in first
-    assert 'Notion: "접수" → "진행"' in first
-    assert "Excel 근거: 2026 행 3 [B3] (v2)" in first
-    assert "Wiki 근거: 증빙 기준.md (v4, section:2, #cccccccccccc)" in first
+    assert '- 현재상태: "접수" → "진행" [반영]' in first
+    assert "원본 위치: Excel 2026 시트 3행" in first
+    assert "Wiki 참고: 증빙 기준.md (v4, section:2, #cccccccccccc)" in first
     assert "Operation ID: op-1" in first
     assert f"/nx_approve P-SYNTHETIC 2 {digest}" in first
     assert "Notion과 Wiki는 아직 변경되지 않았습니다." in first
@@ -263,11 +263,8 @@ def test_overlay_only_recovery_shows_completed_notion_write_and_only_approval() 
 
     rendered = render_review_card_page(revision)
 
-    assert (
-        'Notion: 이전 승인에서 "진행" 반영 완료 '
-        "(이번 승인에서는 재실행하지 않음)"
-    ) in rendered
-    assert "이번 승인 대상: Wiki 승인 오버레이와 최종화 복구" in rendered
+    assert '- 현재상태: "진행" (이전 승인에서 반영 완료)' in rendered
+    assert "승인 후 Wiki: Wiki 승인 오버레이만 복구" in rendered
     assert "이번 승인은 Notion을 다시 쓰지 않고 Wiki 승인 오버레이와 " in rendered
     assert "최종화만 복구합니다." in rendered
     assert '"접수" → "진행"' not in rendered
@@ -275,6 +272,36 @@ def test_overlay_only_recovery_shows_completed_notion_write_and_only_approval() 
     assert "/nx_reject" not in rendered
     assert f"/nx_approve P-SYNTHETIC 2 {revision.digest}" in rendered
     assert "Notion과 Wiki는 아직 변경되지 않았습니다." not in rendered
+
+
+def test_internal_source_key_is_replaced_with_human_evidence_title() -> None:
+    entity_key = f"source:sha256:{'f' * 64}:2026:10"
+    title = operation(
+        "op-title",
+        entity_key=entity_key,
+        database="근거자료",
+        property_name="근거명",
+        current=None,
+        proposed="Excel 2026 10행",
+        refs=[source_ref(row=10, cells="A10")],
+    )
+    digest = operation(
+        "op-digest",
+        entity_key=entity_key,
+        database="근거자료",
+        property_name="SHA256",
+        current=None,
+        proposed="f" * 64,
+        refs=[source_ref(row=10, cells="A10:L10")],
+    )
+
+    rendered = render_review_card_page(proposal([title, digest]))
+
+    assert "1~2. 근거자료 새 페이지 만들기" in rendered
+    assert "자료: Excel 2026 10행" in rendered
+    assert "원본 위치: Excel 2026 시트 10행" in rendered
+    assert "파일 식별값(SHA256)" in rendered
+    assert entity_key not in rendered
 
 
 def test_orphan_history_is_reported_but_never_consumes_a_card() -> None:

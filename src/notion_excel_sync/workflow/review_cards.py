@@ -30,6 +30,26 @@ _CASE_NUMBER_PROPERTIES = frozenset(
         "증빙사건번호",
     }
 )
+_TITLE_PROPERTIES = frozenset(
+    {
+        "당소사건번호",
+        "사건번호",
+        "근거명",
+        "그룹명",
+        "비용명",
+        "업무명",
+        "검토명",
+    }
+)
+_FRIENDLY_PROPERTY_NAMES = {
+    "SHA256": "파일 식별값(SHA256)",
+    "driveItem ID": "원본 파일 ID",
+    "버전ID": "원본 버전",
+    "수집일시": "자료 확인 시각",
+    "파싱상태": "읽기 상태",
+    "보안등급": "자료 등급",
+    "OneDrive URL": "원본 링크",
+}
 
 
 class ReviewCardPageError(ValueError):
@@ -100,6 +120,7 @@ def build_review_cards(proposal: ProposalRevision) -> tuple[ReviewCard, ...]:
     ]
     history_by_source_id = _history_operations_by_source_id(proposal.operations)
     case_by_source_position = _case_numbers_by_source_position(main_operations)
+    display_labels = _display_labels_by_entity(main_operations)
     overlay_only_recovery = _is_overlay_only_correction_recovery(proposal)
 
     cards: list[ReviewCard] = []
@@ -109,7 +130,11 @@ def build_review_cards(proposal: ProposalRevision) -> tuple[ReviewCard, ...]:
             item.change.operation_id
             for item in history_by_source_id.get(change.operation_id, ())
         )
-        case_number = _case_number(operation, case_by_source_position)
+        case_number = _case_number(
+            operation,
+            case_by_source_position,
+            display_labels=display_labels,
+        )
         excel_refs = summarize_excel_source_refs(change.source_refs)
         knowledge_refs = summarize_knowledge_refs(change.knowledge_refs)
         cards.append(
@@ -237,69 +262,71 @@ def render_review_card_page(
     ]
     if not projection.cards:
         lines.extend(["", "검토할 논리 변경 카드가 없습니다."])
-    for card in projection.cards:
+    for group in _group_visible_cards(projection.cards):
+        first = group[0]
+        number_label = (
+            str(first.number)
+            if len(group) == 1
+            else f"{first.number}~{group[-1].number}"
+        )
         lines.extend(
             [
                 "",
-                f"{card.number}. 사건번호: {card.case_number}",
-                f"요약: {card.summary}",
-                f"대상: {card.target_database} / {card.property_name}",
+                f"{number_label}. {_database_action_summary(group)}",
+                f"{_subject_label(first.target_database)}: {first.case_number}",
+                f"원본 위치: {_human_source_summary(group)}",
+                "Notion 변경 내용:",
             ]
         )
-        if overlay_only_recovery:
-            lines.extend(
-                [
-                    (
-                        "Notion: 이전 승인에서 "
-                        f"{_render_value(card.approved_value)} 반영 완료 "
-                        "(이번 승인에서는 재실행하지 않음)"
-                    ),
-                    "이번 승인 대상: Wiki 승인 오버레이와 최종화 복구",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    (
-                        "Notion: "
-                        f"{_render_value(card.current_value)} → "
-                        f"{_render_value(card.approved_value)}"
-                    ),
-                    f"현재 처리: {card.action.value}",
-                ]
-            )
-        lines.extend(
-            [
-                f"변경근거: {card.change_basis}",
-                (
-                    "Excel 근거: "
-                    + (
-                        "; ".join(card.excel_source_refs)
-                        if card.excel_source_refs
-                        else "없음"
-                    )
-                ),
-                (
-                    "Wiki 근거: "
-                    + ("; ".join(card.knowledge_refs) if card.knowledge_refs else "없음")
-                ),
-                f"Wiki 영향: {card.wiki_impact}",
-                f"자동 영향: {card.automatic_notion_impact}",
-                f"Operation ID: {card.operation_id}",
-            ]
+        for card in group:
+            property_label = _friendly_property_name(card.property_name)
+            if overlay_only_recovery:
+                lines.append(
+                    f"- {property_label}: {_render_value(card.approved_value)} "
+                    "(이전 승인에서 반영 완료)"
+                )
+            else:
+                lines.append(
+                    f"- {property_label}: "
+                    f"{_human_change(card.current_value, card.approved_value)} "
+                    f"[{_friendly_action(card.action)}]"
+                )
+        reasons = tuple(dict.fromkeys(card.change_basis for card in group))
+        lines.append(f"변경 근거: {'; '.join(reasons)}")
+        knowledge_refs = tuple(
+            dict.fromkeys(ref for card in group for ref in card.knowledge_refs)
+        )
+        if knowledge_refs:
+            lines.append(f"Wiki 참고: {'; '.join(knowledge_refs)}")
+        lines.append(
+                "승인 후 Wiki: "
+                + (
+                    "사용자가 승인한 값과 수정 내용을 함께 기록"
+                    if not overlay_only_recovery
+                    else "Wiki 승인 오버레이만 복구"
+                )
         )
         if overlay_only_recovery:
             lines.append("이 복구안은 수정·거부·보류할 수 없습니다.")
         else:
-            lines.extend(
-                [
-                    "수정 명령:",
-                    card.commands.apply,
-                    card.commands.exclude,
-                    card.commands.defer,
-                    card.commands.edit,
-                ]
-            )
+            lines.append("세부 조정(선택 사항 — 필요한 항목의 명령만 사용):")
+            for card in group:
+                label = _friendly_property_name(card.property_name)
+                lines.extend(
+                    [
+                        (
+                            f"- {label} · 작업 ID {card.operation_id} "
+                            f"(Operation ID: {card.operation_id})"
+                        ),
+                        (
+                            "  반영/제외/보류: "
+                            f"{card.commands.apply} | "
+                            f"{card.commands.exclude} | "
+                            f"{card.commands.defer}"
+                        ),
+                        f"  값 수정: {card.commands.edit}",
+                    ]
+                )
     if projection.next_command:
         lines.extend(["", f"다음 페이지: {projection.next_command}"])
     if projection.approve_command is None:
@@ -441,18 +468,131 @@ def _case_numbers_by_source_position(
 def _case_number(
     operation: ProposalOperation,
     case_by_source_position: dict[tuple[str, int], str],
+    *,
+    display_labels: dict[tuple[str, str], str] | None = None,
 ) -> str:
-    entity_key = operation.change.entity_key.strip()
-    if entity_key:
+    change = operation.change
+    entity_key = change.entity_key.strip()
+    if entity_key and not _is_internal_entity_key(entity_key):
         return entity_key
+    label = (display_labels or {}).get(
+        (change.target_database, change.entity_key)
+    )
+    if label:
+        return label
     referenced = sorted(
         {
             case_by_source_position[position]
-            for position in _source_positions(operation.change.source_refs)
+            for position in _source_positions(change.source_refs)
             if position in case_by_source_position
         }
     )
-    return ", ".join(referenced) if referenced else "미확인"
+    if referenced:
+        return ", ".join(referenced)
+    positions = sorted(_source_positions(change.source_refs))
+    if positions:
+        sheet, row = positions[0]
+        return f"Excel {sheet} 시트 {row}행 자료"
+    return "식별 정보 없음"
+
+
+def _display_labels_by_entity(
+    operations: Iterable[ProposalOperation],
+) -> dict[tuple[str, str], str]:
+    labels: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+    for operation in operations:
+        change = operation.change
+        if _normalized_property(change.property_name) not in _TITLE_PROPERTIES:
+            continue
+        value = _case_value(operation.approved_value) or _case_value(
+            change.proposed_value
+        )
+        if value:
+            labels[(change.target_database, change.entity_key)].append(
+                (change.operation_id, value)
+            )
+    return {
+        key: sorted(values)[0][1]
+        for key, values in labels.items()
+    }
+
+
+def _group_visible_cards(
+    cards: Iterable[ReviewCard],
+) -> tuple[tuple[ReviewCard, ...], ...]:
+    groups: list[list[ReviewCard]] = []
+    indexes: dict[tuple[str, str], int] = {}
+    for card in cards:
+        key = (card.target_database, card.entity_key)
+        index = indexes.get(key)
+        if index is None:
+            indexes[key] = len(groups)
+            groups.append([card])
+        else:
+            groups[index].append(card)
+    return tuple(tuple(group) for group in groups)
+
+
+def _database_action_summary(cards: tuple[ReviewCard, ...]) -> str:
+    database = cards[0].target_database
+    if all(card.current_value is None for card in cards):
+        return f"{database} 새 페이지 만들기"
+    return f"{database} 페이지 수정"
+
+
+def _subject_label(database: str) -> str:
+    if database == "근거자료":
+        return "자료"
+    if database == "그룹":
+        return "그룹"
+    if database == "비용·청구":
+        return "비용 항목"
+    if database in {"업무·절차", "검토함"}:
+        return "업무"
+    return "사건번호"
+
+
+def _human_source_summary(cards: tuple[ReviewCard, ...]) -> str:
+    positions: set[tuple[str, int]] = set()
+    for card in cards:
+        for source_ref in card.excel_source_refs:
+            match = re.match(r"(.+?) 행 ([0-9]+)", source_ref)
+            if match:
+                positions.add((match.group(1), int(match.group(2))))
+    if positions:
+        return ", ".join(
+            f"Excel {sheet} 시트 {row}행"
+            for sheet, row in sorted(positions)
+        )
+    knowledge_count = len(
+        {ref for card in cards for ref in card.knowledge_refs}
+    )
+    return f"Wiki 근거 {knowledge_count}개" if knowledge_count else "근거 위치 없음"
+
+
+def _friendly_property_name(property_name: str) -> str:
+    return _FRIENDLY_PROPERTY_NAMES.get(property_name, property_name)
+
+
+def _friendly_action(action: ProposalAction) -> str:
+    return {
+        ProposalAction.APPLY: "반영",
+        ProposalAction.EDIT: "사용자 수정값 반영",
+        ProposalAction.EXCLUDE: "제외",
+        ProposalAction.DEFER: "보류",
+    }[action]
+
+
+def _human_change(current: JsonValue, approved: JsonValue) -> str:
+    if current is None:
+        return f"새로 입력 {_render_value(approved)}"
+    return f"{_render_value(current)} → {_render_value(approved)}"
+
+
+def _is_internal_entity_key(value: str) -> bool:
+    return value.casefold().startswith(
+        ("source:", "history:", "analysis:", "review:")
+    )
 
 
 def _source_positions(refs: Iterable[SourceRef]) -> set[tuple[str, int]]:
