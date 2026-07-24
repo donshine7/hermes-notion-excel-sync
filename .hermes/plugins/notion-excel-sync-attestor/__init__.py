@@ -473,6 +473,9 @@ if str(_IMPORT_ROOT) not in sys.path:
     sys.path.insert(0, str(_IMPORT_ROOT))
 
 # Trusted source trees must not acquire unmanifested bytecode after verification.
+# Set both controls: ``sys.dont_write_bytecode`` protects this interpreter and
+# the environment variable protects isolated extractor subprocesses.
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
 if _RUNTIME_MODE == "vendored":
     _verify_host_dependencies()
