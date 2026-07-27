@@ -335,7 +335,10 @@ class SecureGatewayRestartTest(unittest.TestCase):
         wrapper = self.wrapper.read_text(encoding="utf-8")
         worker = self.worker.read_text(encoding="utf-8")
 
-        self.assertIn("Read-Host \"Notion 쓰기 통합 토큰\" -AsSecureString", wrapper)
+        self.assertIn("0xC4F0, 0xAE30", wrapper)
+        self.assertIn("0xD1A0, 0xD070", wrapper)
+        self.assertIn("Read-Host $prompt -AsSecureString", wrapper)
+        self.assertNotIn("Notion 쓰기 통합 토큰", wrapper)
         self.assertIn("SecureStringToBSTR", wrapper)
         self.assertIn("ZeroFreeBSTR", wrapper)
         self.assertIn("FILE_TYPE_PIPE", wrapper)
