@@ -144,7 +144,7 @@ class HermesStructuredAIProvider:
         try:
             response = call_llm(
                 task=self.task_name,
-                model=self.model,
+                model=model,
                 messages=messages,
                 temperature=0,
                 max_tokens=2_000,

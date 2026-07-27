@@ -179,8 +179,9 @@ class AIEnrichmentReport:
     failures: int = 0
     skipped: int = 0
     shadow_results: int = 0
+    failure_codes: dict[str, int] = field(default_factory=dict)
 
-    def audit_payload(self) -> dict[str, int]:
+    def audit_payload(self) -> dict[str, JsonValue]:
         return {
             "attempted": self.attempted,
             "completed": self.completed,
@@ -191,6 +192,7 @@ class AIEnrichmentReport:
             "proposed_changes": len(self.proposed_changes),
             "review_items": len(self.review_items),
             "replaced_operations": len(self.replaced_operation_ids),
+            "failure_codes": dict(sorted(self.failure_codes.items())),
         }
 
 
@@ -281,7 +283,14 @@ def validate_analysis(
     request: AIRequest,
     response: AIProviderResponse,
 ) -> AIAnalysis:
-    payload = response.payload
+    payload = dict(response.payload)
+    # Some otherwise schema-capable providers omit constant envelope fields.
+    # These values are trusted request metadata, not model-derived facts, so a
+    # missing value can be restored safely. An explicitly conflicting value is
+    # still rejected below.
+    payload.setdefault("schema_version", AI_SCHEMA_VERSION)
+    payload.setdefault("task_type", request.task_type)
+    payload.setdefault("source_hash", request.source_hash)
     allowed_top = {
         "schema_version",
         "task_type",

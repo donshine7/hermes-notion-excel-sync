@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping
 
@@ -61,6 +61,7 @@ class PreparationResult:
     ai_attempted: int = 0
     ai_completed: int = 0
     ai_failures: int = 0
+    ai_failure_codes: dict[str, int] = field(default_factory=dict)
 
 
 _NOTION_TITLE_TEXT_LIMIT = 2_000
@@ -869,6 +870,9 @@ class SyncPreparationService:
             ai_attempted=ai_report.attempted if ai_report is not None else 0,
             ai_completed=ai_report.completed if ai_report is not None else 0,
             ai_failures=ai_report.failures if ai_report is not None else 0,
+            ai_failure_codes=(
+                dict(ai_report.failure_codes) if ai_report is not None else {}
+            ),
         )
 
     def _build_evidence_context(

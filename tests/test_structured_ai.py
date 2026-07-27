@@ -215,6 +215,72 @@ def test_validator_rejects_hallucinated_evidence() -> None:
         validate_analysis(request, response)
 
 
+def test_validator_restores_only_missing_trusted_envelope_fields() -> None:
+    request = AIRequest(
+        task_type="party_resolution",
+        source_hash="f" * 64,
+        source_type="excel",
+        source_locator="Cases:2",
+        payload={"fields": [{"name": "의뢰인", "value": "(주)테스트법인"}]},
+        evidence_corpus="의뢰인: (주)테스트법인",
+    )
+    response = AIProviderResponse(
+        payload={
+            "summary": "법인명 확인",
+            "claims": [
+                {
+                    "field": "party_type",
+                    "value": "법인",
+                    "confidence": 0.9,
+                    "inference_type": "classify",
+                    "evidence": [
+                        {"location": "의뢰인", "quote": "(주)테스트법인"}
+                    ],
+                }
+            ],
+            "conflicts": [],
+            "needs_review": True,
+            "overall_confidence": 0.9,
+        },
+        provider="fake",
+        model="fake",
+    )
+
+    analysis = validate_analysis(request, response)
+
+    assert analysis.task_type == "party_resolution"
+    assert analysis.source_hash == "f" * 64
+    assert analysis.claim("party_type") is not None
+
+
+def test_validator_rejects_conflicting_trusted_envelope_field() -> None:
+    request = AIRequest(
+        task_type="party_resolution",
+        source_hash="1" * 64,
+        source_type="excel",
+        source_locator="Cases:2",
+        payload={"fields": [{"name": "의뢰인", "value": "(주)테스트법인"}]},
+        evidence_corpus="의뢰인: (주)테스트법인",
+    )
+    response = AIProviderResponse(
+        payload={
+            "schema_version": "1.0",
+            "task_type": "excel_row_semantics",
+            "source_hash": "1" * 64,
+            "summary": "법인명 확인",
+            "claims": [],
+            "conflicts": [],
+            "needs_review": True,
+            "overall_confidence": 0.2,
+        },
+        provider="fake",
+        model="fake",
+    )
+
+    with pytest.raises(AISchemaError, match="task type"):
+        validate_analysis(request, response)
+
+
 def test_local_only_provider_refuses_external_auto_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -322,6 +388,7 @@ def test_local_provider_receives_only_non_executing_submit_schema(
     ).analyze(request)
 
     assert response.model == "local-model"
+    assert captured["model"] == "local-model"
     tools = captured["tools"]
     assert isinstance(tools, list)
     assert [item["function"]["name"] for item in tools] == [  # type: ignore[index]
@@ -389,6 +456,7 @@ def test_provider_failure_opens_circuit_and_keeps_rules_running(tmp_path: Path) 
 
     assert provider.calls == 1
     assert report.failures == 1
+    assert report.failure_codes == {"provider_response_error": 1}
     assert report.skipped == 1
     assert not report.proposed_changes
     assert not report.review_items

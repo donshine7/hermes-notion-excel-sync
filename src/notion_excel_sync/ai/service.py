@@ -12,7 +12,11 @@ from notion_excel_sync.ai.models import (
     AISchemaError,
     validate_analysis,
 )
-from notion_excel_sync.ai.provider import AIProviderError, StructuredAIProvider
+from notion_excel_sync.ai.provider import (
+    AIProviderError,
+    AIProviderUnavailable,
+    StructuredAIProvider,
+)
 from notion_excel_sync.domain.analyzers.common import record_case_numbers
 from notion_excel_sync.knowledge.policy import redact_sensitive_text
 from notion_excel_sync.models import (
@@ -51,6 +55,7 @@ class StructuredAIService:
     _circuit_open: bool = field(default=False, init=False, repr=False)
     _cache_hits: int = field(default=0, init=False, repr=False)
     _failures: int = field(default=0, init=False, repr=False)
+    _last_failure_code: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.rollout_mode not in {"shadow", "assist", "verified"}:
@@ -70,10 +75,15 @@ class StructuredAIService:
         self._circuit_open = False
         self._cache_hits = 0
         self._failures = 0
+        self._last_failure_code = None
 
     @property
     def failure_count(self) -> int:
         return self._failures
+
+    @property
+    def last_failure_code(self) -> str | None:
+        return self._last_failure_code
 
     def analyze_mail_message(
         self,
@@ -205,7 +215,12 @@ class StructuredAIService:
             if self._cache_hits > cache_before:
                 report.cache_hits += 1
             if analysis is None:
-                report.failures += int(self._calls > calls_before)
+                if self._calls > calls_before:
+                    report.failures += 1
+                    failure_code = self.last_failure_code or "unknown_failure"
+                    report.failure_codes[failure_code] = (
+                        report.failure_codes.get(failure_code, 0) + 1
+                    )
                 report.skipped += int(self._calls == calls_before)
                 continue
             report.completed += 1
@@ -248,15 +263,32 @@ class StructuredAIService:
         if self._circuit_open or self._calls >= self.max_calls_per_sync:
             return None
         self._calls += 1
+        self._last_failure_code = None
         try:
             response = self.provider.analyze(request)
             analysis = validate_analysis(request, response)
             self.cache.put(analysis)
             return analysis
-        except (AIProviderError, AISchemaError, OSError, ValueError):
-            self._failures += 1
-            self._circuit_open = True
+        except AIProviderUnavailable:
+            self._record_failure("provider_unavailable")
             return None
+        except AIProviderError:
+            self._record_failure("provider_response_error")
+            return None
+        except AISchemaError:
+            self._record_failure("schema_or_grounding_rejected")
+            return None
+        except OSError:
+            self._record_failure("cache_io_error")
+            return None
+        except ValueError:
+            self._record_failure("validated_value_rejected")
+            return None
+
+    def _record_failure(self, code: str) -> None:
+        self._last_failure_code = code
+        self._failures += 1
+        self._circuit_open = True
 
     def _excel_request(
         self,

@@ -977,6 +977,7 @@ def _handle_sync_command(
             "ai_attempted": result.ai_attempted,
             "ai_completed": result.ai_completed,
             "ai_failures": result.ai_failures,
+            "ai_failure_codes": result.ai_failure_codes,
             "notion_mutated": False,
         }
         return "[NX_SYNC_NO_CHANGES] " + json.dumps(
@@ -994,12 +995,17 @@ def _handle_sync_command(
     )
     screen = _proposal_screen(result.proposal, prefix="NX_SYNC_PROPOSAL_READY")
     if result.ai_attempted or result.ai_failures:
+        failure_codes = ",".join(
+            f"{name}:{count}"
+            for name, count in sorted(result.ai_failure_codes.items())
+        )
         screen += (
             "\n[NX_AI_ANALYSIS] "
             f"mode={config.ai.rollout_mode} "
             f"attempted={result.ai_attempted} "
             f"completed={result.ai_completed} "
-            f"failures={result.ai_failures}"
+            f"failures={result.ai_failures} "
+            f"failure_codes={failure_codes or 'none'}"
         )
     if result.pending_staged:
         screen += (

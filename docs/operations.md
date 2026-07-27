@@ -75,6 +75,10 @@ AI가 켜진 실행은 제안 뒤에 다음 요약을 추가할 수 있습니다
 보강합니다. 모든 모드에서 최종 Notion 변경에는 동일한 `/nx_approve`가 필요합니다.
 `failures`가 발생해도 규칙 기반 분석은 계속되며 같은 실행에서 추가 모델 호출은
 중단됩니다.
+`failure_codes`는 원문이나 모델 응답을 노출하지 않고
+`provider_unavailable`, `provider_response_error`,
+`schema_or_grounding_rejected`, `cache_io_error`,
+`validated_value_rejected` 중 어느 안전 경계에서 폐기됐는지 표시합니다.
 
 ## 3. 후속 `/nx_sync`
 
