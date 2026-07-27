@@ -932,7 +932,7 @@ class SyncPreparationService:
             refs = record.source_refs
             source = refs[0]
             entity_key = f"source:{source.version_id}:{record.sheet}:{record.row}"
-            title = f"Excel {record.sheet} {record.row}행 (v{source.version_id})"
+            title = f"Excel {record.sheet} {record.row}행"
             fields: list[tuple[str, object]] = [
                 ("근거명", title),
                 ("driveItem ID", source.item_id),

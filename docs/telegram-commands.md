@@ -9,6 +9,7 @@ Hermes의 `notion-excel-sync-attestor` 플러그인이 아래 명령을 Gateway�
 ```text
 /nx_sync
 /nx_show <proposal-id> <revision> [page]
+/nx_show <proposal-id> <revision> <page> detail <item-1-to-5>
 /nx_set <proposal-id> <revision> <operation-id> apply
 /nx_set <proposal-id> <revision> <operation-id> exclude
 /nx_set <proposal-id> <revision> <operation-id> defer
@@ -42,14 +43,18 @@ runtime은 즉시 진행 응답이 없고 중복 요청을 조용히 무시할 �
 `변경이력`을 만듭니다. 최초 reconcile에서 Notion에 반영할 값이 있어도 정확한 별도
 `/nx_approve` 없이는 쓰지 않습니다.
 
-`/nx_show`는 한 페이지에 5~10개의 변경을 표시합니다.
+`/nx_show` 기본 화면은 속성 operation이 아니라 실제로 생성·수정될 Notion 페이지를
+기준으로 묶으며, 한 화면에 최대 5개 페이지를 표시합니다.
 
-- 사건번호
+- 사건번호·자료명·그룹명 등 대상에 맞는 사람용 식별자
 - 변경근거
-- 요약
-- Notion 현재값 → 변경값
+- 사람이 검토해야 할 주요 Notion 현재값 → 변경값
 - Wiki 영향
-- operation ID와 정확한 수정 명령
+
+SHA256, 로컬 파일 ID, 원본 버전 같은 시스템 추적정보는 존재 여부만 요약합니다.
+operation ID, 정확한 시스템 값과 수정 명령은 각 항목 아래에 표시된
+`/nx_show ... detail <item>` 명령으로 별도 확인합니다. 기본 화면과 상세 화면 모두
+읽기 전용이며 proposal revision이나 digest를 바꾸지 않습니다.
 
 `/nx_set`으로 어떤 항목이든 수정·제외·보류하면 새 revision과 digest가 생깁니다. 이전
 개정에 대한 승인 메시지는 무효입니다.

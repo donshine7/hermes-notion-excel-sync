@@ -237,7 +237,10 @@ def test_render_is_deterministic_and_does_not_change_digest_or_revision() -> Non
     assert '- 현재상태: "접수" → "진행" [반영]' in first
     assert "원본 위치: Excel 2026 시트 3행" in first
     assert "Wiki 참고: 증빙 기준.md (v4, section:2, #cccccccccccc)" in first
-    assert "Operation ID: op-1" in first
+    assert "/nx_show P-SYNTHETIC 2 1 detail 1" in first
+    assert "Operation ID: op-1" not in first
+    detail = render_review_card_page(revision, detail_item=1)
+    assert "Operation ID: op-1" in detail
     assert f"/nx_approve P-SYNTHETIC 2 {digest}" in first
     assert "Notion과 Wiki는 아직 변경되지 않았습니다." in first
 
@@ -282,7 +285,7 @@ def test_internal_source_key_is_replaced_with_human_evidence_title() -> None:
         database="근거자료",
         property_name="근거명",
         current=None,
-        proposed="Excel 2026 10행",
+        proposed=f"Excel 2026 10행 (vsha256:{'f' * 64})",
         refs=[source_ref(row=10, cells="A10")],
     )
     digest = operation(
@@ -297,11 +300,34 @@ def test_internal_source_key_is_replaced_with_human_evidence_title() -> None:
 
     rendered = render_review_card_page(proposal([title, digest]))
 
-    assert "1~2. 근거자료 새 페이지 만들기" in rendered
+    assert "페이지: 1/1 (Notion 페이지 1개, 화면당 5개)" in rendered
+    assert "1. 근거자료 새 페이지 만들기" in rendered
     assert "자료: Excel 2026 10행" in rendered
     assert "원본 위치: Excel 2026 시트 10행" in rendered
     assert "파일 식별값(SHA256)" in rendered
+    assert "Operation ID" not in rendered
     assert entity_key not in rendered
+
+
+def test_render_paginates_by_notion_page_instead_of_property_operation() -> None:
+    operations = [
+        operation(
+            f"op-{entity}-{field}",
+            entity_key=f"ENTITY-{entity}",
+            property_name=f"필드-{field}",
+        )
+        for entity in range(25)
+        for field in range(9)
+    ]
+    revision = proposal(operations)
+
+    first = render_review_card_page(revision)
+    fifth = render_review_card_page(revision, 5)
+
+    assert "페이지: 1/5 (Notion 페이지 25개, 화면당 5개)" in first
+    assert "속성 변경: 225건" in first
+    assert f"/nx_show {revision.proposal_id} {revision.revision} 2" in first
+    assert "페이지: 5/5 (Notion 페이지 25개, 화면당 5개)" in fifth
 
 
 def test_orphan_history_is_reported_but_never_consumes_a_card() -> None:
@@ -316,7 +342,7 @@ def test_orphan_history_is_reported_but_never_consumes_a_card() -> None:
     assert page.automatic_history_operations == 1
     assert page.unmerged_history_operations == 1
     assert page.approve_command is None
-    assert "검토할 논리 변경 카드가 없습니다." in rendered
+    assert "검토할 Notion 페이지 변경이 없습니다." in rendered
     assert "승인 불가" in rendered
     assert "/nx_approve" not in rendered
 

@@ -50,6 +50,17 @@ _FRIENDLY_PROPERTY_NAMES = {
     "보안등급": "자료 등급",
     "OneDrive URL": "원본 링크",
 }
+_TECHNICAL_PROPERTIES = frozenset(
+    {
+        "SHA256",
+        "driveItem ID",
+        "버전ID",
+        "수집일시",
+        "파싱상태",
+        "보안등급",
+        "OneDrive URL",
+    }
+)
 
 
 class ReviewCardPageError(ValueError):
@@ -237,60 +248,116 @@ def render_review_card_page(
     page: int = 1,
     *,
     cards_per_page: int = DEFAULT_CARDS_PER_PAGE,
+    detail_item: int | None = None,
 ) -> str:
-    """Render one concise Telegram review page from a proposal revision."""
+    """Render a page-grouped Telegram summary or one exact detail card."""
 
-    projection = review_card_page(
-        proposal,
-        page,
-        cards_per_page=cards_per_page,
+    if cards_per_page < 1:
+        raise ValueError("cards_per_page must be positive")
+    cards = build_review_cards(proposal)
+    groups = _group_visible_cards(cards)
+    total_pages = max(1, (len(groups) + cards_per_page - 1) // cards_per_page)
+    if page < 1 or page > total_pages:
+        raise ReviewCardPageError(
+            f"Page {page} does not exist; valid pages are 1-{total_pages}"
+        )
+    start = (page - 1) * cards_per_page
+    selected_groups = groups[start : start + cards_per_page]
+    if detail_item is not None:
+        if detail_item < 1 or detail_item > len(selected_groups):
+            raise ReviewCardPageError(
+                "Detail item does not exist on the requested review page"
+            )
+        selected_groups = (selected_groups[detail_item - 1],)
+    unmerged_history_count = len(
+        unmerged_history_operation_ids(proposal.operations)
     )
+    history_count = sum(
+        operation.change.target_database == HISTORY_DATABASE
+        for operation in proposal.operations
+    )
+    approve_command = (
+        None
+        if unmerged_history_count
+        else (
+            f"/nx_approve {proposal.proposal_id} "
+            f"{proposal.revision} {proposal.digest}"
+        )
+    )
+    reject_command = f"/nx_reject {proposal.proposal_id} {proposal.revision}"
     overlay_only_recovery = _is_overlay_only_correction_recovery(proposal)
     lines = [
-        f"[NX_PROPOSAL_REVIEW {projection.proposal_id} r{projection.revision}]",
-        f"상태: {projection.status}",
-        f"Digest: {projection.digest}",
+        f"[NX_PROPOSAL_REVIEW {proposal.proposal_id} r{proposal.revision}]",
+        f"상태: {proposal.status.value}",
+        f"Digest: {proposal.digest}",
         (
-            f"페이지: {projection.page}/{projection.total_pages} "
-            f"(논리 변경 {projection.total_cards}건, 페이지당 {projection.cards_per_page}건)"
+            f"페이지: {page}/{total_pages} "
+            f"(Notion 페이지 {len(groups)}개, 화면당 {cards_per_page}개)"
         ),
         (
-            "자동 변경이력: "
-            f"{projection.automatic_history_operations}개 "
-            f"(미병합 {projection.unmerged_history_operations}개)"
+            f"속성 변경: {len(cards)}건 "
+            f"(자동 변경이력 {history_count}건, 미병합 {unmerged_history_count}건)"
         ),
     ]
-    if not projection.cards:
-        lines.extend(["", "검토할 논리 변경 카드가 없습니다."])
-    for group in _group_visible_cards(projection.cards):
-        first = group[0]
-        number_label = (
-            str(first.number)
-            if len(group) == 1
-            else f"{first.number}~{group[-1].number}"
+    if detail_item is None:
+        lines.append(
+            "요약 화면: 시스템 식별값과 정확한 수정 명령은 각 항목의 상세 명령으로 확인"
         )
+    else:
+        lines.append(f"상세 화면: 이 페이지의 {detail_item}번 항목")
+    if not groups:
+        lines.extend(["", "검토할 Notion 페이지 변경이 없습니다."])
+    for local_index, group in enumerate(selected_groups, start=1):
+        first = group[0]
+        display_index = detail_item or local_index
         lines.extend(
             [
                 "",
-                f"{number_label}. {_database_action_summary(group)}",
-                f"{_subject_label(first.target_database)}: {first.case_number}",
+                f"{display_index}. {_database_action_summary(group)}",
+                (
+                    f"{_subject_label(first.target_database)}: "
+                    f"{_humanize_source_title(first.case_number)}"
+                ),
                 f"원본 위치: {_human_source_summary(group)}",
                 "Notion 변경 내용:",
             ]
         )
-        for card in group:
+        visible_cards = (
+            group
+            if detail_item is not None
+            else tuple(
+                card
+                for card in group
+                if card.property_name not in _TECHNICAL_PROPERTIES
+            )
+        )
+        for card in visible_cards:
             property_label = _friendly_property_name(card.property_name)
+            current_value = _humanize_card_value(card, card.current_value)
+            approved_value = _humanize_card_value(card, card.approved_value)
             if overlay_only_recovery:
                 lines.append(
-                    f"- {property_label}: {_render_value(card.approved_value)} "
+                    f"- {property_label}: {_render_value(approved_value)} "
                     "(이전 승인에서 반영 완료)"
                 )
             else:
                 lines.append(
                     f"- {property_label}: "
-                    f"{_human_change(card.current_value, card.approved_value)} "
+                    f"{_human_change(current_value, approved_value)} "
                     f"[{_friendly_action(card.action)}]"
                 )
+        technical_cards = tuple(
+            card for card in group if card.property_name in _TECHNICAL_PROPERTIES
+        )
+        if detail_item is None and technical_cards:
+            technical_labels = ", ".join(
+                _friendly_property_name(card.property_name)
+                for card in technical_cards
+            )
+            lines.append(
+                f"- 시스템 추적정보 {len(technical_cards)}건: "
+                f"{technical_labels} (상세 화면에서 확인)"
+            )
         reasons = tuple(dict.fromkeys(card.change_basis for card in group))
         lines.append(f"변경 근거: {'; '.join(reasons)}")
         knowledge_refs = tuple(
@@ -299,16 +366,16 @@ def render_review_card_page(
         if knowledge_refs:
             lines.append(f"Wiki 참고: {'; '.join(knowledge_refs)}")
         lines.append(
-                "승인 후 Wiki: "
-                + (
-                    "사용자가 승인한 값과 수정 내용을 함께 기록"
-                    if not overlay_only_recovery
-                    else "Wiki 승인 오버레이만 복구"
-                )
+            "승인 후 Wiki: "
+            + (
+                "사용자가 승인한 값과 수정 내용을 함께 기록"
+                if not overlay_only_recovery
+                else "Wiki 승인 오버레이만 복구"
+            )
         )
         if overlay_only_recovery:
             lines.append("이 복구안은 수정·거부·보류할 수 없습니다.")
-        else:
+        elif detail_item is not None:
             lines.append("세부 조정(선택 사항 — 필요한 항목의 명령만 사용):")
             for card in group:
                 label = _friendly_property_name(card.property_name)
@@ -327,27 +394,51 @@ def render_review_card_page(
                         f"  값 수정: {card.commands.edit}",
                     ]
                 )
-    if projection.next_command:
-        lines.extend(["", f"다음 페이지: {projection.next_command}"])
-    if projection.approve_command is None:
+        else:
+            lines.append(
+                "정확한 값·수정 명령: "
+                f"/nx_show {proposal.proposal_id} {proposal.revision} "
+                f"{page} detail {display_index}"
+            )
+    if detail_item is not None:
+        lines.extend(
+            [
+                "",
+                (
+                    "요약으로 돌아가기: "
+                    f"/nx_show {proposal.proposal_id} {proposal.revision} {page}"
+                ),
+            ]
+        )
+    elif page < total_pages:
+        lines.extend(
+            [
+                "",
+                (
+                    "다음 페이지: "
+                    f"/nx_show {proposal.proposal_id} {proposal.revision} {page + 1}"
+                ),
+            ]
+        )
+    if approve_command is None:
         lines.extend(
             [
                 "",
                 (
                     "승인 불가: 검토 카드에 연결되지 않은 변경이력 operation "
-                    f"{projection.unmerged_history_operations}개가 있습니다."
+                    f"{unmerged_history_count}개가 있습니다."
                 ),
                 "표시되지 않은 변경이 있는 제안에는 승인 명령을 제공하지 않습니다.",
             ]
         )
         if not overlay_only_recovery:
-            lines.append(f"거부: {projection.reject_command}")
+            lines.append(f"거부: {reject_command}")
     elif overlay_only_recovery:
         lines.extend(
             [
                 "",
                 "허용 명령(현재 전체 digest와 정확히 일치해야 함):",
-                projection.approve_command,
+                approve_command,
                 "Notion 쓰기는 이전 승인에서 이미 완료되었습니다.",
                 (
                     "이번 승인은 Notion을 다시 쓰지 않고 Wiki 승인 오버레이와 "
@@ -359,9 +450,9 @@ def render_review_card_page(
         lines.extend(
             [
                 "",
-                f"거부: {projection.reject_command}",
+                f"거부: {reject_command}",
                 "최종 승인(현재 전체 digest와 정확히 일치해야 함):",
-                projection.approve_command,
+                approve_command,
                 "Notion과 Wiki는 아직 변경되지 않았습니다.",
             ]
         )
@@ -587,6 +678,21 @@ def _human_change(current: JsonValue, approved: JsonValue) -> str:
     if current is None:
         return f"새로 입력 {_render_value(approved)}"
     return f"{_render_value(current)} → {_render_value(approved)}"
+
+
+def _humanize_card_value(card: ReviewCard, value: JsonValue) -> JsonValue:
+    if card.property_name == "근거명" and isinstance(value, str):
+        return _humanize_source_title(value)
+    return value
+
+
+def _humanize_source_title(value: str) -> str:
+    return re.sub(
+        r"\s+\(vsha256:[0-9a-f]{64}\)\Z",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
 
 
 def _is_internal_entity_key(value: str) -> bool:

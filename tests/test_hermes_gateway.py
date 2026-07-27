@@ -710,10 +710,21 @@ class HermesGatewayApprovalTest(unittest.TestCase):
             )
         )
 
-        self.assertIn(f"Operation ID: {change.operation_id}", shown)
+        self.assertNotIn(f"Operation ID: {change.operation_id}", shown)
+        self.assertIn(
+            f"/nx_show {proposal.proposal_id} 1 1 detail 1",
+            shown,
+        )
+        detail = self.handle(
+            FakeEvent(
+                text=f"/nx_show {proposal.proposal_id} 1 1 detail 1",
+                source=FakeSource(),
+            )
+        )
+        self.assertIn(f"Operation ID: {change.operation_id}", detail)
         self.assertIn(
             f"/nx_set {proposal.proposal_id} 1 {change.operation_id} exclude",
-            shown,
+            detail,
         )
         self.assertIn(f"/nx_approve {proposal.proposal_id} 1 {proposal.digest}", shown)
 

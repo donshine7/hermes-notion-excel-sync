@@ -141,7 +141,10 @@ _IDENTIFIER = r"[A-Za-z0-9._:-]{1,128}"
 _COMMAND_RE = re.compile(
     rf"/nx_approve ({_IDENTIFIER}) ([1-9][0-9]*) ([0-9A-Fa-f]{{64}})"
 )
-_SHOW_RE = re.compile(rf"/nx_show ({_IDENTIFIER}) ([1-9][0-9]*)(?: ([1-9][0-9]*))?")
+_SHOW_RE = re.compile(
+    rf"/nx_show ({_IDENTIFIER}) ([1-9][0-9]*)"
+    r"(?: ([1-9][0-9]*))?(?: detail ([1-5]))?"
+)
 _SET_RE = re.compile(
     rf"/nx_set ({_IDENTIFIER}) ([1-9][0-9]*) ({_IDENTIFIER}) "
     r"(apply|edit|exclude|defer)(?:\s+(.+))?",
@@ -175,6 +178,7 @@ class ParsedProposalCommand:
     proposal_id: str
     revision: int
     page: int = 1
+    detail_item: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,12 +243,30 @@ def _parse_proposal_command(text: str, pattern: re.Pattern[str]) -> ParsedPropos
     match = pattern.fullmatch(text.strip())
     if match is None:
         command = text.strip().split(maxsplit=1)[0]
-        suffix = " [page]" if command == SHOW_COMMAND else ""
+        suffix = " [page [detail 1-5]]" if command == SHOW_COMMAND else ""
         raise HermesGatewayApprovalError(
             f"Use exactly: {command} <proposal_id> <revision>{suffix}"
         )
-    page = int(match.group(3)) if match.lastindex == 3 and match.group(3) else 1
-    return ParsedProposalCommand(match.group(1), int(match.group(2)), page)
+    page = (
+        int(match.group(3))
+        if match.lastindex is not None
+        and match.lastindex >= 3
+        and match.group(3)
+        else 1
+    )
+    detail_item = (
+        int(match.group(4))
+        if match.lastindex is not None
+        and match.lastindex >= 4
+        and match.group(4)
+        else None
+    )
+    return ParsedProposalCommand(
+        match.group(1),
+        int(match.group(2)),
+        page,
+        detail_item,
+    )
 
 
 def _validate_json_shape(value: object, *, depth: int = 0) -> None:
@@ -476,9 +498,14 @@ def _is_overlay_only_correction_recovery(
 def _proposal_page(
     proposal: ProposalRevision,
     page: int,
+    detail_item: int | None = None,
 ) -> str:
     try:
-        return render_review_card_page(proposal, page)
+        return render_review_card_page(
+            proposal,
+            page,
+            detail_item=detail_item,
+        )
     except ReviewCardPageError as exc:
         raise HermesGatewayApprovalError(
             "The requested proposal review page is unavailable"
@@ -1108,8 +1135,13 @@ def _handle_show_command(
         proposal.proposal_id,
         revision=proposal.revision,
         page=command.page,
+        detail_item=command.detail_item,
     )
-    return _proposal_page(proposal, command.page)
+    return _proposal_page(
+        proposal,
+        command.page,
+        command.detail_item,
+    )
 
 
 def _handle_set_command(
