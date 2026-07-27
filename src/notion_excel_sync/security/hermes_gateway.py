@@ -797,10 +797,43 @@ def _prepare_authenticated_sync(
     wiki_baseline = _ensure_local_wiki_baseline(config, database, identity)
     _refresh_local_wiki_data(config, database, identity, wiki_baseline)
     _refresh_hiworks_mail(config, database, identity, wiki_baseline)
-    source = _source_client(config, database)
-    item = source.get_item(config.onedrive.drive_id, config.onedrive.item_id)
-    data_sources = _configured_data_sources(config, database)
-    read_gateway = _notion_read_gateway(config)
+    try:
+        source = _source_client(config, database)
+        item = source.get_item(config.onedrive.drive_id, config.onedrive.item_id)
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=local_workbook_capture)"
+        )
+        raise HermesGatewayApprovalError(
+            "Local Excel capture failed; Notion was not changed"
+        ) from exc
+    try:
+        data_sources = _configured_data_sources(config, database)
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=notion_target_binding)"
+        )
+        raise HermesGatewayApprovalError(
+            "Notion target verification failed; Notion was not changed"
+        ) from exc
+    try:
+        read_gateway = _notion_read_gateway(config)
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=notion_read_setup)"
+        )
+        raise HermesGatewayApprovalError(
+            "Notion read setup failed; Notion was not changed"
+        ) from exc
     service = SyncPreparationService(
         database=database,
         onedrive=source,
@@ -824,14 +857,25 @@ def _prepare_authenticated_sync(
             wiki_baseline,
         ),
     )
-    return service.prepare(
-        drive_id=config.onedrive.drive_id,
-        item_id=config.onedrive.item_id,
-        initial_cutoff=config.initial_cutoff,
-        requested_by=identity.user_id,
-        chat_id=identity.chat_id,
-        source_web_url=item.web_url,
-    )
+    try:
+        return service.prepare(
+            drive_id=config.onedrive.drive_id,
+            item_id=config.onedrive.item_id,
+            initial_cutoff=config.initial_cutoff,
+            requested_by=identity.user_id,
+            chat_id=identity.chat_id,
+            source_web_url=item.web_url,
+        )
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=excel_notion_analysis)"
+        )
+        raise HermesGatewayApprovalError(
+            "Excel and Notion comparison failed; Notion was not changed"
+        ) from exc
 
 
 def _latest_version(
@@ -2594,7 +2638,7 @@ def handle_pre_gateway_dispatch(
         code = _public_denial_code(command_name, exc)
         return _denied(code, _public_denial_message(exc))
     except Exception:
-        logger.error("Hermes Telegram workflow command failed closed")
+        logger.exception("Hermes Telegram workflow command failed closed")
         return _denied(
             "internal_error",
             "The trusted workflow worker encountered an internal error",

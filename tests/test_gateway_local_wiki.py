@@ -212,3 +212,67 @@ def test_hiworks_failure_prevents_source_and_notion_processing() -> None:
     data_refresh.assert_called_once_with(config, database, _identity(), baseline)
     mail_refresh.assert_called_once_with(config, database, _identity(), baseline)
     source_client.assert_not_called()
+
+
+def test_local_workbook_failure_returns_safe_stage_message() -> None:
+    config = SimpleNamespace(
+        onedrive=SimpleNamespace(drive_id="local", item_id="local:item")
+    )
+    database = Mock()
+
+    with (
+        patch(
+            "notion_excel_sync.security.hermes_gateway._ensure_local_wiki_baseline",
+            return_value=None,
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._refresh_local_wiki_data"
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._refresh_hiworks_mail"
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._source_client",
+            side_effect=RuntimeError("private local path"),
+        ),
+        pytest.raises(
+            HermesGatewayApprovalError,
+            match="Local Excel capture failed; Notion was not changed",
+        ),
+    ):
+        _prepare_authenticated_sync(config, database, _identity())
+
+
+def test_notion_target_failure_returns_safe_stage_message() -> None:
+    config = SimpleNamespace(
+        onedrive=SimpleNamespace(drive_id="local", item_id="local:item")
+    )
+    database = Mock()
+    source = Mock()
+    source.get_item.return_value = SimpleNamespace(web_url=None)
+
+    with (
+        patch(
+            "notion_excel_sync.security.hermes_gateway._ensure_local_wiki_baseline",
+            return_value=None,
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._refresh_local_wiki_data"
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._refresh_hiworks_mail"
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._source_client",
+            return_value=source,
+        ),
+        patch(
+            "notion_excel_sync.security.hermes_gateway._configured_data_sources",
+            side_effect=RuntimeError("private binding detail"),
+        ),
+        pytest.raises(
+            HermesGatewayApprovalError,
+            match="Notion target verification failed; Notion was not changed",
+        ),
+    ):
+        _prepare_authenticated_sync(config, database, _identity())
