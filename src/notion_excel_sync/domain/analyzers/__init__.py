@@ -1,4 +1,5 @@
 from notion_excel_sync.domain.analyzers.anomaly import AnomalyAnalyzer
+from notion_excel_sync.domain.analyzers.case_history import CaseHistoryAnalyzer
 from notion_excel_sync.domain.analyzers.finance import (
     ACTUAL_COST_CONTEXT_METADATA,
     EVIDENCE_CONTEXT_METADATA,
@@ -28,6 +29,7 @@ __all__ = [
     "ActualCostContextEntry",
     "ActualCostAnalyzer",
     "AnomalyAnalyzer",
+    "CaseHistoryAnalyzer",
     "CaseIdentityAnalyzer",
     "ContactAnalyzer",
     "DeadlineAnalyzer",

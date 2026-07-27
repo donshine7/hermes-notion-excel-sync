@@ -605,6 +605,7 @@ class SyncPreparationService:
             "source_web_url": source_web_url,
             "baseline_version_id": baseline_version.id,
             "current_version_id": current_version.id,
+            "captured_at": current.captured_at.isoformat(),
             ACTUAL_COST_CONTEXT_METADATA: build_actual_cost_context(current.records),
         }
         if knowledge.available:
@@ -1170,6 +1171,7 @@ class SyncPreparationService:
             "비용·청구": 4,
             "정부지원사업 증빙": 5,
             "기일": 6,
+            "사건 히스토리": 6,
             "등록결정 후속관리": 6,
             "연락이력": 6,
             "검토함": 7,

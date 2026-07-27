@@ -101,6 +101,7 @@ NaN/Infinity 또는 과도하게 큰·깊은 JSON은 거부합니다. 이 명령
 
 ```text
 /nx_schema_plan government-support-evidence <NOTION_PARENT_PAGE_ID>
+/nx_schema_plan case-history <NOTION_PARENT_PAGE_ID>
 /nx_schema_show <schema-proposal-id> <revision> [page]
 /nx_schema_reject <schema-proposal-id> <revision>
 /nx_schema_approve <schema-proposal-id> <revision> <full-64-character-digest>

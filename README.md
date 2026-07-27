@@ -58,9 +58,13 @@ flowchart TD
 ## 분석 구조
 
 변경된 행과 관련 문서를 분석기 레지스트리로 전달합니다. 기본 분석 영역은 사건 식별,
-당사자, 그룹, 업무 상태, 기일, 실제 사건 비용, 정부지원사업 증빙, 등록결정 후속관리,
-연락, 문서·자료, 관계 및 이상 탐지입니다. 알 수 없는 필드는 버리지 않고 검토 후보로
-남깁니다.
+당사자, 그룹, 업무 상태, 기일, 사건 히스토리, 실제 사건 비용, 정부지원사업 증빙,
+등록결정 후속관리, 연락, 문서·자료, 관계 및 이상 탐지입니다. 알 수 없는 필드는 버리지
+않고 검토 후보로 남깁니다.
+
+`사건 히스토리`는 실제 사건의 시간순 업무 사건을 보관합니다. 기존 `변경이력`은 Notion
+속성 mutation 감사 기록으로 그대로 유지하므로 두 DB의 용도가 섞이지 않습니다. 자세한
+이벤트 규칙은 [사건 히스토리 운영 계약](docs/case-history.md)을 참고하십시오.
 
 비용과 증빙은 분리합니다.
 
@@ -168,6 +172,7 @@ Notion 아래에 별도 스키마 생성이 필요한 경우에도 데이터 승
 
 ```text
 /nx_schema_plan government-support-evidence <NOTION_PARENT_PAGE_ID>
+/nx_schema_plan case-history <NOTION_PARENT_PAGE_ID>
 /nx_schema_show <schema-proposal-id> <revision>
 /nx_schema_approve <schema-proposal-id> <revision> <full-64-character-digest>
 ```

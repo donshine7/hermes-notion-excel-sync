@@ -43,6 +43,7 @@ _TITLE_PROPERTIES = frozenset(
         "기일명",
         "후속관리명",
         "연락제목",
+        "히스토리명",
         "검토명",
     }
 )
@@ -54,6 +55,9 @@ _FRIENDLY_PROPERTY_NAMES = {
     "파싱상태": "읽기 상태",
     "보안등급": "자료 등급",
     "OneDrive URL": "원본 링크",
+    "이벤트ID": "이벤트 식별값",
+    "원본버전": "원본 버전",
+    "원본해시": "원본 파일 식별값",
 }
 _TECHNICAL_PROPERTIES = frozenset(
     {
@@ -64,6 +68,9 @@ _TECHNICAL_PROPERTIES = frozenset(
         "파싱상태",
         "보안등급",
         "OneDrive URL",
+        "이벤트ID",
+        "원본버전",
+        "원본해시",
     }
 )
 
@@ -548,9 +555,11 @@ def _case_numbers_by_source_position(
         change = operation.change
         if _normalized_property(change.property_name) not in _CASE_NUMBER_PROPERTIES:
             continue
-        value = change.entity_key.strip() or _case_value(operation.approved_value)
+        value = _case_value(operation.approved_value)
         if not value:
             value = _case_value(change.proposed_value)
+        if not value and not _is_internal_entity_key(change.entity_key.strip()):
+            value = change.entity_key.strip()
         if not value:
             continue
         for position in _source_positions(change.source_refs):
@@ -571,11 +580,6 @@ def _case_number(
     entity_key = change.entity_key.strip()
     if entity_key and not _is_internal_entity_key(entity_key):
         return entity_key
-    label = (display_labels or {}).get(
-        (change.target_database, change.entity_key)
-    )
-    if label:
-        return label
     referenced = sorted(
         {
             case_by_source_position[position]
@@ -585,6 +589,11 @@ def _case_number(
     )
     if referenced:
         return ", ".join(referenced)
+    label = (display_labels or {}).get(
+        (change.target_database, change.entity_key)
+    )
+    if label:
+        return label
     positions = sorted(_source_positions(change.source_refs))
     if positions:
         sheet, row = positions[0]
@@ -648,6 +657,7 @@ def _subject_label(database: str) -> str:
         "기일": "기일",
         "등록결정 후속관리": "등록 후속",
         "연락이력": "연락",
+        "사건 히스토리": "사건 이벤트",
         "검토함": "검토 항목",
     }.get(database, "대상")
 
@@ -720,6 +730,7 @@ def _is_internal_entity_key(value: str) -> bool:
             "registration:",
             "contact:",
             "materials:",
+            "case-history:",
         )
     )
 

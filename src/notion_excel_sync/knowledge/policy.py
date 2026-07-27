@@ -252,6 +252,7 @@ TOPIC_CATEGORIES: dict[str, tuple[str, ...]] = {
     "template": ("서식·템플릿",),
     "grouping-policy": ("정부지원사업·증빙", "사무소 규정·업무 매뉴얼"),
     "case-numbering": ("사무소 규정·업무 매뉴얼",),
+    "case-history": ("사무소 규정·업무 매뉴얼", "국내·해외 절차"),
     "data-quality": ("사무소 규정·업무 매뉴얼",),
 }
 

@@ -382,6 +382,22 @@ class HermesSchemaGatewayTests(unittest.TestCase):
         self.assertFalse(is_schema_command("/nx_schema_approve_now x"))
         self.assertFalse(is_schema_command("승인"))
 
+    def test_case_history_plan_is_read_only_and_uses_its_own_target(self) -> None:
+        result = handle_schema_command(
+            self.event(101),
+            f"/nx_schema_plan case-history {SCHEMA_PARENT_PAGE_ID}",
+            self.config,
+            self.database,
+        )
+
+        self.assertIn("Database: 사건 히스토리", result)
+        self.assertIn("아직 Notion은 변경되지 않았습니다", result)
+        self.assertEqual(self.notion.create_count, 0)
+        proposal = self.database.load_active_schema_proposal("사건 히스토리")
+        self.assertIsNotNone(proposal)
+        assert proposal is not None
+        self.assertEqual(proposal.schema_payload["template_id"], "case-history")
+
     def test_plan_and_show_are_read_only_and_event_replay_is_stable(self) -> None:
         proposal_id, revision, digest, result = self.plan()
         self.assertIn("아직 Notion은 변경되지 않았습니다", result)

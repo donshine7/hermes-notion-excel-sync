@@ -189,6 +189,7 @@ idempotent하게 복구합니다. 사용자가 편집한 값은 Notion 성공 �
 
 ```text
 /nx_schema_plan government-support-evidence <NOTION_PARENT_PAGE_ID>
+/nx_schema_plan case-history <NOTION_PARENT_PAGE_ID>
 /nx_schema_show <schema-proposal-id> <revision>
 /nx_schema_approve <schema-proposal-id> <revision> <full-64-character-digest>
 ```

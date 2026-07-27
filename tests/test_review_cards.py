@@ -187,6 +187,71 @@ def test_card_contains_exact_review_and_command_data() -> None:
     assert card.commands.edit == "/nx_set P-SYNTHETIC 2 op-edit edit <JSON>"
 
 
+def test_case_history_summary_is_human_readable_and_hides_tracking_values() -> None:
+    entity_key = "case-history:" + "f" * 32
+    revision = proposal(
+        [
+            operation(
+                "history-title",
+                entity_key=entity_key,
+                database="사건 히스토리",
+                property_name="히스토리명",
+                current=None,
+                proposed="SS-2026-017 · 2026-07-17 · 업무완료",
+            ),
+            operation(
+                "history-case",
+                entity_key=entity_key,
+                database="사건 히스토리",
+                property_name="사건번호",
+                current=None,
+                proposed="SS-2026-017",
+            ),
+            operation(
+                "history-date",
+                entity_key=entity_key,
+                database="사건 히스토리",
+                property_name="발생일",
+                current=None,
+                proposed="2026-07-17",
+            ),
+            operation(
+                "history-type",
+                entity_key=entity_key,
+                database="사건 히스토리",
+                property_name="이벤트유형",
+                current=None,
+                proposed="업무완료",
+            ),
+            operation(
+                "history-summary",
+                entity_key=entity_key,
+                database="사건 히스토리",
+                property_name="요약",
+                current=None,
+                proposed="가출원 명세서 제출 · 업무완료",
+            ),
+            operation(
+                "history-id",
+                entity_key=entity_key,
+                database="사건 히스토리",
+                property_name="이벤트ID",
+                current=None,
+                proposed=entity_key,
+            ),
+        ]
+    )
+
+    rendered = render_review_card_page(revision)
+
+    assert "사건 히스토리 새 페이지 만들기" in rendered
+    assert "사건 이벤트: SS-2026-017" in rendered
+    assert "- 발생일: 새로 입력 \"2026-07-17\" [반영]" in rendered
+    assert "- 이벤트유형: 새로 입력 \"업무완료\" [반영]" in rendered
+    assert "시스템 추적정보 1건: 이벤트 식별값" in rendered
+    assert entity_key not in rendered
+
+
 def test_case_number_prefers_entity_key_then_uses_same_row_reverse_lookup() -> None:
     case_identity = operation(
         "op-case",

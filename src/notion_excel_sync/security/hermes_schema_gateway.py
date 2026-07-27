@@ -44,8 +44,7 @@ from notion_excel_sync.security.schema_recovery import (
 from notion_excel_sync.workflow.notion_schema import (
     REMOTE_MARKER_PREFIX,
     SCHEMA_API_VERSION,
-    SCHEMA_LOGICAL_NAME,
-    SCHEMA_TEMPLATE_ID,
+    SCHEMA_TEMPLATES,
     CreatedSchemaBinding,
     DirectChildIdentity,
     NotionSchemaSecurityError,
@@ -62,6 +61,7 @@ from notion_excel_sync.workflow.notion_schema import (
     capture_schema_live_binding,
     decide_schema_reconciliation,
     normalize_notion_id,
+    schema_template,
     verify_created_schema,
 )
 
@@ -86,9 +86,10 @@ _NOTION_ID = (
     r"(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
     r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})"
 )
-_PLAN_RE = re.compile(
-    rf"/nx_schema_plan ({re.escape(SCHEMA_TEMPLATE_ID)}) ({_NOTION_ID})"
+_TEMPLATE_PATTERN = "|".join(
+    re.escape(template_id) for template_id in sorted(SCHEMA_TEMPLATES)
 )
+_PLAN_RE = re.compile(rf"/nx_schema_plan ({_TEMPLATE_PATTERN}) ({_NOTION_ID})")
 _SHOW_RE = re.compile(rf"/nx_schema_show ({_PROPOSAL_ID}) ([1-9][0-9]*)(?: ([1-9][0-9]*))?")
 _REJECT_RE = re.compile(rf"/nx_schema_reject ({_PROPOSAL_ID}) ([1-9][0-9]*)")
 _APPROVE_RE = re.compile(
@@ -287,7 +288,8 @@ def _parse_command(text: str) -> ParsedSchemaCommand:
         match = _PLAN_RE.fullmatch(normalized)
         if match is None:
             raise HermesSchemaGatewayError(
-                "정확한 형식: /nx_schema_plan government-support-evidence <parent_page_id>"
+                "정확한 형식: /nx_schema_plan "
+                "<government-support-evidence|case-history> <parent_page_id>"
             )
         return ParsedSchemaCommand(
             command_name="nx_schema_plan",
@@ -457,9 +459,14 @@ def _validate_owner(
         raise HermesSchemaGatewayError("요청한 스키마 제안 revision이 최신 revision과 다릅니다.")
 
 
-def _relation_ids(config: AppConfig) -> dict[str, str]:
+def _relation_ids(config: AppConfig, template_id: str) -> dict[str, str]:
     result: dict[str, str] = {}
-    logical_names = ("한국 특허 사건", "그룹", "비용·청구", "근거자료")
+    logical_names = tuple(
+        dict.fromkeys(
+            logical_name
+            for _, logical_name in schema_template(template_id).relations
+        )
+    )
     for logical_name in logical_names:
         value = str(config.notion.databases.get(logical_name, "")).strip()
         if not value or value.upper().startswith("REPLACE_"):
@@ -491,10 +498,11 @@ def _capture_snapshot(
     gateway: _SchemaRemoteReader,
     config: AppConfig,
     *,
+    template_id: str,
     parent_page_id: str,
     expected_write_bot_id: str | None = None,
 ) -> _RemoteSnapshot:
-    relation_ids = _relation_ids(config)
+    relation_ids = _relation_ids(config, template_id)
     parent_page = gateway.get_page(parent_page_id)
     write_bot = gateway.get_self()
     children = _direct_child_databases(gateway, parent_page_id)
@@ -503,6 +511,7 @@ def _capture_snapshot(
         for name, data_source_id in relation_ids.items()
     }
     binding = capture_schema_live_binding(
+        template_id=template_id,
         parent_page=parent_page,
         write_bot=write_bot,
         direct_child_databases=children,
@@ -611,7 +620,7 @@ def _plan_from_proposal(
         raise HermesSchemaGatewayError("저장된 스키마 사전조건이 계획과 다릅니다.")
     if (
         proposal.purpose != SCHEMA_APPROVAL_PURPOSE
-        or proposal.logical_database_name != SCHEMA_LOGICAL_NAME
+        or proposal.logical_database_name != plan.logical_name
         or normalize_notion_id(proposal.parent_page_id) != plan.parent_page_id
         or plan.parent_page_id != expected_parent_page_id
     ):
@@ -724,18 +733,19 @@ def _mark_preapply_stale(
         )
 
 
-def _target_is_unconfigured(config: AppConfig) -> bool:
-    configured = str(config.notion.databases.get(SCHEMA_LOGICAL_NAME, "")).strip()
+def _target_is_unconfigured(config: AppConfig, logical_name: str) -> bool:
+    configured = str(config.notion.databases.get(logical_name, "")).strip()
     return not configured or configured.upper().startswith("REPLACE_")
 
 
 def _has_active_schema_target(
     database: StateDatabase,
     *,
+    logical_name: str,
     exclude_proposal_id: str | None = None,
     include_pending: bool,
 ) -> bool:
-    active = database.load_active_schema_proposal(SCHEMA_LOGICAL_NAME)
+    active = database.load_active_schema_proposal(logical_name)
     if active is None or active.schema_proposal_id == exclude_proposal_id:
         return False
     if not include_pending and active.status in {
@@ -772,14 +782,19 @@ def _dispatch_plan(
     expected_parent_page_id: str,
 ) -> str:
     assert parsed.template_id is not None and parsed.parent_page_id is not None
+    contract = schema_template(parsed.template_id)
     if parsed.parent_page_id != expected_parent_page_id:
         raise HermesSchemaGatewayError("이 템플릿의 허용된 최상위 Notion 페이지만 사용할 수 있습니다.")
     if config.notion.api_version != SCHEMA_API_VERSION:
         raise HermesSchemaGatewayError("고정 스키마 템플릿과 Notion API 버전이 다릅니다.")
-    if not _target_is_unconfigured(config):
-        raise HermesSchemaGatewayError("정부지원사업 증빙 data source가 이미 설정되어 있습니다.")
-    if database.get_schema_installation(SCHEMA_LOGICAL_NAME) is not None:
-        raise HermesSchemaGatewayError("정부지원사업 증빙 스키마가 이미 설치되어 있습니다.")
+    if not _target_is_unconfigured(config, contract.logical_name):
+        raise HermesSchemaGatewayError(
+            f"{contract.logical_name} data source가 이미 설정되어 있습니다."
+        )
+    if database.get_schema_installation(contract.logical_name) is not None:
+        raise HermesSchemaGatewayError(
+            f"{contract.logical_name} 스키마가 이미 설치되어 있습니다."
+        )
 
     seed = _plan_seed(command_hash, identity)
     proposal_id = f"SP-{seed[:32]}"
@@ -790,7 +805,11 @@ def _dispatch_plan(
     if existing is not None:
         _validate_owner(identity, existing, 1)
         return _proposal_screen(existing)
-    if _has_active_schema_target(database, include_pending=True):
+    if _has_active_schema_target(
+        database,
+        logical_name=contract.logical_name,
+        include_pending=True,
+    ):
         raise HermesSchemaGatewayError(
             "같은 대상의 미완료 스키마 제안이 있습니다. 먼저 기존 제안을 처리해야 합니다."
         )
@@ -799,6 +818,7 @@ def _dispatch_plan(
     snapshot = _capture_snapshot(
         gateway,
         config,
+        template_id=parsed.template_id,
         parent_page_id=parsed.parent_page_id,
     )
     plan = build_schema_create_plan(
@@ -820,7 +840,7 @@ def _dispatch_plan(
         chat_id=identity.chat_id,
         thread_id=identity.thread_id,
         operation_id=f"schema-create-{seed[:32]}",
-        logical_database_name=SCHEMA_LOGICAL_NAME,
+        logical_database_name=contract.logical_name,
         parent_page_id=expected_parent_page_id,
         schema_payload=plan.digest_payload(),
         precondition=dataclass_to_dict(plan.approved_live_binding),
@@ -1015,7 +1035,7 @@ def _dispatch_approve(
     if not hmac.compare_digest(parsed.digest, proposal.digest):
         raise HermesSchemaGatewayError("전체 스키마 digest가 최신 제안과 일치하지 않습니다.")
     plan = _plan_from_proposal(proposal, expected_parent_page_id)
-    if database.get_schema_installation(SCHEMA_LOGICAL_NAME) is not None:
+    if database.get_schema_installation(plan.logical_name) is not None:
         if proposal.status is SchemaProposalStatus.COMMITTED:
             return _safe_failure("COMMITTED", "스키마가 이미 정확히 설치되어 있습니다.")
         raise HermesSchemaGatewayError("동일한 논리 DB 설치가 이미 등록되어 있습니다.")
@@ -1052,17 +1072,18 @@ def _dispatch_approve(
             raise HermesSchemaGatewayError(
                 "승인 전 Notion API 버전이 고정 계획과 달라졌습니다."
             )
-        if not _target_is_unconfigured(config):
+        if not _target_is_unconfigured(config, plan.logical_name):
             _mark_preapply_stale(
                 database,
                 proposal,
                 reason_code="target_configuration_changed",
             )
             raise HermesSchemaGatewayError(
-                "승인 전 정부지원사업 증빙 data source 설정이 달라졌습니다."
+                f"승인 전 {plan.logical_name} data source 설정이 달라졌습니다."
             )
         if _has_active_schema_target(
             database,
+            logical_name=plan.logical_name,
             exclude_proposal_id=proposal.schema_proposal_id,
             include_pending=False,
         ):
@@ -1072,6 +1093,7 @@ def _dispatch_approve(
             current = _capture_snapshot(
                 read_gateway,
                 config,
+                template_id=plan.template_id,
                 parent_page_id=plan.parent_page_id,
                 expected_write_bot_id=plan.write_bot_id,
             )
@@ -1173,6 +1195,7 @@ def _dispatch_approve(
             second = _capture_snapshot(
                 gateway,
                 config,
+                template_id=plan.template_id,
                 parent_page_id=plan.parent_page_id,
                 expected_write_bot_id=plan.write_bot_id,
             )
@@ -1279,7 +1302,10 @@ def _dispatch_approve(
 
     return "\n".join(
         [
-            "[NX_SCHEMA_COMMITTED] 정부지원사업 증빙 DB를 정확히 검증하고 등록했습니다.",
+            (
+                f"[NX_SCHEMA_COMMITTED] {plan.logical_name} DB를 "
+                "정확히 검증하고 등록했습니다."
+            ),
             f"Proposal: {proposal.schema_proposal_id}",
             f"Revision: {proposal.revision}",
             "Excel 체크포인트와 데이터 변경 대기열은 변경하지 않았습니다.",
@@ -1316,7 +1342,7 @@ def _recovery_candidates(
     for remote_database in children:
         title = _plain_rich_text(remote_database.get("title"))
         marker = _plain_rich_text(remote_database.get("description"))
-        if title != SCHEMA_LOGICAL_NAME and not marker.startswith(REMOTE_MARKER_PREFIX):
+        if title != plan.logical_name and marker != plan.remote_marker:
             continue
         rows = remote_database.get("data_sources")
         if (
@@ -1473,6 +1499,7 @@ def _dispatch_recover(
         snapshot = _capture_snapshot(
             gateway,
             config,
+            template_id=plan.template_id,
             parent_page_id=plan.parent_page_id,
             expected_write_bot_id=plan.write_bot_id,
         )

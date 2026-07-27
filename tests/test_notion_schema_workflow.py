@@ -8,6 +8,10 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from notion_excel_sync.workflow.notion_schema import (
+    CASE_HISTORY_LOGICAL_NAME,
+    CASE_HISTORY_PROPERTIES,
+    CASE_HISTORY_SELECT_OPTIONS,
+    CASE_HISTORY_TEMPLATE_ID,
     FIXED_PROPERTIES,
     FIXED_SELECT_OPTIONS,
     REMOTE_MARKER_PREFIX,
@@ -152,6 +156,26 @@ def make_plan():
         )
 
 
+def make_case_history_plan():
+    case_relations = {"한국 특허 사건": CASE_SOURCE_ID}
+    case_sources = {
+        "한국 특허 사건": relation_sources()["한국 특허 사건"],
+    }
+    with patch(
+        "notion_excel_sync.workflow.notion_schema.secrets.token_hex",
+        return_value="cd" * 16,
+    ):
+        return build_schema_create_plan(
+            CASE_HISTORY_TEMPLATE_ID,
+            parent_page=parent_page(),
+            write_bot=write_bot(),
+            direct_child_databases=[],
+            relation_data_source_ids=case_relations,
+            relation_data_sources=case_sources,
+            expected_write_bot_id=BOT_ID,
+        )
+
+
 def remote_schema(plan) -> dict[str, dict[str, object]]:
     relation_by_property = {
         item.property_name: item.data_source_id for item in plan.relation_targets
@@ -291,6 +315,33 @@ class NotionSchemaPlanTest(unittest.TestCase):
         body["initial_data_source"]["properties"]["임의 속성"] = {"title": {}}
         self.assertNotIn(
             "임의 속성", plan.create_body["initial_data_source"]["properties"]
+        )
+
+    def test_case_history_template_is_exact_and_relation_scoped(self) -> None:
+        plan = make_case_history_plan()
+        body = plan.create_body
+        properties = body["initial_data_source"]["properties"]
+
+        self.assertEqual(plan.logical_name, CASE_HISTORY_LOGICAL_NAME)
+        self.assertEqual(
+            list(properties),
+            [name for name, _ in CASE_HISTORY_PROPERTIES],
+        )
+        self.assertEqual(
+            properties["사건"]["relation"]["data_source_id"],
+            CASE_SOURCE_ID,
+        )
+        self.assertEqual(
+            properties["이벤트유형"]["select"]["options"],
+            [
+                {"name": name, "color": color}
+                for name, color in CASE_HISTORY_SELECT_OPTIONS["이벤트유형"]
+            ],
+        )
+        self.assertEqual(properties["신뢰도"]["number"]["format"], "number")
+        self.assertEqual(
+            body["title"][0]["text"]["content"],
+            CASE_HISTORY_LOGICAL_NAME,
         )
 
     def test_canonical_digest_is_order_independent_but_binds_marker(self) -> None:
