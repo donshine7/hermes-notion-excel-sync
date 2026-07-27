@@ -21,6 +21,7 @@ from notion_excel_sync.domain import (
 from notion_excel_sync.models import (
     ChangeKind,
     KnowledgeRef,
+    ProposalOperation,
     ProposalRevision,
     ProposedChange,
     RecordChange,
@@ -65,6 +66,99 @@ _PROPOSAL_BATCH_MAX_ENTITIES = 25
 _PROPOSAL_BATCH_MAX_OPERATIONS = 500
 _LEGACY_ROW_PROVENANCE_ANALYZER = "provenance_tracker"
 _LEGACY_ROW_PROVENANCE_DATABASE = "근거자료"
+_REVIEW_MATERIALIZER_ANALYZER = "review_materializer"
+_REVIEW_DATABASE = "검토함"
+_REVIEW_CONFIDENCE_PROPERTY = "신뢰도"
+_BOOTSTRAP_REVIEW_MIN_CONFIDENCE = 0.8
+
+
+def _review_group_confidence(
+    operations: list[ProposalOperation],
+) -> float | None:
+    for operation in operations:
+        if operation.change.property_name != _REVIEW_CONFIDENCE_PROPERTY:
+            continue
+        value = operation.approved_value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+    return None
+
+
+def _retire_obsolete_bootstrap_reviews(
+    database: StateDatabase,
+    pending_operations: list[ProposalOperation],
+    *,
+    current_version_id: str,
+    actor: str,
+) -> tuple[list[ProposalOperation], dict[str, int]]:
+    """Retire only stale or low-value review pages before the first checkpoint.
+
+    Rejected first-run proposals can leave durable pending review operations.
+    A later Excel save has a new source version, so retaining the old review
+    identity would duplicate the same uncertainty. Low-confidence bootstrap
+    reviews are also summarized locally instead of creating thousands of
+    Notion pages. Non-review work and high-confidence current reviews are
+    preserved exactly.
+    """
+
+    review_groups: dict[str, list[ProposalOperation]] = {}
+    for operation in pending_operations:
+        change = operation.change
+        if (
+            change.analyzer == _REVIEW_MATERIALIZER_ANALYZER
+            and change.target_database == _REVIEW_DATABASE
+        ):
+            review_groups.setdefault(change.entity_key, []).append(operation)
+
+    stale_ids: set[str] = set()
+    low_confidence_ids: set[str] = set()
+    for group in review_groups.values():
+        source_versions = {
+            ref.version_id
+            for operation in group
+            for ref in operation.change.source_refs
+            if ref.version_id
+        }
+        if source_versions and current_version_id not in source_versions:
+            stale_ids.update(
+                operation.change.operation_id for operation in group
+            )
+            continue
+        confidence = _review_group_confidence(group)
+        if (
+            confidence is not None
+            and confidence < _BOOTSTRAP_REVIEW_MIN_CONFIDENCE
+        ):
+            low_confidence_ids.update(
+                operation.change.operation_id for operation in group
+            )
+
+    retired_ids = stale_ids | low_confidence_ids
+    if retired_ids:
+        database.retire_pending_operations(
+            retired_ids,
+            expected_analyzer=_REVIEW_MATERIALIZER_ANALYZER,
+            expected_database=_REVIEW_DATABASE,
+            actor=actor,
+            reason=(
+                "Superseded first-run reviews and low-confidence bootstrap "
+                "reviews are summarized locally instead of materialized as "
+                "individual Notion pages"
+            ),
+        )
+    return (
+        [
+            operation
+            for operation in pending_operations
+            if operation.change.operation_id not in retired_ids
+        ],
+        {
+            "stale_operations": len(stale_ids),
+            "low_confidence_operations": len(low_confidence_ids),
+            "retired_operations": len(retired_ids),
+        },
+    )
 
 
 def _source_ref_identity(ref: SourceRef) -> dict[str, object]:
@@ -357,6 +451,11 @@ class SyncPreparationService:
         baseline_version, current_version = self._versions(
             drive_id, item_id, initial_cutoff
         )
+        bootstrap_review_retirement = {
+            "stale_operations": 0,
+            "low_confidence_operations": 0,
+            "retired_operations": 0,
+        }
         pending_operations = self.database.load_pending_operations()
         legacy_provenance = [
             operation
@@ -388,6 +487,16 @@ class SyncPreparationService:
                 for operation in pending_operations
                 if operation.change.operation_id not in retired_ids
             ]
+        if first_run:
+            (
+                pending_operations,
+                bootstrap_review_retirement,
+            ) = _retire_obsolete_bootstrap_reviews(
+                self.database,
+                pending_operations,
+                current_version_id=current_version.id,
+                actor=requested_by,
+            )
         wiki_pending_count = sum(
             bool(operation.change.knowledge_refs) for operation in pending_operations
         )
@@ -528,6 +637,29 @@ class SyncPreparationService:
         domain_changes = [change for run in runs for change in run.proposed_changes]
         reviews = [review for run in runs for review in run.review_items]
         reviews.extend(self._unrouted_reviews(runs))
+        bootstrap_reviews_suppressed = 0
+        if full_reconcile:
+            bootstrap_reviews_suppressed = sum(
+                review.confidence < _BOOTSTRAP_REVIEW_MIN_CONFIDENCE
+                for review in reviews
+            )
+            reviews = [
+                review
+                for review in reviews
+                if review.confidence >= _BOOTSTRAP_REVIEW_MIN_CONFIDENCE
+            ]
+            self.database.audit(
+                "bootstrap_review_filter",
+                {
+                    "source_version_id": current.version_id,
+                    "minimum_confidence": _BOOTSTRAP_REVIEW_MIN_CONFIDENCE,
+                    "materialized_review_pages": len(reviews),
+                    "suppressed_review_pages": bootstrap_reviews_suppressed,
+                    **bootstrap_review_retirement,
+                },
+                None,
+                requested_by,
+            )
         all_changes = self._deduplicate(domain_changes)
         all_changes.extend(self._review_changes(reviews, current.version_id))
         all_changes = self._deduplicate(all_changes)
@@ -612,6 +744,8 @@ class SyncPreparationService:
                 "row_changes": len(row_changes),
                 "operations": len(proposal.operations),
                 "staged_pending_operations": len(staged_pending),
+                "bootstrap_reviews_suppressed": bootstrap_reviews_suppressed,
+                "bootstrap_review_retirement": bootstrap_review_retirement,
                 "wiki_generation_digest": knowledge.binding.get(
                     "generation_digest", ""
                 ),

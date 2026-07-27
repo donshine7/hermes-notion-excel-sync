@@ -22,7 +22,10 @@ from notion_excel_sync.models import (
 from notion_excel_sync.persistence.database import StateDatabase
 from notion_excel_sync.security.approval import ApprovalService
 from notion_excel_sync.workflow.proposals import ProposalService
-from notion_excel_sync.workflow.sync import SyncPreparationService
+from notion_excel_sync.workflow.sync import (
+    SyncPreparationService,
+    _retire_obsolete_bootstrap_reviews,
+)
 
 
 def test_proposal_batch_keeps_pages_atomic_and_stages_a_bounded_suffix() -> None:
@@ -137,6 +140,106 @@ def test_legacy_row_provenance_backlog_is_retired_without_touching_real_work() -
         assert [item.change.operation_id for item in remaining] == [
             real_work.operation_id
         ]
+
+
+def test_bootstrap_review_cleanup_keeps_current_high_confidence_and_real_work() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        database = StateDatabase(Path(folder) / "state.db")
+        database.initialize()
+
+        def review_change(
+            entity: str,
+            property_name: str,
+            value: object,
+            version: str,
+        ) -> ProposedChange:
+            return ProposedChange(
+                target_database="검토함",
+                entity_key=entity,
+                property_name=property_name,
+                kind=ChangeKind.CREATE,
+                current_value=None,
+                proposed_value=value,
+                analyzer="review_materializer",
+                analyzer_version="1.0.0",
+                confidence=1.0,
+                reason="synthetic review",
+                source_refs=[
+                    SourceRef(
+                        "local",
+                        "local:item",
+                        version,
+                        version,
+                        "2026",
+                        2,
+                        "A2",
+                    )
+                ],
+                operation_id=f"{entity}-{property_name}",
+            )
+
+        stale = [
+            review_change("review:stale", "검토항목", "stale", "old-version"),
+            review_change("review:stale", "신뢰도", 0.9, "old-version"),
+        ]
+        low = [
+            review_change("review:low", "검토항목", "low", "current-version"),
+            review_change("review:low", "신뢰도", 0.55, "current-version"),
+        ]
+        high = [
+            review_change("review:high", "검토항목", "high", "current-version"),
+            review_change("review:high", "신뢰도", 0.9, "current-version"),
+        ]
+        real_work = ProposedChange(
+            target_database="한국 특허 사건",
+            entity_key="SS-SYNTHETIC-001",
+            property_name="현재상태",
+            kind=ChangeKind.UPDATE,
+            current_value="접수",
+            proposed_value="진행",
+            analyzer="workflow_status",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="real pending work",
+            source_refs=[],
+            operation_id="real-work-operation",
+        )
+        ProposalService(database).create(
+            "current-version",
+            "hash",
+            "telegram-user",
+            "telegram-chat",
+            [real_work],
+            staged_pending_changes=[*stale, *low, *high, real_work],
+        )
+
+        remaining, summary = _retire_obsolete_bootstrap_reviews(
+            database,
+            database.load_pending_operations(),
+            current_version_id="current-version",
+            actor="telegram-user",
+        )
+
+        assert summary == {
+            "stale_operations": 2,
+            "low_confidence_operations": 2,
+            "retired_operations": 4,
+        }
+        assert {
+            operation.change.operation_id for operation in remaining
+        } == {
+            "review:high-검토항목",
+            "review:high-신뢰도",
+            real_work.operation_id,
+        }
+        assert {
+            operation.change.operation_id
+            for operation in database.load_pending_operations()
+        } == {
+            "review:high-검토항목",
+            "review:high-신뢰도",
+            real_work.operation_id,
+        }
 
 
 class FakeOneDrive:

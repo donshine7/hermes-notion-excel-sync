@@ -309,6 +309,33 @@ def test_internal_source_key_is_replaced_with_human_evidence_title() -> None:
     assert entity_key not in rendered
 
 
+def test_party_page_uses_human_party_label_instead_of_case_number() -> None:
+    party_name = operation(
+        "op-party-name",
+        entity_key="party:amc",
+        database="당사자",
+        property_name="당사자명",
+        current=None,
+        proposed="AMC",
+        refs=[source_ref(row=107, cells="C107")],
+    )
+    party_type = operation(
+        "op-party-type",
+        entity_key="party:amc",
+        database="당사자",
+        property_name="구분",
+        current=None,
+        proposed="기타",
+        refs=[source_ref(row=107, cells="C107")],
+    )
+
+    rendered = render_review_card_page(proposal([party_name, party_type]))
+
+    assert "당사자: AMC" in rendered
+    assert "사건번호: party:amc" not in rendered
+    assert "party:amc" not in rendered
+
+
 def test_render_paginates_by_notion_page_instead_of_property_operation() -> None:
     operations = [
         operation(

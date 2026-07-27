@@ -1,5 +1,5 @@
 name: notion-excel-sync-attestor
-version: "0.6.7"
+version: "0.6.9"
 description: "Consume authenticated Telegram sync, correction, and schema commands with separate exact approval domains."
 author: "local"
 kind: standalone

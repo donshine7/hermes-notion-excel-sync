@@ -36,8 +36,13 @@ _TITLE_PROPERTIES = frozenset(
         "사건번호",
         "근거명",
         "그룹명",
-        "비용명",
+        "당사자명",
+        "항목명",
+        "증빙명",
         "업무명",
+        "기일명",
+        "후속관리명",
+        "연락제목",
         "검토명",
     }
 )
@@ -632,15 +637,19 @@ def _database_action_summary(cards: tuple[ReviewCard, ...]) -> str:
 
 
 def _subject_label(database: str) -> str:
-    if database == "근거자료":
-        return "자료"
-    if database == "그룹":
-        return "그룹"
-    if database == "비용·청구":
-        return "비용 항목"
-    if database in {"업무·절차", "검토함"}:
-        return "업무"
-    return "사건번호"
+    return {
+        "한국 특허 사건": "사건번호",
+        "근거자료": "자료",
+        "그룹": "그룹",
+        "당사자": "당사자",
+        "비용·청구": "비용 항목",
+        "정부지원사업 증빙": "증빙 항목",
+        "업무·절차": "업무",
+        "기일": "기일",
+        "등록결정 후속관리": "등록 후속",
+        "연락이력": "연락",
+        "검토함": "검토 항목",
+    }.get(database, "대상")
 
 
 def _human_source_summary(cards: tuple[ReviewCard, ...]) -> str:
@@ -697,7 +706,21 @@ def _humanize_source_title(value: str) -> str:
 
 def _is_internal_entity_key(value: str) -> bool:
     return value.casefold().startswith(
-        ("source:", "history:", "analysis:", "review:")
+        (
+            "source:",
+            "history:",
+            "analysis:",
+            "review:",
+            "party:",
+            "group:",
+            "workflow:",
+            "deadline:",
+            "cost:",
+            "evidence:",
+            "registration:",
+            "contact:",
+            "materials:",
+        )
     )
 
 
