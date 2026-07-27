@@ -64,6 +64,18 @@ Wiki 세대 준비뿐입니다. 원본 폴더와 Excel, Notion, 승인된 Wiki �
 않습니다. 완료되면 제안이 있을 때 `[NX_SYNC_PROPOSAL_READY]`, 없을 때
 `[NX_SYNC_NO_CHANGES]`를 보냅니다.
 
+AI가 켜진 실행은 제안 뒤에 다음 요약을 추가할 수 있습니다.
+
+```text
+[NX_AI_ANALYSIS] mode=shadow attempted=4 completed=4 failures=0
+```
+
+`shadow` 결과는 Notion 제안에 영향을 주지 않습니다. `assist`는 검토함 후보만 만들고,
+`verified`도 원본 인용·스키마·최소 신뢰도를 통과한 허용 필드만 기존 제안 후보를
+보강합니다. 모든 모드에서 최종 Notion 변경에는 동일한 `/nx_approve`가 필요합니다.
+`failures`가 발생해도 규칙 기반 분석은 계속되며 같은 실행에서 추가 모델 호출은
+중단됩니다.
+
 ## 3. 후속 `/nx_sync`
 
 후속 요청마다 다음 입력을 독립적으로 처리합니다.

@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 
 from notion_excel_sync.adapters.excel import ExcelSnapshotReader, diff_snapshots
 from notion_excel_sync.adapters.onedrive import DriveVersion, OneDriveReadOnlyClient
+from notion_excel_sync.ai.service import StructuredAIService
 from notion_excel_sync.domain import (
     ACTUAL_COST_CONTEXT_METADATA,
     EVIDENCE_CONTEXT_METADATA,
@@ -57,6 +58,9 @@ class PreparationResult:
     wiki_generation_digest: str | None = None
     wiki_shadow_hits: int = 0
     pending_staged: int = 0
+    ai_attempted: int = 0
+    ai_completed: int = 0
+    ai_failures: int = 0
 
 
 _NOTION_TITLE_TEXT_LIMIT = 2_000
@@ -422,6 +426,7 @@ class SyncPreparationService:
         data_source_ids: Mapping[str, str] | None = None,
         notion_schema_provider: Callable[[str], Mapping[str, Any]] | None = None,
         knowledge_provider: AnalyzerKnowledgeProvider | None = None,
+        ai_service: StructuredAIService | None = None,
         first_run_full_reconcile: bool = False,
         snapshot_observer: Callable[[WorkbookSnapshot, bool], None] | None = None,
     ) -> None:
@@ -435,6 +440,7 @@ class SyncPreparationService:
         self.data_source_ids = data_source_ids
         self.notion_schema_provider = notion_schema_provider
         self.knowledge_provider = knowledge_provider
+        self.ai_service = ai_service
         self.first_run_full_reconcile = first_run_full_reconcile
         self.snapshot_observer = snapshot_observer
 
@@ -691,9 +697,38 @@ class SyncPreparationService:
                 metadata=metadata,
                 knowledge_refs_by_analyzer=knowledge.verified_refs_by_analyzer,
             )
-        domain_changes = [change for run in runs for change in run.proposed_changes]
+        ai_report = (
+            self.ai_service.enrich_excel_runs(
+                runs,
+                verified_context_by_analyzer=(
+                    knowledge.verified_context_by_analyzer
+                ),
+                verified_refs_by_analyzer=(
+                    knowledge.verified_ai_refs_by_analyzer
+                ),
+            )
+            if runs and self.ai_service is not None
+            else None
+        )
+        domain_changes = [
+            change
+            for run in runs
+            for change in run.proposed_changes
+            if ai_report is None
+            or change.operation_id not in ai_report.replaced_operation_ids
+        ]
+        if ai_report is not None:
+            domain_changes.extend(ai_report.proposed_changes)
         reviews = [review for run in runs for review in run.review_items]
         reviews.extend(self._unrouted_reviews(runs))
+        if ai_report is not None:
+            reviews.extend(ai_report.review_items)
+            self.database.audit(
+                "structured_ai_analysis",
+                ai_report.audit_payload(),
+                None,
+                requested_by,
+            )
         bootstrap_reviews_suppressed = 0
         if full_reconcile:
             bootstrap_reviews_suppressed = sum(
@@ -810,6 +845,9 @@ class SyncPreparationService:
                     "generation_digest", ""
                 ),
                 "wiki_shadow_hits": sum(knowledge.shadow_counts.values()),
+                "structured_ai": (
+                    ai_report.audit_payload() if ai_report is not None else {}
+                ),
             },
             proposal.proposal_id,
             requested_by,
@@ -828,6 +866,9 @@ class SyncPreparationService:
             ),
             wiki_shadow_hits=sum(knowledge.shadow_counts.values()),
             pending_staged=len(staged_pending),
+            ai_attempted=ai_report.attempted if ai_report is not None else 0,
+            ai_completed=ai_report.completed if ai_report is not None else 0,
+            ai_failures=ai_report.failures if ai_report is not None else 0,
         )
 
     def _build_evidence_context(
@@ -1134,7 +1175,11 @@ class SyncPreparationService:
                         kind=ChangeKind.CREATE,
                         current_value=None,
                         proposed_value=value,
-                        analyzer="review_materializer",
+                        analyzer=(
+                            "llm_review_materializer"
+                            if review.review_type.startswith("AI ")
+                            else "review_materializer"
+                        ),
                         analyzer_version="1.0.0",
                         confidence=confidence,
                         reason="분석 결과의 불확실성을 사용자 승인 후 검토함에 기록합니다.",

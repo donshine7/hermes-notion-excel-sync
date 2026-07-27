@@ -19,6 +19,9 @@ from notion_excel_sync.adapters.local_workbook import LocalWorkbookReadOnlyClien
 from notion_excel_sync.adapters.notion import HttpNotionGateway, NotionMatch
 from notion_excel_sync.adapters.onedrive import OneDriveReadOnlyClient
 from notion_excel_sync.adapters.onedrive_auth import build_onedrive_token_provider
+from notion_excel_sync.ai.cache import AIAnalysisCache
+from notion_excel_sync.ai.provider import HermesStructuredAIProvider
+from notion_excel_sync.ai.service import StructuredAIService
 from notion_excel_sync.config import AppConfig, load_config
 from notion_excel_sync.domain import AnalysisPipeline, build_default_registry
 from notion_excel_sync.knowledge.corrections import (
@@ -524,6 +527,32 @@ def _configured_knowledge_provider(
     )
 
 
+def _configured_ai_service(
+    config: AppConfig,
+) -> StructuredAIService | None:
+    """Build a no-tools AI enrichment service; disabled means no model call."""
+
+    ai_config = getattr(config, "ai", None)
+    if ai_config is None or not ai_config.enabled:
+        return None
+    return StructuredAIService(
+        provider=HermesStructuredAIProvider(
+            task_name=ai_config.task_name,
+            model=ai_config.model,
+            timeout_seconds=ai_config.timeout_seconds,
+            privacy_mode=ai_config.privacy_mode,
+        ),
+        cache=AIAnalysisCache(ai_config.cache_db),
+        rollout_mode=ai_config.rollout_mode,
+        privacy_mode=ai_config.privacy_mode,
+        max_calls_per_sync=ai_config.max_calls_per_sync,
+        max_mail_calls_per_sync=ai_config.max_mail_calls_per_sync,
+        max_input_chars=ai_config.max_input_chars,
+        assist_confidence=ai_config.assist_confidence,
+        verified_confidence=ai_config.verified_confidence,
+    )
+
+
 def _ensure_local_wiki_baseline(
     config: AppConfig,
     database: StateDatabase,
@@ -651,6 +680,7 @@ def _refresh_hiworks_mail(
     database: StateDatabase,
     identity: TelegramEventIdentity,
     baseline: Mapping[str, Any] | None,
+    ai_service: StructuredAIService | None = None,
 ) -> None:
     """Publish only provably post-T0 Hiworks mail before Excel analysis starts."""
 
@@ -662,13 +692,17 @@ def _refresh_hiworks_mail(
             wiki=config.wiki,
             checkpoints=database,
             secret_resolver=lambda name: config.secret(name),
+            ai_service=ai_service,
         ).ingest(actor=identity.user_id)
         if result.status is HiworksMailIngestionStatus.COMPLETED:
             logger.info(
-                "Hiworks Wiki generation ready: generation=%s messages=%s remaining=%s",
+                "Hiworks Wiki generation ready: generation=%s messages=%s remaining=%s "
+                "ai_analyzed=%s ai_failures=%s",
                 result.generation,
                 result.new_count,
                 result.remaining,
+                result.ai_analyzed_count,
+                result.ai_failure_count,
             )
     except Exception as exc:
         raise HermesGatewayApprovalError(
@@ -795,8 +829,18 @@ def _prepare_authenticated_sync(
     identity: TelegramEventIdentity,
 ) -> PreparationResult:
     wiki_baseline = _ensure_local_wiki_baseline(config, database, identity)
+    ai_service = _configured_ai_service(config)
     _refresh_local_wiki_data(config, database, identity, wiki_baseline)
-    _refresh_hiworks_mail(config, database, identity, wiki_baseline)
+    if ai_service is None:
+        _refresh_hiworks_mail(config, database, identity, wiki_baseline)
+    else:
+        _refresh_hiworks_mail(
+            config,
+            database,
+            identity,
+            wiki_baseline,
+            ai_service,
+        )
     try:
         source = _source_client(config, database)
         item = source.get_item(config.onedrive.drive_id, config.onedrive.item_id)
@@ -849,6 +893,7 @@ def _prepare_authenticated_sync(
         data_source_ids=data_sources,
         notion_schema_provider=read_gateway.get_data_source,
         knowledge_provider=_configured_knowledge_provider(config),
+        ai_service=ai_service,
         first_run_full_reconcile=config.source.mode == "local_filesystem",
         snapshot_observer=_local_snapshot_observer(
             config,
@@ -929,6 +974,9 @@ def _handle_sync_command(
             "changed_rows": result.changes_detected,
             "pending_reintroduced": result.pending_reintroduced,
             "checkpoint_advanced": result.checkpoint_advanced,
+            "ai_attempted": result.ai_attempted,
+            "ai_completed": result.ai_completed,
+            "ai_failures": result.ai_failures,
             "notion_mutated": False,
         }
         return "[NX_SYNC_NO_CHANGES] " + json.dumps(
@@ -945,6 +993,14 @@ def _handle_sync_command(
         digest=result.proposal.digest,
     )
     screen = _proposal_screen(result.proposal, prefix="NX_SYNC_PROPOSAL_READY")
+    if result.ai_attempted or result.ai_failures:
+        screen += (
+            "\n[NX_AI_ANALYSIS] "
+            f"mode={config.ai.rollout_mode} "
+            f"attempted={result.ai_attempted} "
+            f"completed={result.ai_completed} "
+            f"failures={result.ai_failures}"
+        )
     if result.pending_staged:
         screen += (
             "\n[NX_SYNC_BATCH] "

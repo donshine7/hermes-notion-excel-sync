@@ -44,6 +44,10 @@ flowchart TD
     D --> M["T0 이후 Hiworks 메일 수집"]
     W0 --> A["분석기 실행"]
     M --> A
+    A --> S["AI 대상 선별<br/>모호한 변경만"]
+    S --> J["구조화 AI 분석<br/>JSON + 원본 인용"]
+    J --> V0["스키마·근거·신뢰도 검증"]
+    V0 --> P
     A --> P["변경제안과 Telegram 검토 카드"]
     P --> U{"사용자 결정"}
     U -->|"수정·제외·보류"| R["새 개정·digest 생성"]
@@ -73,6 +77,13 @@ flowchart TD
   증빙할지 분석합니다. 실제 비용을 읽기 전용 제약으로 참조하지만 덮어쓰지 않습니다.
 
 분석기는 Notion writer를 직접 호출할 수 없습니다.
+
+규칙 기반 분석 뒤에는 선택적인 구조화 AI 계층이 있습니다. AI는 모든 행을 읽지 않고
+복합 당사자, 의미가 모호한 변경, 정부지원사업 증빙 검토, 사건 히스토리 요약처럼 규칙만
+으로 확정하기 어려운 변경만 분석합니다. 출력은 JSON Schema, 입력 해시, 원본에 실제
+존재하는 인용문과 신뢰도를 모두 통과해야 합니다. 모델 실패 시 기존 규칙 분석은 계속되고,
+AI에는 Notion 쓰기 도구나 승인 비밀을 제공하지 않습니다. 자세한 내용은
+[구조화 AI 운영 계약](docs/structured-ai.md)을 참고하십시오.
 
 ## LLM Wiki
 
@@ -144,6 +155,7 @@ Copy-Item .\config\sync.example.json .\config\sync.local.json
 - `notion.schema_parent_page_id`: 별도 스키마 생성에만 쓰는 허용 상위 페이지 ID
 - `approval.allowed_telegram_users`: 승인 가능한 숫자 사용자 ID
 - `email`: Hiworks POP3 읽기 설정과 비밀키 이름
+- `ai`: 구조화 AI의 shadow/assist/verified 단계, 개인정보 경계와 호출 한도
 
 실제 경로와 식별자는 예제나 Git 추적 파일에 넣지 마십시오.
 
@@ -187,6 +199,7 @@ Notion 아래에 별도 스키마 생성이 필요한 경우에도 데이터 승
 - [운영 가이드](docs/operations.md)
 - [Telegram 명령](docs/telegram-commands.md)
 - [LLM Wiki 운영 계약](docs/llm-wiki.md)
+- [구조화 AI 운영 계약](docs/structured-ai.md)
 
 ## 개발 검증
 

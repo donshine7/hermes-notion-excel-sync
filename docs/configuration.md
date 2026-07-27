@@ -93,6 +93,48 @@ lock, 캐시 또는 임시 파일을 생성하지 않습니다.
 UIDL과 Message-ID를 사용해 중복을 막습니다. `T0`보다 이전 메일은 헤더 확인 후 제외하며,
 첨부는 메타데이터와 해시만 기본 저장하고 원문 payload를 Wiki에 복제하지 않습니다.
 
+## 구조화 AI 설정
+
+AI는 기본적으로 꺼져 있으며, 켜더라도 초기 운영은 `shadow`를 사용합니다.
+
+| 키 | 의미 |
+|---|---|
+| `ai.enabled` | 구조화 AI 분석 사용 여부 |
+| `ai.provider` | 현재 `hermes`만 허용 |
+| `ai.task_name` | Hermes auxiliary 모델 작업 이름 |
+| `ai.model` | 선택적인 모델 고정값 |
+| `ai.rollout_mode` | `shadow`, `assist`, `verified` |
+| `ai.privacy_mode` | `local_only` 또는 명시적 `redacted_remote` |
+| `ai.cache_db` | `%LOCALAPPDATA%\notion-excel-sync\ai` 아래 결과 캐시 |
+| `ai.max_calls_per_sync` | 한 동기화의 최대 모델 호출 |
+| `ai.max_mail_calls_per_sync` | 전체 호출 중 새 메일에 사용할 최대 호출 |
+| `ai.max_input_chars` | 한 호출의 최대 입력 문자 |
+| `ai.assist_confidence` | 사람 검토 후보를 만들 최소 신뢰도 |
+| `ai.verified_confidence` | 검증 모드에서 값 후보로 사용할 최소 신뢰도 |
+
+```json
+{
+  "ai": {
+    "enabled": true,
+    "provider": "hermes",
+    "task_name": "web_extract",
+    "rollout_mode": "shadow",
+    "privacy_mode": "local_only",
+    "max_calls_per_sync": 8,
+    "max_mail_calls_per_sync": 4,
+    "max_input_chars": 12000,
+    "assist_confidence": 0.8,
+    "verified_confidence": 0.95
+  }
+}
+```
+
+`local_only`는 Hermes가 loopback endpoint를 사용하지 않으면 AI를 건너뜁니다. 외부
+provider 사용에는 `redacted_remote`를 명시해야 합니다. 이는 원문 전체 전송 허가가
+아니며, 프로그램은 이메일·전화·계정번호 패턴을 제거하고 변경 행과 검증된 Wiki 발췌만
+제한적으로 전달합니다. 모델에는 Notion 쓰기 토큰, Telegram 승인 비밀, Hiworks
+비밀번호 또는 실행 도구가 전달되지 않습니다.
+
 ## Notion 설정
 
 `notion.databases`에는 페이지 링크가 아니라 검증된 database/data source ID를 넣습니다.

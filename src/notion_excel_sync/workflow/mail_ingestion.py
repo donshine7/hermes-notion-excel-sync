@@ -18,6 +18,11 @@ from notion_excel_sync.adapters.hiworks_mail import (
 from notion_excel_sync.config import EmailConfig, WikiConfig
 from notion_excel_sync.knowledge.projection import WikiOutputStore, WikiProjection
 
+from notion_excel_sync.ai.service import (
+    StructuredAIService,
+    compact_analysis_payload,
+)
+
 
 WIKI_BOOTSTRAP_CHECKPOINT_KEY = "wiki-bootstrap"
 HIWORKS_MAIL_CHECKPOINT_KEY = "email-hiworks"
@@ -47,6 +52,8 @@ class HiworksMailIngestionResult:
     new_count: int
     generation: str | None
     remaining: int
+    ai_analyzed_count: int = 0
+    ai_failure_count: int = 0
 
 
 class IngestionCheckpointStore(Protocol):
@@ -167,6 +174,7 @@ class HiworksMailIngestionService:
         reader_factory: ReaderFactory = HiworksIncrementalMailReader,
         output_store_factory: OutputStoreFactory = WikiOutputStore,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        ai_service: StructuredAIService | None = None,
         bootstrap_checkpoint_key: str = WIKI_BOOTSTRAP_CHECKPOINT_KEY,
         mail_checkpoint_key: str = HIWORKS_MAIL_CHECKPOINT_KEY,
     ) -> None:
@@ -180,6 +188,7 @@ class HiworksMailIngestionService:
         self.reader_factory = reader_factory
         self.output_store_factory = output_store_factory
         self.clock = clock
+        self.ai_service = ai_service
         self.bootstrap_checkpoint_key = bootstrap_checkpoint_key
         self.mail_checkpoint_key = mail_checkpoint_key
 
@@ -290,11 +299,36 @@ class HiworksMailIngestionService:
             self.wiki.output_root,
             source_root=self.wiki.source_root,
         )
-        projection = output.publish_mail_messages(
-            publishable,
-            baseline_at=baseline.isoformat(),
-            collected_at=collected_at,
-        )
+        ai_analyses: dict[str, Mapping[str, object]] = {}
+        ai_completed = 0
+        ai_failures = 0
+        if self.ai_service is not None:
+            for message in publishable:
+                failures_before = self.ai_service.failure_count
+                analysis = self.ai_service.analyze_mail_message(message)
+                ai_failures += (
+                    self.ai_service.failure_count - failures_before
+                )
+                if analysis is None:
+                    continue
+                ai_completed += 1
+                if self.ai_service.rollout_mode != "shadow":
+                    ai_analyses[message.header.uidl] = compact_analysis_payload(
+                        analysis
+                    )
+        if ai_analyses:
+            projection = output.publish_mail_messages(
+                publishable,
+                baseline_at=baseline.isoformat(),
+                collected_at=collected_at,
+                ai_analyses=ai_analyses,
+            )
+        else:
+            projection = output.publish_mail_messages(
+                publishable,
+                baseline_at=baseline.isoformat(),
+                collected_at=collected_at,
+            )
 
         checkpoint = {
             "schema_version": 1,
@@ -304,6 +338,8 @@ class HiworksMailIngestionService:
             "generation": projection.generation,
             "published_count": len(publishable),
             "remaining_new_count": batch.remaining_new_count,
+            "ai_analyzed_count": ai_completed,
+            "ai_failure_count": ai_failures,
             "updated_at": collected_at.isoformat(),
         }
         self.checkpoints.save_ingestion_checkpoint(
@@ -316,6 +352,8 @@ class HiworksMailIngestionService:
             new_count=len(publishable),
             generation=projection.generation,
             remaining=batch.remaining_new_count,
+            ai_analyzed_count=ai_completed,
+            ai_failure_count=ai_failures,
         )
 
 

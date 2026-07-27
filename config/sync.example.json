@@ -137,6 +137,21 @@
     "max_body_bytes": 2097152,
     "max_attachment_bytes": 20971520
   },
+  "ai": {
+    "enabled": false,
+    "provider": "hermes",
+    "task_name": "web_extract",
+    "model": null,
+    "rollout_mode": "shadow",
+    "privacy_mode": "local_only",
+    "cache_db": "%LOCALAPPDATA%\\notion-excel-sync\\ai\\analysis.db",
+    "timeout_seconds": 45,
+    "max_calls_per_sync": 8,
+    "max_mail_calls_per_sync": 4,
+    "max_input_chars": 12000,
+    "assist_confidence": 0.8,
+    "verified_confidence": 0.95
+  },
   "notion": {
     "read_token_env": "NOTION_READ_TOKEN",
     "write_token_env": "GATEWAY_RELAY_NX_NOTION_TOKEN",

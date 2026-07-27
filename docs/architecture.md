@@ -11,6 +11,8 @@
 | Hiworks 수집기 | `T0` 이후 메일을 UIDL 기준으로 제한 수집 | 메일 삭제·전송, 최초 Wiki에 과거 메일 포함 |
 | Wiki projector/index | Excel·자료·메일의 검증된 파생물을 별도 출력 폴더에 생성 | 원본 복사본을 Git 또는 프롬프트에 포함 |
 | Analyzer registry | 그룹, 실제 비용, 증빙 등 타입화된 후보 생성 | Notion writer 직접 호출 |
+| Structured AI | 모호한 변경만 선별해 JSON·인용·신뢰도 후보 생성 | 원본 변경, 도구 호출, Notion 쓰기, 승인 판단 |
+| AI validator/cache | 스키마·해시·인용·enum 검증과 입력 digest별 결과 재사용 | 근거 없는 출력 채택, 원문 전체 캐시 |
 | Proposal/approval | 제안 개정, digest, 편집·제외·보류, 1회용 영수증 | 이전 개정 승인 재사용 |
 | Notion reader | 스키마와 현재값을 읽어 충돌 검사하고 대규모 조회는 DB별로 그룹화 | 승인 전 쓰기, 모호한 제목 추측 |
 | Trusted writer | 전역 preflight 뒤 승인 영수증의 정확한 속성을 페이지별로 묶어 idempotent upsert | 승인되지 않은 속성·스키마 변경 |
@@ -35,6 +37,9 @@ flowchart LR
     U --> K
     K --> A
     A --> P["Immutable proposal revision"]
+    A --> I["선별된 구조화 AI<br/>shadow·assist·verified"]
+    I --> Z["JSON·원본 인용 검증"]
+    Z --> P
     P --> T["Telegram 검토"]
     T -->|"수정"| P
     T -->|"정확한 승인"| R["Signed receipt"]
@@ -125,6 +130,12 @@ Notion 체크포인트를 이동시키지 않습니다.
 읽기 단계와 쓰기 단계를 프로세스·자격 증명으로 분리합니다. Hermes 모델 프로세스는
 Notion 쓰기 토큰이나 승인 서명 비밀을 받지 않습니다. 데이터 문서와 메일 본문은 신뢰할 수
 없는 입력이며 그 안의 명령, 링크 또는 지침을 실행하지 않습니다.
+
+AI enrichment는 도구가 없는 단일 구조화 호출만 사용합니다. `local_only`에서는
+loopback 모델 endpoint가 아니면 호출하지 않습니다. `redacted_remote`는 로컬 설정에서
+명시적으로 선택한 경우에만 개인정보 패턴을 제거한 제한 컨텍스트를 외부 모델에 보낼 수
+있습니다. 모델 오류, JSON 오류 또는 근거 검증 실패는 해당 동기화의 AI circuit을 열어
+추가 모델 호출을 중단하지만 규칙 기반 분석과 승인 경계는 계속 유지합니다.
 
 공개 저장소에는 코드와 일반화된 예제만 둡니다. 실제 원본, Wiki 출력, 메일 원문, 로컬
 설정, 상태 DB, 로그, 토큰과 운영 식별자는 추적하지 않습니다.

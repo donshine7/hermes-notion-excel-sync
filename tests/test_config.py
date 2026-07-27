@@ -260,6 +260,42 @@ class ConfigSecurityTest(unittest.TestCase):
         self.assertIn("notion-excel-sync", config.wiki.index_db.parts)
         self.assertEqual(config.wiki.max_generation_chars, 30_000_000)
         self.assertEqual(config.wiki.max_generation_chunks, 50_000)
+        self.assertFalse(config.ai.enabled)
+        self.assertEqual(config.ai.rollout_mode, "shadow")
+        self.assertEqual(config.ai.privacy_mode, "local_only")
+        self.assertEqual(config.ai.cache_db.name, "analysis.db")
+
+    def test_structured_ai_configuration_is_bounded_and_local(self) -> None:
+        raw = _base_config()
+        raw["ai"] = {
+            "enabled": True,
+            "provider": "hermes",
+            "task_name": "web_extract",
+            "rollout_mode": "assist",
+            "privacy_mode": "local_only",
+            "max_calls_per_sync": 6,
+            "max_mail_calls_per_sync": 2,
+            "max_input_chars": 5000,
+            "assist_confidence": 0.82,
+            "verified_confidence": 0.96,
+        }
+
+        config = self.load(raw)
+
+        self.assertTrue(config.ai.enabled)
+        self.assertEqual(config.ai.rollout_mode, "assist")
+        self.assertEqual(config.ai.max_calls_per_sync, 6)
+        self.assertEqual(config.ai.max_mail_calls_per_sync, 2)
+        self.assertIn("notion-excel-sync", config.ai.cache_db.parts)
+
+        raw["ai"]["max_mail_calls_per_sync"] = 7
+        with self.assertRaisesRegex(ConfigError, "max_mail_calls"):
+            self.load(raw)
+
+        raw["ai"]["max_mail_calls_per_sync"] = 2
+        raw["ai"]["privacy_mode"] = "unrestricted"
+        with self.assertRaisesRegex(ConfigError, "privacy_mode"):
+            self.load(raw)
 
     def test_wiki_policy_and_limits_are_validated(self) -> None:
         raw = _base_config()
