@@ -135,6 +135,18 @@ provider 사용에는 `redacted_remote`를 명시해야 합니다. 이는 원문
 제한적으로 전달합니다. 모델에는 Notion 쓰기 토큰, Telegram 승인 비밀, Hiworks
 비밀번호 또는 실행 도구가 전달되지 않습니다.
 
+외부 제공자를 `shadow`로 처음 활성화할 때는 전용 설정 도구가 명시적 동의 플래그,
+원자적 설정 교체와 로컬 AI 캐시 ACL 강화를 함께 수행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\configure-structured-ai.py `
+  --project-root $PWD `
+  --config .\config\sync.local.json `
+  --privacy-mode redacted_remote `
+  --rollout-mode shadow `
+  --external-provider-consent
+```
+
 ## Notion 설정
 
 `notion.databases`에는 페이지 링크가 아니라 검증된 database/data source ID를 넣습니다.
