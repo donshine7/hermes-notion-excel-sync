@@ -2891,6 +2891,78 @@ class StateDatabase:
             ).fetchall()
         return [_operation_from_dict(json.loads(row["payload"])) for row in rows]
 
+    def retire_pending_operations(
+        self,
+        operation_ids: Iterable[str],
+        *,
+        expected_analyzer: str,
+        expected_database: str,
+        actor: str,
+        reason: str,
+    ) -> int:
+        """Resolve an obsolete, exactly classified pending-operation set.
+
+        The caller cannot use this migration helper to discard arbitrary
+        proposal work. Every unresolved row must still decode to the expected
+        analyzer and target database before any row is updated.
+        """
+
+        identifiers = sorted({str(item) for item in operation_ids if str(item)})
+        if not identifiers:
+            return 0
+        now = datetime.now().astimezone().isoformat()
+        with self.transaction() as connection:
+            verified: list[str] = []
+            for start in range(0, len(identifiers), 400):
+                batch = identifiers[start : start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT operation_id, payload FROM pending_change "
+                    f"WHERE resolved_at IS NULL AND operation_id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    operation = _operation_from_dict(json.loads(row["payload"]))
+                    change = operation.change
+                    if (
+                        change.analyzer != expected_analyzer
+                        or change.target_database != expected_database
+                    ):
+                        raise RuntimeError(
+                            "Pending-operation retirement classification mismatch"
+                        )
+                    verified.append(str(row["operation_id"]))
+            if len(verified) != len(identifiers):
+                raise RuntimeError(
+                    "Pending-operation retirement set changed before migration"
+                )
+            connection.executemany(
+                "UPDATE pending_change SET resolved_at = ? "
+                "WHERE operation_id = ? AND resolved_at IS NULL",
+                ((now, operation_id) for operation_id in verified),
+            )
+            connection.execute(
+                "INSERT INTO audit_log("
+                "event_type, proposal_id, actor, details, created_at"
+                ") VALUES (?, NULL, ?, ?, ?)",
+                (
+                    "pending_operations_retired",
+                    actor,
+                    json.dumps(
+                        {
+                            "count": len(verified),
+                            "expected_analyzer": expected_analyzer,
+                            "expected_database": expected_database,
+                            "reason": reason,
+                            "operation_set_digest": sha256_json(verified),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return len(verified)
+
     def pending_outbox(self, proposal_id: str) -> list[sqlite3.Row]:
         with self.session() as connection:
             return list(

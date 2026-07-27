@@ -56,6 +56,89 @@ def test_proposal_batch_keeps_pages_atomic_and_stages_a_bounded_suffix() -> None
     assert selected_entities.isdisjoint(staged_entities)
 
 
+def test_change_sort_uses_human_numeric_order_for_entity_keys() -> None:
+    changes = [
+        ProposedChange(
+            target_database="한국 특허 사건",
+            entity_key=entity_key,
+            property_name="현재상태",
+            kind=ChangeKind.UPDATE,
+            current_value=None,
+            proposed_value="진행",
+            analyzer="synthetic",
+            analyzer_version="1",
+            confidence=1.0,
+            reason="synthetic ordering fixture",
+            source_refs=[],
+        )
+        for entity_key in ("CASE-100", "CASE-10", "CASE-2")
+    ]
+
+    ordered = SyncPreparationService._sort_changes(changes)
+
+    assert [item.entity_key for item in ordered] == [
+        "CASE-2",
+        "CASE-10",
+        "CASE-100",
+    ]
+
+
+def test_legacy_row_provenance_backlog_is_retired_without_touching_real_work() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        database = StateDatabase(Path(folder) / "state.db")
+        database.initialize()
+        legacy = ProposedChange(
+            target_database="근거자료",
+            entity_key="source:version:2026:10",
+            property_name="근거명",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value="Excel 2026 10행",
+            analyzer="provenance_tracker",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="legacy row provenance",
+            source_refs=[],
+            operation_id="legacy-provenance-operation",
+        )
+        real_work = ProposedChange(
+            target_database="한국 특허 사건",
+            entity_key="SS-SYNTHETIC-001",
+            property_name="현재상태",
+            kind=ChangeKind.UPDATE,
+            current_value="접수",
+            proposed_value="진행",
+            analyzer="workflow_status",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="real pending work",
+            source_refs=[],
+            operation_id="real-work-operation",
+        )
+        ProposalService(database).create(
+            "version",
+            "hash",
+            "telegram-user",
+            "telegram-chat",
+            [real_work],
+            staged_pending_changes=[legacy, real_work],
+        )
+
+        retired = database.retire_pending_operations(
+            [legacy.operation_id],
+            expected_analyzer="provenance_tracker",
+            expected_database="근거자료",
+            actor="telegram-user",
+            reason="synthetic migration",
+        )
+
+        assert retired == 1
+        remaining = database.load_pending_operations()
+        assert [item.change.operation_id for item in remaining] == [
+            real_work.operation_id
+        ]
+
+
 class FakeOneDrive:
     def __init__(self, content: bytes) -> None:
         self.content = content
@@ -739,6 +822,19 @@ class SyncPreparationTest(unittest.TestCase):
             self.assertFalse(
                 any(
                     operation.change.target_database == "변경이력"
+                    for operation in result.proposal.operations
+                )
+            )
+            self.assertFalse(
+                any(
+                    operation.change.analyzer == "provenance_tracker"
+                    or operation.change.target_database == "근거자료"
+                    for operation in result.proposal.operations
+                )
+            )
+            self.assertTrue(
+                all(
+                    operation.change.source_refs
                     for operation in result.proposal.operations
                 )
             )

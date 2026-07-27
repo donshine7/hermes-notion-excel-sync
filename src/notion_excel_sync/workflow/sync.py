@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -62,6 +63,8 @@ _REVIEW_TITLE_DIGEST_LENGTH = 16
 _REVIEW_LOCATOR_LIMIT = 96
 _PROPOSAL_BATCH_MAX_ENTITIES = 25
 _PROPOSAL_BATCH_MAX_OPERATIONS = 500
+_LEGACY_ROW_PROVENANCE_ANALYZER = "provenance_tracker"
+_LEGACY_ROW_PROVENANCE_DATABASE = "근거자료"
 
 
 def _source_ref_identity(ref: SourceRef) -> dict[str, object]:
@@ -355,6 +358,36 @@ class SyncPreparationService:
             drive_id, item_id, initial_cutoff
         )
         pending_operations = self.database.load_pending_operations()
+        legacy_provenance = [
+            operation
+            for operation in pending_operations
+            if (
+                operation.change.analyzer == _LEGACY_ROW_PROVENANCE_ANALYZER
+                and operation.change.target_database
+                == _LEGACY_ROW_PROVENANCE_DATABASE
+            )
+        ]
+        if legacy_provenance:
+            retired_ids = {
+                operation.change.operation_id
+                for operation in legacy_provenance
+            }
+            self.database.retire_pending_operations(
+                retired_ids,
+                expected_analyzer=_LEGACY_ROW_PROVENANCE_ANALYZER,
+                expected_database=_LEGACY_ROW_PROVENANCE_DATABASE,
+                actor=requested_by,
+                reason=(
+                    "Excel row provenance remains in immutable SourceRef, "
+                    "local audit state, and Wiki; it is no longer materialized "
+                    "as one Notion page per row"
+                ),
+            )
+            pending_operations = [
+                operation
+                for operation in pending_operations
+                if operation.change.operation_id not in retired_ids
+            ]
         wiki_pending_count = sum(
             bool(operation.change.knowledge_refs) for operation in pending_operations
         )
@@ -496,7 +529,6 @@ class SyncPreparationService:
         reviews = [review for run in runs for review in run.review_items]
         reviews.extend(self._unrouted_reviews(runs))
         all_changes = self._deduplicate(domain_changes)
-        all_changes.extend(self._provenance_changes(current, row_changes, source_web_url))
         all_changes.extend(self._review_changes(reviews, current.version_id))
         all_changes = self._deduplicate(all_changes)
         pending_regular = [
@@ -919,52 +951,6 @@ class SyncPreparationService:
         return result
 
     @staticmethod
-    def _provenance_changes(
-        snapshot: WorkbookSnapshot,
-        row_changes: list,
-        source_web_url: str | None,
-    ) -> list[ProposedChange]:
-        result: list[ProposedChange] = []
-        for change in row_changes:
-            record = change.after or change.before
-            if record is None or not record.source_refs:
-                continue
-            refs = record.source_refs
-            source = refs[0]
-            entity_key = f"source:{source.version_id}:{record.sheet}:{record.row}"
-            title = f"Excel {record.sheet} {record.row}행"
-            fields: list[tuple[str, object]] = [
-                ("근거명", title),
-                ("driveItem ID", source.item_id),
-                ("버전ID", source.version_id),
-                ("SHA256", source.file_hash),
-                ("원본유형", "엑셀"),
-                ("수집일시", snapshot.captured_at.isoformat()),
-                ("파싱상태", "완료"),
-                ("보안등급", "내부"),
-                ("요약", f"{record.sheet} 시트 {record.row}행 변경분"),
-            ]
-            if source_web_url:
-                fields.append(("OneDrive URL", source_web_url))
-            for property_name, value in fields:
-                result.append(
-                    ProposedChange(
-                        target_database="근거자료",
-                        entity_key=entity_key,
-                        property_name=property_name,
-                        kind=ChangeKind.CREATE,
-                        current_value=None,
-                        proposed_value=value,
-                        analyzer="provenance_tracker",
-                        analyzer_version="1.0.0",
-                        confidence=1.0,
-                        reason="변경 제안의 로컬·Excel 원본 위치를 보존합니다.",
-                        source_refs=refs,
-                    )
-                )
-        return result
-
-    @staticmethod
     def _history_changes(changes: list[ProposedChange]) -> list[ProposedChange]:
         result: list[ProposedChange] = []
         for change in changes:
@@ -1065,7 +1051,7 @@ class SyncPreparationService:
                 == NOTION_DEFINITIONS[item.target_database].title_property
                 else 1,
                 item.target_database,
-                item.entity_key,
+                _natural_sort_key(item.entity_key),
                 item.property_name,
             ),
         )
@@ -1077,6 +1063,14 @@ def _display_value(value: object) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
+
+
+def _natural_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"([0-9]+)", str(value))
+        if part
+    )
 
 
 def _history_area(database: str) -> str:
