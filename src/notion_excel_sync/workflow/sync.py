@@ -21,6 +21,7 @@ from notion_excel_sync.domain import (
 from notion_excel_sync.models import (
     ChangeKind,
     KnowledgeRef,
+    ProposalAction,
     ProposalOperation,
     ProposalRevision,
     ProposedChange,
@@ -70,6 +71,52 @@ _REVIEW_MATERIALIZER_ANALYZER = "review_materializer"
 _REVIEW_DATABASE = "검토함"
 _REVIEW_CONFIDENCE_PROPERTY = "신뢰도"
 _BOOTSTRAP_REVIEW_MIN_CONFIDENCE = 0.8
+_OBSOLETE_PARTY_ANALYZER_VERSION = "1.0.0"
+
+
+def _retire_obsolete_party_pending(
+    database: StateDatabase,
+    pending_operations: list[ProposalOperation],
+    *,
+    actor: str,
+) -> tuple[list[ProposalOperation], int]:
+    """Retire only unreviewed bootstrap party output from the unsafe v1 parser."""
+
+    obsolete = [
+        operation
+        for operation in pending_operations
+        if (
+            operation.change.analyzer == "party"
+            and operation.change.analyzer_version
+            == _OBSOLETE_PARTY_ANALYZER_VERSION
+            and operation.change.target_database == "당사자"
+            and operation.action is ProposalAction.DEFER
+            and not operation.user_override
+        )
+    ]
+    if not obsolete:
+        return pending_operations, 0
+    operation_ids = {operation.change.operation_id for operation in obsolete}
+    retired = database.retire_pending_operations(
+        operation_ids,
+        expected_analyzer="party",
+        expected_database="당사자",
+        actor=actor,
+        reason=(
+            "Party analyzer v1.1 rematerializes the current Excel snapshot "
+            "without splitting legal-name commas or auto-registering composite names"
+        ),
+    )
+    if retired != len(operation_ids):
+        raise RuntimeError("Obsolete party pending retirement count mismatch")
+    return (
+        [
+            operation
+            for operation in pending_operations
+            if operation.change.operation_id not in operation_ids
+        ],
+        retired,
+    )
 
 
 def _review_group_confidence(
@@ -456,6 +503,7 @@ class SyncPreparationService:
             "low_confidence_operations": 0,
             "retired_operations": 0,
         }
+        obsolete_party_operations_retired = 0
         pending_operations = self.database.load_pending_operations()
         legacy_provenance = [
             operation
@@ -495,6 +543,14 @@ class SyncPreparationService:
                 self.database,
                 pending_operations,
                 current_version_id=current_version.id,
+                actor=requested_by,
+            )
+            (
+                pending_operations,
+                obsolete_party_operations_retired,
+            ) = _retire_obsolete_party_pending(
+                self.database,
+                pending_operations,
                 actor=requested_by,
             )
         wiki_pending_count = sum(
@@ -747,6 +803,9 @@ class SyncPreparationService:
                 "staged_pending_operations": len(staged_pending),
                 "bootstrap_reviews_suppressed": bootstrap_reviews_suppressed,
                 "bootstrap_review_retirement": bootstrap_review_retirement,
+                "obsolete_party_operations_retired": (
+                    obsolete_party_operations_retired
+                ),
                 "wiki_generation_digest": knowledge.binding.get(
                     "generation_digest", ""
                 ),

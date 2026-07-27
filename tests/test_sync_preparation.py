@@ -25,6 +25,7 @@ from notion_excel_sync.workflow.proposals import ProposalService
 from notion_excel_sync.workflow.sync import (
     SyncPreparationService,
     _retire_obsolete_bootstrap_reviews,
+    _retire_obsolete_party_pending,
 )
 
 
@@ -140,6 +141,79 @@ def test_legacy_row_provenance_backlog_is_retired_without_touching_real_work() -
         assert [item.change.operation_id for item in remaining] == [
             real_work.operation_id
         ]
+
+
+def test_obsolete_party_backlog_is_retired_without_losing_user_override() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        database = StateDatabase(Path(folder) / "state.db")
+        database.initialize()
+
+        def party_change(operation_id: str, version: str) -> ProposedChange:
+            return ProposedChange(
+                target_database="당사자",
+                entity_key=f"party:{operation_id}",
+                property_name="당사자명",
+                kind=ChangeKind.CREATE,
+                current_value=None,
+                proposed_value=operation_id,
+                analyzer="party",
+                analyzer_version=version,
+                confidence=1.0,
+                reason="synthetic party backlog",
+                source_refs=[],
+                operation_id=operation_id,
+            )
+
+        obsolete = party_change("obsolete-party", "1.0.0")
+        current = party_change("current-party", "1.1.0")
+        proposal = ProposalService(database).create(
+            "version",
+            "hash",
+            "telegram-user",
+            "telegram-chat",
+            [current],
+            staged_pending_changes=[obsolete, current],
+        )
+        operations = database.load_pending_operations()
+        overridden = next(
+            item
+            for item in operations
+            if item.change.operation_id == obsolete.operation_id
+        )
+        overridden.user_override = True
+
+        remaining_with_override, retired_with_override = (
+            _retire_obsolete_party_pending(
+                database,
+                [overridden, *[
+                    item
+                    for item in operations
+                    if item.change.operation_id != obsolete.operation_id
+                ]],
+                actor="telegram-user",
+            )
+        )
+        assert retired_with_override == 0
+        assert len(remaining_with_override) == 2
+
+        overridden.user_override = False
+        remaining, retired = _retire_obsolete_party_pending(
+            database,
+            [overridden, *[
+                item
+                for item in operations
+                if item.change.operation_id != obsolete.operation_id
+            ]],
+            actor=proposal.requested_by,
+        )
+
+        assert retired == 1
+        assert [item.change.operation_id for item in remaining] == [
+            current.operation_id
+        ]
+        assert [
+            item.change.operation_id for item in database.load_pending_operations()
+        ] == [current.operation_id]
 
 
 def test_bootstrap_review_cleanup_keeps_current_high_confidence_and_real_work() -> None:

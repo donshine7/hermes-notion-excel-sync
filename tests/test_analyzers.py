@@ -81,6 +81,89 @@ def test_pipeline_routes_domain_analyzers_and_keeps_actual_and_evidence_cost_sep
     assert evidence[0].proposed_value == 900_000
 
 
+def test_party_analyzer_preserves_english_legal_name_commas_and_classifies_company():
+    record = SourceRecord(
+        key="foreign-company",
+        sheet="2026",
+        row=258,
+        values={
+            "당소 사건번호": "SS-2026-258",
+            "의뢰인": "NPTI GLOBAL CO., LTD.",
+        },
+        source_refs=[source_ref()],
+    )
+    run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.CREATE, record.key, None, record)
+    )
+    party_changes = [
+        change
+        for change in run.proposed_changes
+        if change.target_database == "당사자"
+    ]
+    by_entity: dict[str, dict[str, object]] = {}
+    for change in party_changes:
+        by_entity.setdefault(change.entity_key, {})[change.property_name] = (
+            change.proposed_value
+        )
+
+    assert by_entity == {
+        "party:npti global co., ltd.": {
+            "당사자명": "NPTI GLOBAL CO., LTD.",
+            "구분": "법인",
+        }
+    }
+
+
+def test_party_analyzer_blocks_composite_or_temporary_names_from_notion():
+    for row, name in enumerate(
+        (
+            "(주)씨에프씨/김성일_서울로미래로",
+            "(주)신규법인_유준혁",
+            "LTD.",
+        ),
+        start=2,
+    ):
+        record = SourceRecord(
+            key=f"ambiguous-party-{row}",
+            sheet="2026",
+            row=row,
+            values={"당소 사건번호": f"SS-{row}", "의뢰인": name},
+            source_refs=[source_ref()],
+        )
+        run = AnalysisPipeline(build_default_registry()).analyze_change(
+            RecordChange(ChangeKind.CREATE, record.key, None, record)
+        )
+
+        assert not any(
+            change.target_database == "당사자"
+            for change in run.proposed_changes
+        )
+        assert any(
+            item.title == f"{name} 정식 당사자명 확인"
+            for item in run.review_items
+        )
+
+
+def test_party_analyzer_classifies_clear_korean_person_name_as_individual():
+    record = SourceRecord(
+        key="korean-person",
+        sheet="2026",
+        row=214,
+        values={"당소 사건번호": "SS-214", "의뢰인": "강나영"},
+        source_refs=[source_ref()],
+    )
+    run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.CREATE, record.key, None, record)
+    )
+    values = {
+        change.property_name: change.proposed_value
+        for change in run.proposed_changes
+        if change.target_database == "당사자"
+    }
+
+    assert values == {"당사자명": "강나영", "구분": "개인"}
+
+
 def test_source_profiler_and_generator_create_inert_draft_for_unknown_column():
     records = [
         SourceRecord(
