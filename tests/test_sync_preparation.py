@@ -22,7 +22,298 @@ from notion_excel_sync.models import (
 from notion_excel_sync.persistence.database import StateDatabase
 from notion_excel_sync.security.approval import ApprovalService
 from notion_excel_sync.workflow.proposals import ProposalService
-from notion_excel_sync.workflow.sync import SyncPreparationService
+from notion_excel_sync.workflow.sync import (
+    SyncPreparationService,
+    _retire_obsolete_bootstrap_reviews,
+    _retire_obsolete_party_pending,
+)
+
+
+def test_proposal_batch_keeps_pages_atomic_and_stages_a_bounded_suffix() -> None:
+    changes = [
+        ProposedChange(
+            target_database="Synthetic",
+            entity_key=f"entity-{entity:03d}",
+            property_name=f"property-{property_index:02d}",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value=f"value-{entity}-{property_index}",
+            analyzer="synthetic",
+            analyzer_version="1",
+            confidence=1.0,
+            reason="synthetic batching fixture",
+            source_refs=[],
+            operation_id=f"operation-{entity:03d}-{property_index:02d}",
+        )
+        for property_index in range(20)
+        for entity in range(30)
+    ]
+
+    selected, staged = SyncPreparationService._proposal_batch(changes)
+    selected_entities = {item.entity_key for item in selected}
+    staged_entities = {item.entity_key for item in staged}
+
+    assert len(selected) == 500
+    assert len(staged) == 100
+    assert len(selected_entities) == 25
+    assert len(staged_entities) == 5
+    assert selected_entities.isdisjoint(staged_entities)
+
+
+def test_change_sort_uses_human_numeric_order_for_entity_keys() -> None:
+    changes = [
+        ProposedChange(
+            target_database="한국 특허 사건",
+            entity_key=entity_key,
+            property_name="현재상태",
+            kind=ChangeKind.UPDATE,
+            current_value=None,
+            proposed_value="진행",
+            analyzer="synthetic",
+            analyzer_version="1",
+            confidence=1.0,
+            reason="synthetic ordering fixture",
+            source_refs=[],
+        )
+        for entity_key in ("CASE-100", "CASE-10", "CASE-2")
+    ]
+
+    ordered = SyncPreparationService._sort_changes(changes)
+
+    assert [item.entity_key for item in ordered] == [
+        "CASE-2",
+        "CASE-10",
+        "CASE-100",
+    ]
+
+
+def test_legacy_row_provenance_backlog_is_retired_without_touching_real_work() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        database = StateDatabase(Path(folder) / "state.db")
+        database.initialize()
+        legacy = ProposedChange(
+            target_database="근거자료",
+            entity_key="source:version:2026:10",
+            property_name="근거명",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value="Excel 2026 10행",
+            analyzer="provenance_tracker",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="legacy row provenance",
+            source_refs=[],
+            operation_id="legacy-provenance-operation",
+        )
+        real_work = ProposedChange(
+            target_database="한국 특허 사건",
+            entity_key="SS-SYNTHETIC-001",
+            property_name="현재상태",
+            kind=ChangeKind.UPDATE,
+            current_value="접수",
+            proposed_value="진행",
+            analyzer="workflow_status",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="real pending work",
+            source_refs=[],
+            operation_id="real-work-operation",
+        )
+        ProposalService(database).create(
+            "version",
+            "hash",
+            "telegram-user",
+            "telegram-chat",
+            [real_work],
+            staged_pending_changes=[legacy, real_work],
+        )
+
+        retired = database.retire_pending_operations(
+            [legacy.operation_id],
+            expected_analyzer="provenance_tracker",
+            expected_database="근거자료",
+            actor="telegram-user",
+            reason="synthetic migration",
+        )
+
+        assert retired == 1
+        remaining = database.load_pending_operations()
+        assert [item.change.operation_id for item in remaining] == [
+            real_work.operation_id
+        ]
+
+
+def test_obsolete_party_backlog_is_retired_without_losing_user_override() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        database = StateDatabase(Path(folder) / "state.db")
+        database.initialize()
+
+        def party_change(operation_id: str, version: str) -> ProposedChange:
+            return ProposedChange(
+                target_database="당사자",
+                entity_key=f"party:{operation_id}",
+                property_name="당사자명",
+                kind=ChangeKind.CREATE,
+                current_value=None,
+                proposed_value=operation_id,
+                analyzer="party",
+                analyzer_version=version,
+                confidence=1.0,
+                reason="synthetic party backlog",
+                source_refs=[],
+                operation_id=operation_id,
+            )
+
+        obsolete = party_change("obsolete-party", "1.0.0")
+        current = party_change("current-party", "1.1.0")
+        proposal = ProposalService(database).create(
+            "version",
+            "hash",
+            "telegram-user",
+            "telegram-chat",
+            [current],
+            staged_pending_changes=[obsolete, current],
+        )
+        operations = database.load_pending_operations()
+        overridden = next(
+            item
+            for item in operations
+            if item.change.operation_id == obsolete.operation_id
+        )
+        overridden.user_override = True
+
+        remaining_with_override, retired_with_override = (
+            _retire_obsolete_party_pending(
+                database,
+                [overridden, *[
+                    item
+                    for item in operations
+                    if item.change.operation_id != obsolete.operation_id
+                ]],
+                actor="telegram-user",
+            )
+        )
+        assert retired_with_override == 0
+        assert len(remaining_with_override) == 2
+
+        overridden.user_override = False
+        remaining, retired = _retire_obsolete_party_pending(
+            database,
+            [overridden, *[
+                item
+                for item in operations
+                if item.change.operation_id != obsolete.operation_id
+            ]],
+            actor=proposal.requested_by,
+        )
+
+        assert retired == 1
+        assert [item.change.operation_id for item in remaining] == [
+            current.operation_id
+        ]
+        assert [
+            item.change.operation_id for item in database.load_pending_operations()
+        ] == [current.operation_id]
+
+
+def test_bootstrap_review_cleanup_keeps_current_high_confidence_and_real_work() -> None:
+    with tempfile.TemporaryDirectory() as folder:
+        database = StateDatabase(Path(folder) / "state.db")
+        database.initialize()
+
+        def review_change(
+            entity: str,
+            property_name: str,
+            value: object,
+            version: str,
+        ) -> ProposedChange:
+            return ProposedChange(
+                target_database="검토함",
+                entity_key=entity,
+                property_name=property_name,
+                kind=ChangeKind.CREATE,
+                current_value=None,
+                proposed_value=value,
+                analyzer="review_materializer",
+                analyzer_version="1.0.0",
+                confidence=1.0,
+                reason="synthetic review",
+                source_refs=[
+                    SourceRef(
+                        "local",
+                        "local:item",
+                        version,
+                        version,
+                        "2026",
+                        2,
+                        "A2",
+                    )
+                ],
+                operation_id=f"{entity}-{property_name}",
+            )
+
+        stale = [
+            review_change("review:stale", "검토항목", "stale", "old-version"),
+            review_change("review:stale", "신뢰도", 0.9, "old-version"),
+        ]
+        low = [
+            review_change("review:low", "검토항목", "low", "current-version"),
+            review_change("review:low", "신뢰도", 0.55, "current-version"),
+        ]
+        high = [
+            review_change("review:high", "검토항목", "high", "current-version"),
+            review_change("review:high", "신뢰도", 0.9, "current-version"),
+        ]
+        real_work = ProposedChange(
+            target_database="한국 특허 사건",
+            entity_key="SS-SYNTHETIC-001",
+            property_name="현재상태",
+            kind=ChangeKind.UPDATE,
+            current_value="접수",
+            proposed_value="진행",
+            analyzer="workflow_status",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="real pending work",
+            source_refs=[],
+            operation_id="real-work-operation",
+        )
+        ProposalService(database).create(
+            "current-version",
+            "hash",
+            "telegram-user",
+            "telegram-chat",
+            [real_work],
+            staged_pending_changes=[*stale, *low, *high, real_work],
+        )
+
+        remaining, summary = _retire_obsolete_bootstrap_reviews(
+            database,
+            database.load_pending_operations(),
+            current_version_id="current-version",
+            actor="telegram-user",
+        )
+
+        assert summary == {
+            "stale_operations": 2,
+            "low_confidence_operations": 2,
+            "retired_operations": 4,
+        }
+        assert {
+            operation.change.operation_id for operation in remaining
+        } == {
+            "review:high-검토항목",
+            "review:high-신뢰도",
+            real_work.operation_id,
+        }
+        assert {
+            operation.change.operation_id
+            for operation in database.load_pending_operations()
+        } == {
+            "review:high-검토항목",
+            "review:high-신뢰도",
+            real_work.operation_id,
+        }
 
 
 class FakeOneDrive:
@@ -107,6 +398,20 @@ class FakeKnowledgeProvider:
         if not changes:
             raise AssertionError("Knowledge retrieval requires changed Excel rows")
         return self.snapshot
+
+
+class RecordingNotionReader:
+    def __init__(self) -> None:
+        self.clear_calls = 0
+        self.load_calls: list[set[tuple[str, str, str]]] = []
+
+    def clear_cache(self) -> None:
+        self.clear_calls += 1
+
+    def load(self, keys, title_values):
+        del title_values
+        self.load_calls.append(set(keys))
+        return {}
 
 
 def knowledge_ref() -> KnowledgeRef:
@@ -543,6 +848,7 @@ class SyncPreparationTest(unittest.TestCase):
                     shadow_counts={"government_support_evidence": 1},
                 )
             )
+            notion_reader = RecordingNotionReader()
             service = SyncPreparationService(
                 database,
                 VersionedWorkbookOneDrive(
@@ -552,6 +858,7 @@ class SyncPreparationTest(unittest.TestCase):
                 ExcelSnapshotReader([SheetSpec("지원사업", ("ID",))]),
                 AnalysisPipeline(build_default_registry()),
                 ProposalService(database, approval),
+                notion_reader=notion_reader,
                 knowledge_provider=knowledge,
             )
 
@@ -601,6 +908,15 @@ class SyncPreparationTest(unittest.TestCase):
             self.assertTrue(evidence_history)
             self.assertTrue(
                 all(operation.change.knowledge_refs == [ref] for operation in evidence_history)
+            )
+            self.assertEqual(notion_reader.clear_calls, 1)
+            self.assertTrue(notion_reader.load_calls)
+            self.assertTrue(
+                all(
+                    key[0] != "변경이력"
+                    for call in notion_reader.load_calls
+                    for key in call
+                )
             )
 
     def test_noop_new_version_advances_checkpoint_without_a_proposal(self) -> None:
@@ -673,6 +989,32 @@ class SyncPreparationTest(unittest.TestCase):
             self.assertEqual(result.current_version_id, "2.0")
             self.assertEqual(result.changes_detected, 1)
             self.assertIsNotNone(result.proposal)
+            assert result.proposal is not None
+            self.assertTrue(
+                any(
+                    operation.change.target_database != "변경이력"
+                    for operation in result.proposal.operations
+                )
+            )
+            self.assertFalse(
+                any(
+                    operation.change.target_database == "변경이력"
+                    for operation in result.proposal.operations
+                )
+            )
+            self.assertFalse(
+                any(
+                    operation.change.analyzer == "provenance_tracker"
+                    or operation.change.target_database == "근거자료"
+                    for operation in result.proposal.operations
+                )
+            )
+            self.assertTrue(
+                all(
+                    operation.change.source_refs
+                    for operation in result.proposal.operations
+                )
+            )
             self.assertIsNone(database.get_checkpoint("local", "local:item"))
 
     def test_pending_item_reappears_without_a_new_onedrive_version(self) -> None:

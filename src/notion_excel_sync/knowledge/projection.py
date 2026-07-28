@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 from uuid import uuid4
 
 from notion_excel_sync.adapters.hiworks_mail import HiworksMailMessage
@@ -401,6 +401,7 @@ class WikiOutputStore:
         *,
         baseline_at: str,
         collected_at: datetime,
+        ai_analyses: Mapping[str, Mapping[str, object]] | None = None,
     ) -> WikiProjection:
         mail_root = self.output_root / "mail"
         message_root = mail_root / "messages"
@@ -408,6 +409,13 @@ class WikiOutputStore:
         analyses = [analyze_mail_message(message) for message in messages]
         for analysis in analyses:
             locator = sha256_json({"uidl": analysis.uidl})[:32]
+            ai_analysis = dict((ai_analyses or {}).get(analysis.uidl, {}))
+            combined_content_hash = sha256_json(
+                {
+                    "mail_content_hash": analysis.content_hash,
+                    "ai_analysis": ai_analysis,
+                }
+            )
             payload = {
                 "schema_version": 1,
                 "authority": "hiworks_email",
@@ -426,7 +434,8 @@ class WikiOutputStore:
                 "body_truncated": analysis.body_truncated,
                 "skip_reason": analysis.skip_reason,
                 "attachments": analysis.attachments,
-                "content_hash": analysis.content_hash,
+                "ai_analysis": ai_analysis,
+                "content_hash": combined_content_hash,
             }
             self._write_text(
                 message_root / f"{locator}.json",
@@ -455,6 +464,33 @@ class WikiOutputStore:
                 "",
                 _markdown_value(analysis.attachments, limit=5000),
             ]
+            if ai_analysis:
+                lines.extend(
+                    [
+                        "",
+                        "## 구조화 AI 분석",
+                        "",
+                        "> 이 분석은 보조 제안이며 Excel 사실을 대체하지 않습니다.",
+                        "",
+                        f"- 요약: {_markdown_value(ai_analysis.get('summary'))}",
+                        (
+                            "- 신뢰도: "
+                            f"{float(ai_analysis.get('overall_confidence', 0)):.0%}"
+                        ),
+                        (
+                            "- 검토 필요: "
+                            f"{'예' if ai_analysis.get('needs_review') else '아니오'}"
+                        ),
+                        (
+                            "- 분석 식별값: "
+                            f"{_markdown_value(ai_analysis.get('analysis_digest'))}"
+                        ),
+                        "",
+                        "### 구조화 항목",
+                        "",
+                        _markdown_value(ai_analysis.get("claims", {}), limit=5000),
+                    ]
+                )
             self._write_text(message_root / f"{locator}.md", "\n".join(lines) + "\n")
 
         catalog_rows: list[dict[str, object]] = []

@@ -20,6 +20,9 @@ SCHEMA_PURPOSE = "notion_schema_create/v1"
 SCHEMA_TEMPLATE_ID = "government-support-evidence"
 SCHEMA_TEMPLATE_VERSION = 1
 SCHEMA_LOGICAL_NAME = "정부지원사업 증빙"
+CASE_HISTORY_TEMPLATE_ID = "case-history"
+CASE_HISTORY_TEMPLATE_VERSION = 1
+CASE_HISTORY_LOGICAL_NAME = "사건 히스토리"
 # Pure workflow tests need a deterministic valid Notion ID. Production callers
 # must supply their configured parent explicitly and must never rely on this fake.
 SCHEMA_PARENT_PAGE_ID = "f0000000000000000000000000000001"
@@ -86,6 +89,98 @@ FIXED_SELECT_OPTIONS: Mapping[str, tuple[tuple[str, str], ...]] = MappingProxyTy
         ("검토필요", "yellow"),
     ),
 })
+
+CASE_HISTORY_PROPERTIES: tuple[tuple[str, str], ...] = (
+    ("히스토리명", "title"),
+    ("이벤트ID", "rich_text"),
+    ("사건번호", "rich_text"),
+    ("발생일", "date"),
+    ("수집일시", "date"),
+    ("이벤트유형", "select"),
+    ("요약", "rich_text"),
+    ("상세내용", "rich_text"),
+    ("다음조치", "rich_text"),
+    ("다음기한", "date"),
+    ("출처유형", "select"),
+    ("출처위치", "rich_text"),
+    ("원본버전", "rich_text"),
+    ("원본해시", "rich_text"),
+    ("신뢰도", "number"),
+    ("검토상태", "select"),
+    ("사람확인", "checkbox"),
+    ("사건", "relation"),
+)
+CASE_HISTORY_RELATIONS: tuple[tuple[str, str], ...] = (
+    ("사건", "한국 특허 사건"),
+)
+CASE_HISTORY_SELECT_OPTIONS: Mapping[
+    str, tuple[tuple[str, str], ...]
+] = MappingProxyType({
+    "이벤트유형": (
+        ("등록결정", "purple"),
+        ("업무완료", "green"),
+        ("연락", "blue"),
+        ("출원", "orange"),
+        ("업무접수", "yellow"),
+        ("업무시작", "default"),
+    ),
+    "출처유형": (
+        ("Excel", "green"),
+        ("이메일", "blue"),
+        ("로컬 데이터", "default"),
+    ),
+    "검토상태": (
+        ("승인완료", "green"),
+        ("검토필요", "yellow"),
+    ),
+})
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaTemplateContract:
+    template_id: str
+    template_version: int
+    logical_name: str
+    title_property: str
+    properties: tuple[tuple[str, str], ...]
+    relations: tuple[tuple[str, str], ...]
+    select_options: Mapping[str, tuple[tuple[str, str], ...]]
+    number_formats: Mapping[str, str]
+
+
+SCHEMA_TEMPLATES: Mapping[str, SchemaTemplateContract] = MappingProxyType({
+    SCHEMA_TEMPLATE_ID: SchemaTemplateContract(
+        template_id=SCHEMA_TEMPLATE_ID,
+        template_version=SCHEMA_TEMPLATE_VERSION,
+        logical_name=SCHEMA_LOGICAL_NAME,
+        title_property="증빙명",
+        properties=FIXED_PROPERTIES,
+        relations=FIXED_RELATIONS,
+        select_options=FIXED_SELECT_OPTIONS,
+        number_formats=MappingProxyType({
+            name: ("number" if name == "인정 건수" else "won")
+            for name, property_type in FIXED_PROPERTIES
+            if property_type == "number"
+        }),
+    ),
+    CASE_HISTORY_TEMPLATE_ID: SchemaTemplateContract(
+        template_id=CASE_HISTORY_TEMPLATE_ID,
+        template_version=CASE_HISTORY_TEMPLATE_VERSION,
+        logical_name=CASE_HISTORY_LOGICAL_NAME,
+        title_property="히스토리명",
+        properties=CASE_HISTORY_PROPERTIES,
+        relations=CASE_HISTORY_RELATIONS,
+        select_options=CASE_HISTORY_SELECT_OPTIONS,
+        number_formats=MappingProxyType({"신뢰도": "number"}),
+    ),
+})
+
+
+def schema_template(template_id: str) -> SchemaTemplateContract:
+    try:
+        return SCHEMA_TEMPLATES[template_id]
+    except KeyError as exc:
+        raise SchemaTemplateError("Schema template is not allowlisted") from exc
 
 
 class NotionSchemaSecurityError(ValueError):
@@ -185,12 +280,11 @@ class SchemaCreatePlan:
     approved_live_binding: SchemaLiveBinding
 
     def __post_init__(self) -> None:
-        _assert_template_contract()
-        if self.template_id != SCHEMA_TEMPLATE_ID:
-            raise SchemaTemplateError("Schema template is not allowlisted")
-        if self.template_version != SCHEMA_TEMPLATE_VERSION:
+        contract = schema_template(self.template_id)
+        _assert_template_contract(self.template_id)
+        if self.template_version != contract.template_version:
             raise SchemaTemplateError("Schema template version is not allowlisted")
-        if self.logical_name != SCHEMA_LOGICAL_NAME:
+        if self.logical_name != contract.logical_name:
             raise SchemaTemplateError("Schema title is not allowlisted")
         if self.purpose != SCHEMA_PURPOSE:
             raise SchemaTemplateError("Schema approval purpose is not allowlisted")
@@ -202,7 +296,7 @@ class SchemaCreatePlan:
             raise SchemaBindingError("Write bot ID is not canonical")
         if _REMOTE_MARKER_RE.fullmatch(self.remote_marker) is None:
             raise SchemaTemplateError("Remote schema marker is invalid")
-        expected_relation_names = FIXED_RELATIONS
+        expected_relation_names = contract.relations
         actual_relation_names = tuple(
             (item.property_name, item.logical_name) for item in self.relation_targets
         )
@@ -233,17 +327,18 @@ class SchemaCreatePlan:
     def create_body(self) -> dict[str, Any]:
         """Return a fresh, exact request body; callers cannot inject fields."""
 
-        _assert_template_contract()
+        contract = schema_template(self.template_id)
+        _assert_template_contract(self.template_id)
         return {
             "parent": {
                 "type": "page_id",
                 "page_id": self.parent_page_id,
             },
-            "title": [_notion_text(SCHEMA_LOGICAL_NAME)],
+            "title": [_notion_text(contract.logical_name)],
             "description": [_notion_text(self.remote_marker)],
             "is_inline": False,
             "initial_data_source": {
-                "properties": _create_properties(self.relation_targets),
+                "properties": _create_properties(contract, self.relation_targets),
             },
         }
 
@@ -391,24 +486,26 @@ def _notion_text(content: str) -> dict[str, Any]:
     }
 
 
-def _assert_template_contract() -> None:
-    definition = NOTION_DEFINITIONS.get(SCHEMA_LOGICAL_NAME)
+def _assert_template_contract(template_id: str = SCHEMA_TEMPLATE_ID) -> None:
+    contract = schema_template(template_id)
+    definition = NOTION_DEFINITIONS.get(contract.logical_name)
     if definition is None:
         raise SchemaTemplateError("Allowlisted Notion definition is missing")
-    if definition.title_property != "증빙명":
+    if definition.title_property != contract.title_property:
         raise SchemaTemplateError("Allowlisted title property changed")
-    if len(definition.properties) != len(FIXED_PROPERTIES):
+    if len(definition.properties) != len(contract.properties):
         raise SchemaTemplateError("Allowlisted property count changed")
-    if dict(definition.properties) != dict(FIXED_PROPERTIES):
+    if dict(definition.properties) != dict(contract.properties):
         raise SchemaTemplateError("Allowlisted property types changed")
-    if dict(definition.relations) != dict(FIXED_RELATIONS):
+    if dict(definition.relations) != dict(contract.relations):
         raise SchemaTemplateError("Allowlisted relation definitions changed")
 
 
 def _normalize_relation_ids(
     relation_data_source_ids: Mapping[str, str],
+    contract: SchemaTemplateContract,
 ) -> tuple[RelationTarget, ...]:
-    expected_logical_names = {logical_name for _, logical_name in FIXED_RELATIONS}
+    expected_logical_names = {logical_name for _, logical_name in contract.relations}
     if set(relation_data_source_ids) != expected_logical_names:
         raise SchemaTemplateError("Relation target set must match the allowlisted template")
     return tuple(
@@ -417,7 +514,7 @@ def _normalize_relation_ids(
             logical_name=logical_name,
             data_source_id=normalize_notion_id(relation_data_source_ids[logical_name]),
         )
-        for property_name, logical_name in FIXED_RELATIONS
+        for property_name, logical_name in contract.relations
     )
 
 
@@ -500,6 +597,7 @@ def _direct_child_identity(
 
 def capture_schema_live_binding(
     *,
+    template_id: str = SCHEMA_TEMPLATE_ID,
     parent_page: Mapping[str, Any],
     write_bot: Mapping[str, Any],
     direct_child_databases: Sequence[Mapping[str, Any]],
@@ -510,10 +608,11 @@ def capture_schema_live_binding(
 ) -> SchemaLiveBinding:
     """Canonicalize the exact read-only precondition for one schema proposal."""
 
-    _assert_template_contract()
+    contract = schema_template(template_id)
+    _assert_template_contract(template_id)
     parent = _parent_binding(parent_page, expected_parent_page_id)
     bot = _write_bot_binding(write_bot, expected_write_bot_id)
-    relation_targets = _normalize_relation_ids(relation_data_source_ids)
+    relation_targets = _normalize_relation_ids(relation_data_source_ids, contract)
     expected_names = {item.logical_name for item in relation_targets}
     if set(relation_data_sources) != expected_names:
         raise SchemaBindingError("Live relation data-source set is not exact")
@@ -528,9 +627,7 @@ def capture_schema_live_binding(
     conflicts: list[DirectChildIdentity] = []
     for raw_child in direct_child_databases:
         child = _direct_child_identity(raw_child, parent.page_id)
-        if child.title == SCHEMA_LOGICAL_NAME or child.marker.startswith(
-            REMOTE_MARKER_PREFIX
-        ):
+        if child.title == contract.logical_name:
             conflicts.append(child)
     conflicts.sort(key=lambda item: item.database_id)
     return SchemaLiveBinding(
@@ -561,13 +658,13 @@ def build_schema_create_plan(
     expected_parent_page_id: str = SCHEMA_PARENT_PAGE_ID,
     api_version: str = SCHEMA_API_VERSION,
 ) -> SchemaCreatePlan:
-    """Build the sole allowlisted schema plan without accepting a body or title."""
+    """Build one fixed allowlisted schema plan without accepting a body or title."""
 
-    if template_id != SCHEMA_TEMPLATE_ID:
-        raise SchemaTemplateError("Schema template is not allowlisted")
+    contract = schema_template(template_id)
     if api_version != SCHEMA_API_VERSION:
         raise SchemaTemplateError("Notion API version is not allowlisted")
     live_binding = capture_schema_live_binding(
+        template_id=template_id,
         parent_page=parent_page,
         write_bot=write_bot,
         direct_child_databases=direct_child_databases,
@@ -579,11 +676,11 @@ def build_schema_create_plan(
     expected_parent = normalize_notion_id(expected_parent_page_id)
     if live_binding.parent.page_id != expected_parent:
         raise SchemaBindingError("Live schema parent differs from the expected parent")
-    relation_targets = _normalize_relation_ids(relation_data_source_ids)
+    relation_targets = _normalize_relation_ids(relation_data_source_ids, contract)
     return SchemaCreatePlan(
-        template_id=SCHEMA_TEMPLATE_ID,
-        template_version=SCHEMA_TEMPLATE_VERSION,
-        logical_name=SCHEMA_LOGICAL_NAME,
+        template_id=contract.template_id,
+        template_version=contract.template_version,
+        logical_name=contract.logical_name,
         purpose=SCHEMA_PURPOSE,
         api_version=SCHEMA_API_VERSION,
         parent_page_id=expected_parent,
@@ -595,25 +692,24 @@ def build_schema_create_plan(
 
 
 def _create_properties(
+    contract: SchemaTemplateContract,
     relation_targets: tuple[RelationTarget, ...],
 ) -> dict[str, Any]:
     relation_ids = {item.property_name: item.data_source_id for item in relation_targets}
     result: dict[str, Any] = {}
-    for property_name, property_type in FIXED_PROPERTIES:
+    for property_name, property_type in contract.properties:
         if property_type == "select":
             result[property_name] = {
                 "select": {
                     "options": [
                         {"name": name, "color": color}
-                        for name, color in FIXED_SELECT_OPTIONS[property_name]
+                        for name, color in contract.select_options[property_name]
                     ]
                 }
             }
         elif property_type == "number":
             result[property_name] = {
-                "number": {
-                    "format": "number" if property_name == "인정 건수" else "won"
-                }
+                "number": {"format": contract.number_formats[property_name]}
             }
         elif property_type == "relation":
             result[property_name] = {
@@ -628,22 +724,23 @@ def _create_properties(
 
 
 def _canonical_expected_remote_schema(plan: SchemaCreatePlan) -> dict[str, Any]:
+    contract = schema_template(plan.template_id)
     relation_ids = {
         item.property_name: item.data_source_id for item in plan.relation_targets
     }
     expected: dict[str, Any] = {}
-    for property_name, property_type in FIXED_PROPERTIES:
+    for property_name, property_type in contract.properties:
         row: dict[str, Any] = {"type": property_type}
         if property_type == "select":
             row["options"] = sorted(
                 [
                     {"name": name, "color": color}
-                    for name, color in FIXED_SELECT_OPTIONS[property_name]
+                    for name, color in contract.select_options[property_name]
                 ],
                 key=lambda item: (item["name"], item["color"]),
             )
         elif property_type == "number":
-            row["format"] = "number" if property_name == "인정 건수" else "won"
+            row["format"] = contract.number_formats[property_name]
         elif property_type == "relation":
             row["target_data_source_id"] = relation_ids[property_name]
             row["mode"] = "single_property"
@@ -657,14 +754,15 @@ def canonicalize_created_data_source_schema(
 ) -> dict[str, Any]:
     """Normalize only security-relevant schema fields and reject every extra property."""
 
+    contract = schema_template(plan.template_id)
     properties = _mapping(data_source.get("properties"), label="created properties")
-    expected_names = {name for name, _ in FIXED_PROPERTIES}
+    expected_names = {name for name, _ in contract.properties}
     if set(properties) != expected_names:
         raise CreatedSchemaVerificationError(
             "Created data source has missing or extra properties"
         )
     canonical: dict[str, Any] = {}
-    for property_name, expected_type in FIXED_PROPERTIES:
+    for property_name, expected_type in contract.properties:
         raw = _mapping(properties[property_name], label=f"property {property_name}")
         if raw.get("type") != expected_type:
             raise CreatedSchemaVerificationError("Created property type differs")
@@ -752,6 +850,7 @@ def verify_created_schema(
 ) -> CreatedSchemaBinding:
     """Verify an exact database/data-source pair and capture its immutable identity."""
 
+    contract = schema_template(plan.template_id)
     start, _ = _normalized_timestamp(attempt_started_at, label="attempt start")
     observed, _ = _normalized_timestamp(observed_at, label="observation time")
     if observed < start:
@@ -798,7 +897,7 @@ def verify_created_schema(
         raise CreatedSchemaVerificationError("Created data-source parent differs")
 
     if _rich_text(database.get("title"), label="created database title") != (
-        SCHEMA_LOGICAL_NAME
+        contract.logical_name
     ):
         raise CreatedSchemaVerificationError("Created database title differs")
     if database.get("is_inline") is not False:
@@ -820,9 +919,9 @@ def verify_created_schema(
         raise CreatedSchemaVerificationError("Created data-source identity differs")
     if _normalized_text(
         child_source.get("name"), label="created database data-source name"
-    ) != SCHEMA_LOGICAL_NAME:
+    ) != contract.logical_name:
         raise CreatedSchemaVerificationError("Created database data-source name differs")
-    if _data_source_display_name(data_source) != SCHEMA_LOGICAL_NAME:
+    if _data_source_display_name(data_source) != contract.logical_name:
         raise CreatedSchemaVerificationError("Created data-source name differs")
 
     data_source_creator_id = _created_by_id(data_source, label="created data source")
@@ -919,6 +1018,7 @@ def decide_schema_reconciliation(
 ) -> ReconciliationDecision:
     """Return a non-mutating, fail-closed decision after a create interruption."""
 
+    contract = schema_template(plan.template_id)
     approved_base = replace(plan.approved_live_binding, direct_child_conflicts=())
     current_base = replace(current_live_binding, direct_child_conflicts=())
     try:
@@ -933,8 +1033,8 @@ def decide_schema_reconciliation(
     try:
         for candidate in candidates:
             identity = _relevant_candidate_identity(candidate, plan.parent_page_id)
-            if identity.title == SCHEMA_LOGICAL_NAME or identity.marker.startswith(
-                REMOTE_MARKER_PREFIX
+            if identity.title == contract.logical_name or (
+                identity.marker == plan.remote_marker
             ):
                 relevant.append((identity, candidate))
     except CreatedSchemaVerificationError:
@@ -969,7 +1069,7 @@ def decide_schema_reconciliation(
         )
 
     identity, candidate = relevant[0]
-    if identity.title != SCHEMA_LOGICAL_NAME or identity.marker != plan.remote_marker:
+    if identity.title != contract.logical_name or identity.marker != plan.remote_marker:
         return ReconciliationDecision(
             ReconciliationDisposition.CONFLICT,
             "foreign_or_mismatched_child",
@@ -997,6 +1097,12 @@ def decide_schema_reconciliation(
 
 
 __all__ = [
+    "CASE_HISTORY_LOGICAL_NAME",
+    "CASE_HISTORY_PROPERTIES",
+    "CASE_HISTORY_RELATIONS",
+    "CASE_HISTORY_SELECT_OPTIONS",
+    "CASE_HISTORY_TEMPLATE_ID",
+    "CASE_HISTORY_TEMPLATE_VERSION",
     "CreatedSchemaBinding",
     "CreatedSchemaVerificationError",
     "DirectChildIdentity",
@@ -1013,6 +1119,7 @@ __all__ = [
     "RemoteSchemaCandidate",
     "SCHEMA_API_VERSION",
     "SCHEMA_LOGICAL_NAME",
+    "SCHEMA_TEMPLATES",
     "SCHEMA_PARENT_PAGE_ID",
     "SCHEMA_PURPOSE",
     "SCHEMA_TEMPLATE_ID",
@@ -1020,6 +1127,7 @@ __all__ = [
     "SchemaBindingError",
     "SchemaCreatePlan",
     "SchemaLiveBinding",
+    "SchemaTemplateContract",
     "SchemaTemplateError",
     "WriteBotBinding",
     "assert_schema_live_binding_matches",
@@ -1029,5 +1137,6 @@ __all__ = [
     "decide_schema_reconciliation",
     "generate_remote_marker",
     "normalize_notion_id",
+    "schema_template",
     "verify_created_schema",
 ]

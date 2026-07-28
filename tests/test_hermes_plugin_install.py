@@ -70,6 +70,8 @@ print(json.dumps({
     "mode": module._RUNTIME_MODE,
     "root": str(module._IMPORT_ROOT),
     "project_on_path": project_root in sys.path,
+    "bytecode_env": os.environ.get("PYTHONDONTWRITEBYTECODE"),
+    "dont_write_bytecode": sys.dont_write_bytecode,
     "gateway": str(Path(hermes_gateway.__file__).resolve()),
     "vendored": {
         name: str(Path(sys.modules[name].__file__).resolve())
@@ -157,7 +159,7 @@ print(json.dumps({
             ):
                 self.assertIn(schema_runtime_file, actual)
             self.assertIn(
-                'version: "0.4.1"',
+                'version: "0.8.2"',
                 (plugin_dir / "plugin.yaml").read_text(encoding="utf-8"),
             )
             self.assertEqual(
@@ -198,6 +200,8 @@ print(json.dumps({
             self.assertEqual(loaded.returncode, 0, loaded.stderr)
             payload = json.loads(loaded.stdout.strip())
             self.assertEqual(payload["mode"], "vendored")
+            self.assertEqual(payload["bytecode_env"], "1")
+            self.assertTrue(payload["dont_write_bytecode"])
             self.assertEqual(Path(payload["root"]), runtime_root.resolve())
             self.assertFalse(payload["project_on_path"])
             self.assertTrue(

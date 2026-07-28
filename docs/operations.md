@@ -21,20 +21,65 @@
 
 검증 중 원본, Wiki와 Notion을 변경하면 안 됩니다.
 
+플러그인 설치·갱신 후에는 프로젝트 아래의 개발용 스크립트가 아니라 보호된 launcher
+사본으로 Gateway를 재시작합니다.
+
+```powershell
+& (Join-Path $env:LOCALAPPDATA `
+  "hermes\secure-gateway-launcher\restart-hermes-gateway-secure.ps1") `
+  -ProjectRoot $PWD
+```
+
 ## 2. 최초 `/nx_sync`
 
 사용자가 새 Telegram 메시지로 `/nx_sync`를 보냅니다.
 
 1. Gateway가 원본 Telegram 사용자·chat/thread를 인증합니다.
-2. 아직 bootstrap checkpoint가 없으면 명령 수신 시각을 `T0`로 기록합니다.
-3. 전체 Excel과 전체 데이터 원본 폴더를 읽습니다.
-4. 최초 hydration 설정이 켜져 있으면 온라인 전용 파일을 읽기 위해 내려받습니다.
-5. 메일은 읽거나 초기 Wiki에 넣지 않습니다.
-6. Excel과 데이터 projection이 모두 성공하면 초기 Wiki `G0`를 확정합니다.
-7. Excel 전체와 현재 Notion 값을 비교해 최초 제안을 만듭니다.
+2. 인증이 끝나면 `[NX_SYNC_ACCEPTED]`를 즉시 보내고 준비 작업을 계속합니다.
+3. 아직 bootstrap checkpoint가 없으면 명령 수신 시각을 `T0`로 기록합니다.
+4. 전체 Excel과 전체 데이터 원본 폴더를 읽습니다.
+5. 최초 hydration 설정이 켜져 있으면 온라인 전용 파일을 읽기 위해 내려받습니다.
+6. 메일은 읽거나 초기 Wiki에 넣지 않습니다.
+7. Excel과 데이터 projection이 모두 성공하면 초기 Wiki `G0`를 확정합니다.
+8. Excel 전체와 현재 Notion 값을 비교해 최초 제안을 만듭니다.
 
-이 단계에서 Notion은 변경되지 않습니다. 변경이 없어도 최초 기준과 Wiki 성공 여부를
-정확히 보고합니다.
+이 실행은 명령 시점의 전체 상태를 reconcile해 기준선을 세웁니다. 기준선의 각 속성을
+과거 변경으로 간주하지 않으므로 속성별 `변경이력` operation은 만들지 않습니다. 최초
+제안에 실제 Notion 변경이 있으면 후속 실행과 동일하게 정확한 별도 Telegram 승인이
+필요합니다.
+
+최초 전체 reconcile에서는 신뢰도 `0.8` 미만의 대량 검토 후보를 개별 Notion
+`검토함` 페이지로 만들지 않습니다. 억제 건수와 기준은 로컬 감사 로그에 집계하고,
+복수 사건번호처럼 신뢰도 `0.8` 이상인 항목만 Telegram 제안에 포함합니다. 최초
+체크포인트가 확정된 뒤의 변경분에서는 저신뢰 항목도 평소와 같이 개별 검토 대상으로
+제안합니다.
+
+최초 구축 도중 제안을 거부한 뒤 Excel이 다시 저장되어 원본 버전이 바뀌면, 새
+`/nx_sync`는 아직 승인되지 않은 구버전 `review_materializer/검토함` 대기 작업만
+정확히 분류해 종료합니다. 최신 버전의 고신뢰 검토와 사건·당사자·업무 등 실질 작업은
+보존합니다. 이 로컬 정리는 Notion 쓰기나 체크포인트 전진을 수행하지 않습니다.
+
+준비 단계에서 허용되는 로컬 변경은 runtime 상태 기록과 LLM Wiki 운영 계약에 따른 파생
+Wiki 세대 준비뿐입니다. 원본 폴더와 Excel, Notion, 승인된 Wiki 오버레이는 변경되지
+않습니다. 완료되면 제안이 있을 때 `[NX_SYNC_PROPOSAL_READY]`, 없을 때
+`[NX_SYNC_NO_CHANGES]`를 보냅니다.
+
+AI가 켜진 실행은 제안 뒤에 다음 요약을 추가할 수 있습니다.
+
+```text
+[NX_AI_ANALYSIS] mode=shadow attempted=4 completed=4 failures=0
+```
+
+`shadow` 결과는 Notion 제안에 영향을 주지 않습니다. `assist`는 검토함 후보만 만들고,
+`verified`도 원본 인용·스키마·최소 신뢰도를 통과한 허용 필드만 기존 제안 후보를
+보강합니다. 모든 모드에서 최종 Notion 변경에는 동일한 `/nx_approve`가 필요합니다.
+`failures`가 발생해도 규칙 기반 분석은 계속되며 같은 실행에서 추가 모델 호출은
+중단됩니다.
+`failure_codes`는 원문이나 모델 응답을 노출하지 않고
+`provider_unavailable`, `provider_response_error`,
+`response_shape_rejected`, `claim_field_rejected`, `evidence_rejected`,
+`grounding_rejected`, `schema_or_grounding_rejected`, `cache_io_error`,
+`validated_value_rejected` 중 어느 안전 경계에서 폐기됐는지 표시합니다.
 
 ## 3. 후속 `/nx_sync`
 
@@ -49,6 +94,36 @@
 
 메일과 데이터 자료는 Wiki와 분석 보조 정보에만 반영합니다. Excel만 Notion 사건 사실의
 원본입니다.
+
+Excel의 각 행을 별도의 Notion `근거자료` 페이지로 만들지는 않습니다. 시트·행·셀,
+원본 버전과 SHA256은 각 실질 변경의 immutable `SourceRef`, 로컬 감사 로그와 Wiki
+근거에 보존합니다. Notion `근거자료`에는 행 위치 같은 기술 메타데이터가 아니라
+정부지원사업 증빙 등 사람이 실제로 관리할 분석 결과만 생성합니다. 0.6.5 이하에서
+대기열에 저장된 `provenance_tracker` 행별 작업은 이후 동기화 준비 시 해당 analyzer와
+대상 DB가 정확히 일치할 때만 종료되며, 종료 개수와 operation 집합 digest를 감사
+로그에 남깁니다.
+
+후속 실행은 마지막 성공 기준선 이후의 Excel 속성 변경에 대해서만 `변경이력` operation을
+만듭니다. 현재값 조회 대상이 많으면 DB별로 묶어 읽어 왕복 횟수를 줄이지만, 매핑된 페이지
+검증과 중복 제목 탐지는 생략하지 않습니다. 하나의 요청이 여러 페이지와 일치하는 등
+대상이 모호하면 쓰기 제안을 추측하지 않고 실패시킵니다.
+
+## 3.1 동기화 진행 응답과 중복 명령
+
+0.6.0 이상 runtime에서는 인증된 `/nx_sync`가 다음 순서로 응답합니다.
+
+1. 즉시 `[NX_SYNC_ACCEPTED]`
+2. 준비가 끝난 뒤 `[NX_SYNC_PROPOSAL_READY]` 또는 `[NX_SYNC_NO_CHANGES]`
+
+같은 Gateway에서 동기화가 이미 실행 중일 때 다시 `/nx_sync`를 보내면 새 작업을 만들지
+않고 `[NX_SYNC_IN_PROGRESS]`로 현재 단계만 알려 줍니다. 이 응답은 승인이나 Notion 쓰기
+권한이 아닙니다. 짧은 시간에 중복 요청이 몰리면 진행 확인은 한 건으로 합쳐져 한 번만
+응답할 수 있습니다.
+
+0.5.1 runtime은 진행 응답을 지원하지 않고 중복 명령을 조용히 무시할 수 있습니다.
+0.5.1이 설치된 상태에서는 첫 요청이 끝날 때까지 `/nx_sync`를 다시 보내지 마십시오.
+0.6.0 이상으로 갱신한 뒤에도 중복 실행은 하지 않으며, `[NX_SYNC_IN_PROGRESS]`를 상태
+확인으로만 사용합니다.
 
 ## 4. Telegram 검토
 
@@ -75,6 +150,17 @@
 수정·제외·보류는 항상 새 revision과 digest를 만듭니다. 이전 digest로는 승인할 수
 없습니다.
 
+검토 화면과 무관한 독립 정정은 엄격한 JSON 명령으로 요청합니다.
+
+```text
+/nx_correct {"database":"한국 특허 사건","entity_key":"SS-SYNTHETIC-001","property":"현재상태","value":"보류","reason":"합성 예시 확인","case_number":"SS-SYNTHETIC-001"}
+```
+
+이 단계는 현재 로컬 Excel 전체 해시와 현재 Notion 값을 읽어 별도 correction proposal을
+만들 뿐 원격 쓰기는 하지 않습니다. 표시된 새 revision과 digest를 `/nx_approve`로 다시
+승인한 뒤에만 Notion과 Wiki 보정 오버레이에 반영합니다. 독립 정정 완료는 Excel
+체크포인트를 전진시키지 않습니다.
+
 ## 5. 최종 승인과 반영
 
 사용자는 표시된 값을 그대로 포함한 별도 메시지를 보냅니다.
@@ -91,9 +177,17 @@ Gateway는 첫 Notion 쓰기 직전에 다음을 다시 검증합니다.
 4. Notion schema, relation 대상과 현재 property precondition
 5. 각 operation의 대상·속성·인코딩된 값
 
-하나라도 다르면 `STALE`로 끝내고 아무것도 쓰지 않습니다. 모두 같을 때만 승인된
-operation을 적용합니다. 사용자가 편집한 값은 Notion 성공 확인 후 Wiki 승인 오버레이에도
-반영합니다.
+이 전역 preflight가 하나라도 실패하면 `STALE`로 끝내고 Notion에 아무것도 쓰지 않습니다.
+모두 같을 때만 정확히 승인된 operation을 적용합니다. 같은 Notion 페이지·안전 단계에서
+연속된 승인 속성들은 한 번의 페이지 update로 묶지만, 제목 생성·변경과 후속 속성은 별도
+요청이 될 수 있습니다. 묶음 안의 각 operation은 제안 revision과 전체 digest에 이미
+포함되어 있어야 합니다. 배치 처리는 승인 범위를 합치거나 넓히지 않습니다.
+
+Notion은 여러 페이지를 하나의 트랜잭션으로 제공하지 않으므로 쓰기 시작 뒤 네트워크가
+중단되면 일부 페이지가 이미 반영되었을 수 있습니다. Gateway는 쓰기 전에 만든 outbox와
+operation ID를 이용해 이미 성공한 작업을 판별하고, 동일 영수증의 정확한 나머지 범위만
+idempotent하게 복구합니다. 사용자가 편집한 값은 Notion 성공 확인 후 Wiki 승인
+오버레이에도 반영합니다.
 
 ## 6. 독립 사용자 정정
 
@@ -112,6 +206,7 @@ operation을 적용합니다. 사용자가 편집한 값은 Notion 성공 확인
 
 ```text
 /nx_schema_plan government-support-evidence <NOTION_PARENT_PAGE_ID>
+/nx_schema_plan case-history <NOTION_PARENT_PAGE_ID>
 /nx_schema_show <schema-proposal-id> <revision>
 /nx_schema_approve <schema-proposal-id> <revision> <full-64-character-digest>
 ```
@@ -130,7 +225,14 @@ GET-only 검증을 수행합니다. 복구 완료 뒤 데이터 반영에는 새
 - `FAILED` before write: 원격 쓰기 없이 실패했습니다. 원인을 고친 뒤 다시 요청합니다.
 - partial `FAILED`: `/nx_recover`로 성공 operation을 제외한 새 revision을 만들고 다시
   승인합니다.
-- `APPLYING` crash: 동일한 승인 범위와 outbox만 idempotent reconciliation합니다.
+- `APPLYING` crash: 같은 프로세스에서는 동일한 승인 범위와 outbox만 idempotent
+  reconciliation합니다. Gateway 재시작으로 승인 비밀이 회전했다면
+  `/nx_recover <proposal-id> <revision>`을 보냅니다. 살아 있는 apply worker가 없고
+  저장된 영수증·사용된 nonce·outbox가 정확히 일치할 때만 Notion 재쓰기 없이 복구
+  revision을 만들며, 적용에는 다시 별도 승인이 필요합니다.
+- 오래 걸리는 `/nx_sync`: 0.6.0 이상에서는 첫 `[NX_SYNC_ACCEPTED]` 뒤 최종
+  `[NX_SYNC_PROPOSAL_READY]` 또는 `[NX_SYNC_NO_CHANGES]`를 기다립니다. 중간에 다시
+  보내면 `[NX_SYNC_IN_PROGRESS]`만 반환하며 새 실행을 만들지 않습니다.
 - Wiki bootstrap 실패: 이전 Wiki를 유지하고 실패한 입력의 체크포인트를 이동하지
   않습니다.
 - mail poison message: 해당 UIDL을 격리·보고하고 나머지 안전한 메시지만 처리합니다.

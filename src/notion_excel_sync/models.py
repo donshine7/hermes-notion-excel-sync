@@ -14,6 +14,9 @@ JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "Jso
 
 SCHEMA_APPROVAL_PURPOSE = "notion_schema_create/v1"
 SCHEMA_RECOVERY_PURPOSE = "notion_schema_recovery/v1"
+EXCEL_SYNC_PURPOSE = "excel_sync/v1"
+USER_CORRECTION_PURPOSE = "user_correction/v1"
+CORRECTION_OVERLAY_RECOVERY_MODE = "wiki_overlay_only/v1"
 
 
 def utc_now() -> datetime:
@@ -26,6 +29,36 @@ def canonical_json(value: Any) -> str:
 
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def source_basis_digest(refs: list[SourceRef] | tuple[SourceRef, ...]) -> str:
+    """Hash only the source cells whose values justify one operation.
+
+    Workbook version and whole-file hash are intentionally omitted. This lets
+    an approved override survive unrelated workbook edits while still
+    detecting a change to the exact cited row/cells/raw value.
+    """
+
+    rows = [
+        {
+            "sheet": ref.sheet,
+            "row": ref.row,
+            "cells": ref.cells,
+            "raw_value": ref.raw_value,
+        }
+        for ref in refs
+    ]
+    return sha256_json(
+        sorted(
+            rows,
+            key=lambda item: (
+                str(item["sheet"]).casefold(),
+                int(item["row"]),
+                str(item["cells"]),
+                sha256_json(item["raw_value"]),
+            ),
+        )
+    )
 
 
 class ChangeKind(StrEnum):
@@ -51,6 +84,11 @@ class ProposalStatus(StrEnum):
     APPLYING = "applying"
     COMMITTED = "committed"
     FAILED = "failed"
+
+
+class ProposalPurpose(StrEnum):
+    EXCEL_SYNC = EXCEL_SYNC_PURPOSE
+    USER_CORRECTION = USER_CORRECTION_PURPOSE
 
 
 class SchemaProposalStatus(StrEnum):
@@ -257,6 +295,8 @@ class ProposalRevision:
     created_at: datetime = field(default_factory=utc_now)
     expires_at: datetime | None = None
     knowledge_binding: dict[str, JsonValue] = field(default_factory=dict)
+    purpose: ProposalPurpose = ProposalPurpose.EXCEL_SYNC
+    correction_binding: dict[str, JsonValue] = field(default_factory=dict)
 
     @property
     def digest(self) -> str:
@@ -273,6 +313,13 @@ class ProposalRevision:
         # An empty binding is semantically equivalent to a pre-Wiki proposal.
         if self.knowledge_binding:
             payload["knowledge_binding"] = self.knowledge_binding
+        # Preserve the digest of proposals created before independent
+        # Telegram corrections. The non-default purpose is still explicitly
+        # domain-separated from ordinary Excel synchronization.
+        if self.purpose is not ProposalPurpose.EXCEL_SYNC:
+            payload["purpose"] = self.purpose.value
+        if self.correction_binding:
+            payload["correction_binding"] = self.correction_binding
         return sha256_json(payload)
 
 

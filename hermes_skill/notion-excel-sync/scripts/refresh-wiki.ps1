@@ -18,6 +18,7 @@ if ($ForceFull) {
     $cliArguments += "--force-full"
 }
 
-# This command uses Microsoft Graph GET only. It replaces the protected local
-# Wiki generation atomically and never changes OneDrive, Excel, or Notion.
+# This command reads only the configured immutable local source. It replaces
+# the protected Wiki generation atomically and never changes the source,
+# Excel, or Notion.
 Invoke-NesCli -ProjectRoot $ProjectRoot -CliArguments $cliArguments

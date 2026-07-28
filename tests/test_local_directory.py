@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -270,7 +271,7 @@ def test_online_only_files_follow_explicit_hydration_policy(
         *args: object,
         **kwargs: object,
     ) -> object:
-        if path == document:
+        if path == local_files.windows_extended_path(document):
             source_opens.append(mode)
         return real_open(path, mode, *args, **kwargs)
 
@@ -296,6 +297,27 @@ def test_online_only_files_follow_explicit_hydration_policy(
 
     assert allowed.download_current("local-drive", allowed_entry.item_id) == expected_bytes
     assert source_opens == ["rb"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended paths only")
+def test_windows_long_source_paths_are_scanned_and_read(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    extended_source = local_files.windows_extended_path(source)
+    current = extended_source
+    while len(os.fspath(current / "document.txt")) <= 280:
+        current /= "deep-directory-segment"
+    current.mkdir(parents=True)
+    document = current / "document.txt"
+    document.write_text("long path content", encoding="utf-8")
+
+    adapter = _adapter(source, tmp_path / "runtime")
+    entries = adapter.walk_folder("local-drive", adapter.root_item_id)
+    file_entry = next(entry for entry in entries if not entry.is_folder)
+
+    assert len(os.fspath(document)) > 260
+    assert adapter.download_current("local-drive", file_entry.item_id) == (
+        b"long path content"
+    )
 
 
 def test_drive_scope_and_traversal_limits_fail_closed(tmp_path: Path) -> None:

@@ -389,6 +389,38 @@ class WikiParallelDocumentTests(unittest.TestCase):
                             config=config,
                         )
 
+    def test_extractor_subprocess_cannot_write_runtime_bytecode(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["extractor-worker"],
+            returncode=20,
+            stdout=(
+                b'{"schema_version":1,"status":"document_rejected",'
+                b'"code":"extractor_rejected_document"}'
+            ),
+            stderr=b"",
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            config = _config(Path(folder) / "wiki.db")
+            with patch(
+                "notion_excel_sync.knowledge.refresh._run_extractor_process",
+                return_value=completed,
+            ) as run:
+                with self.assertRaisesRegex(
+                    WikiRefreshError,
+                    "extractor_rejected_document",
+                ):
+                    _isolated_extract(
+                        b"document",
+                        ".txt",
+                        work_dir=Path(folder) / "work",
+                        config=config,
+                    )
+
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(command[1:3], ["-B", "-I"])
+        self.assertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
+
     def test_unknown_extractor_error_is_fatal(self) -> None:
         drive = _DocumentDrive({"01": b"one"})
         with tempfile.TemporaryDirectory() as folder:

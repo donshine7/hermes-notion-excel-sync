@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping
 
 from notion_excel_sync.adapters.excel import ExcelSnapshotReader, diff_snapshots
 from notion_excel_sync.adapters.onedrive import DriveVersion, OneDriveReadOnlyClient
+from notion_excel_sync.ai.service import StructuredAIService
 from notion_excel_sync.domain import (
     ACTUAL_COST_CONTEXT_METADATA,
     EVIDENCE_CONTEXT_METADATA,
@@ -20,11 +22,14 @@ from notion_excel_sync.domain import (
 from notion_excel_sync.models import (
     ChangeKind,
     KnowledgeRef,
+    ProposalAction,
+    ProposalOperation,
     ProposalRevision,
     ProposedChange,
     RecordChange,
     ReviewItem,
     SourceRecord,
+    SourceRef,
     WorkbookSnapshot,
     sha256_json,
 )
@@ -52,10 +57,363 @@ class PreparationResult:
     checkpoint_advanced: bool = False
     wiki_generation_digest: str | None = None
     wiki_shadow_hits: int = 0
+    pending_staged: int = 0
+    ai_attempted: int = 0
+    ai_completed: int = 0
+    ai_failures: int = 0
+    ai_failure_codes: dict[str, int] = field(default_factory=dict)
+
+
+_NOTION_TITLE_TEXT_LIMIT = 2_000
+_REVIEW_IDENTITY_VERSION = 2
+_REVIEW_TITLE_DIGEST_LENGTH = 16
+_REVIEW_LOCATOR_LIMIT = 96
+_PROPOSAL_BATCH_MAX_ENTITIES = 25
+_PROPOSAL_BATCH_MAX_OPERATIONS = 500
+_LEGACY_ROW_PROVENANCE_ANALYZER = "provenance_tracker"
+_LEGACY_ROW_PROVENANCE_DATABASE = "근거자료"
+_REVIEW_MATERIALIZER_ANALYZER = "review_materializer"
+_REVIEW_DATABASE = "검토함"
+_REVIEW_CONFIDENCE_PROPERTY = "신뢰도"
+_BOOTSTRAP_REVIEW_MIN_CONFIDENCE = 0.8
+_OBSOLETE_PARTY_ANALYZER_VERSION = "1.0.0"
+
+
+def _retire_obsolete_party_pending(
+    database: StateDatabase,
+    pending_operations: list[ProposalOperation],
+    *,
+    actor: str,
+) -> tuple[list[ProposalOperation], int]:
+    """Retire only unreviewed bootstrap party output from the unsafe v1 parser."""
+
+    obsolete = [
+        operation
+        for operation in pending_operations
+        if (
+            operation.change.analyzer == "party"
+            and operation.change.analyzer_version
+            == _OBSOLETE_PARTY_ANALYZER_VERSION
+            and operation.change.target_database == "당사자"
+            and operation.action is ProposalAction.DEFER
+            and not operation.user_override
+        )
+    ]
+    if not obsolete:
+        return pending_operations, 0
+    operation_ids = {operation.change.operation_id for operation in obsolete}
+    retired = database.retire_pending_operations(
+        operation_ids,
+        expected_analyzer="party",
+        expected_database="당사자",
+        actor=actor,
+        reason=(
+            "Party analyzer v1.1 rematerializes the current Excel snapshot "
+            "without splitting legal-name commas or auto-registering composite names"
+        ),
+    )
+    if retired != len(operation_ids):
+        raise RuntimeError("Obsolete party pending retirement count mismatch")
+    return (
+        [
+            operation
+            for operation in pending_operations
+            if operation.change.operation_id not in operation_ids
+        ],
+        retired,
+    )
+
+
+def _review_group_confidence(
+    operations: list[ProposalOperation],
+) -> float | None:
+    for operation in operations:
+        if operation.change.property_name != _REVIEW_CONFIDENCE_PROPERTY:
+            continue
+        value = operation.approved_value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+    return None
+
+
+def _retire_obsolete_bootstrap_reviews(
+    database: StateDatabase,
+    pending_operations: list[ProposalOperation],
+    *,
+    current_version_id: str,
+    actor: str,
+) -> tuple[list[ProposalOperation], dict[str, int]]:
+    """Retire only stale or low-value review pages before the first checkpoint.
+
+    Rejected first-run proposals can leave durable pending review operations.
+    A later Excel save has a new source version, so retaining the old review
+    identity would duplicate the same uncertainty. Low-confidence bootstrap
+    reviews are also summarized locally instead of creating thousands of
+    Notion pages. Non-review work and high-confidence current reviews are
+    preserved exactly.
+    """
+
+    review_groups: dict[str, list[ProposalOperation]] = {}
+    for operation in pending_operations:
+        change = operation.change
+        if (
+            change.analyzer == _REVIEW_MATERIALIZER_ANALYZER
+            and change.target_database == _REVIEW_DATABASE
+        ):
+            review_groups.setdefault(change.entity_key, []).append(operation)
+
+    stale_ids: set[str] = set()
+    low_confidence_ids: set[str] = set()
+    for group in review_groups.values():
+        source_versions = {
+            ref.version_id
+            for operation in group
+            for ref in operation.change.source_refs
+            if ref.version_id
+        }
+        if source_versions and current_version_id not in source_versions:
+            stale_ids.update(
+                operation.change.operation_id for operation in group
+            )
+            continue
+        confidence = _review_group_confidence(group)
+        if (
+            confidence is not None
+            and confidence < _BOOTSTRAP_REVIEW_MIN_CONFIDENCE
+        ):
+            low_confidence_ids.update(
+                operation.change.operation_id for operation in group
+            )
+
+    retired_ids = stale_ids | low_confidence_ids
+    if retired_ids:
+        database.retire_pending_operations(
+            retired_ids,
+            expected_analyzer=_REVIEW_MATERIALIZER_ANALYZER,
+            expected_database=_REVIEW_DATABASE,
+            actor=actor,
+            reason=(
+                "Superseded first-run reviews and low-confidence bootstrap "
+                "reviews are summarized locally instead of materialized as "
+                "individual Notion pages"
+            ),
+        )
+    return (
+        [
+            operation
+            for operation in pending_operations
+            if operation.change.operation_id not in retired_ids
+        ],
+        {
+            "stale_operations": len(stale_ids),
+            "low_confidence_operations": len(low_confidence_ids),
+            "retired_operations": len(retired_ids),
+        },
+    )
+
+
+def _source_ref_identity(ref: SourceRef) -> dict[str, object]:
+    return {
+        "drive_id": ref.drive_id,
+        "item_id": ref.item_id,
+        "version_id": ref.version_id,
+        "file_hash": ref.file_hash,
+        "sheet": ref.sheet,
+        "row": ref.row,
+        "cells": ref.cells,
+        "raw_value": ref.raw_value,
+    }
+
+
+def _knowledge_ref_identity(ref: KnowledgeRef) -> dict[str, object]:
+    return {
+        "drive_id": ref.drive_id,
+        "item_id": ref.item_id,
+        "version_id": ref.version_id,
+        "content_hash": ref.content_hash,
+        "chunk_locator": ref.chunk_locator,
+        "chunk_hash": ref.chunk_hash,
+        "security_classification": ref.security_classification,
+        "display_name": ref.display_name,
+        "etag": ref.etag,
+        "extractor_version": ref.extractor_version,
+        "policy_version": ref.policy_version,
+        "effective_from": ref.effective_from,
+        "effective_to": ref.effective_to,
+        "authority": ref.authority,
+        "status": ref.status,
+    }
+
+
+def _identity_item_key(item: dict[str, object]) -> str:
+    return json.dumps(
+        item,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _normalized_identity_items(
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Sort citations as before while removing exact semantic duplicates."""
+
+    unique = {_identity_item_key(item): item for item in items}
+    return sorted(
+        unique.values(),
+        key=lambda item: (sha256_json(item), _identity_item_key(item)),
+    )
+
+
+def _normalized_source_refs(refs: list[SourceRef]) -> list[SourceRef]:
+    unique = {
+        _identity_item_key(_source_ref_identity(ref)): ref
+        for ref in refs
+    }
+    return sorted(
+        unique.values(),
+        key=lambda ref: (
+            sha256_json(_source_ref_identity(ref)),
+            _identity_item_key(_source_ref_identity(ref)),
+        ),
+    )
+
+
+def _normalized_knowledge_refs(refs: list[KnowledgeRef]) -> list[KnowledgeRef]:
+    unique = {
+        _identity_item_key(_knowledge_ref_identity(ref)): ref
+        for ref in refs
+    }
+    return sorted(
+        unique.values(),
+        key=lambda ref: (
+            sha256_json(_knowledge_ref_identity(ref)),
+            _identity_item_key(_knowledge_ref_identity(ref)),
+        ),
+    )
+
+
+def _review_identity_payload(review: ReviewItem, version_id: str) -> dict[str, object]:
+    """Bind one review page to every fact that distinguishes its meaning."""
+
+    return {
+        "identity_version": _REVIEW_IDENTITY_VERSION,
+        "version": version_id,
+        "review_type": review.review_type,
+        "title": review.title,
+        "reason": review.reason,
+        "current_value": review.current_value,
+        "proposed_value": review.proposed_value,
+        "confidence": review.confidence,
+        "source_refs": _normalized_identity_items(
+            [_source_ref_identity(ref) for ref in review.source_refs]
+        ),
+        "knowledge_refs": _normalized_identity_items(
+            [_knowledge_ref_identity(ref) for ref in review.knowledge_refs]
+        ),
+    }
+
+
+def _legacy_review_entity_key_for_refs(
+    review: ReviewItem,
+    version_id: str,
+    refs: list[SourceRef],
+) -> str:
+    identity = sha256_json(
+        {
+            "version": version_id,
+            "title": review.title,
+            "refs": [
+                (item.sheet, item.row, item.cells) for item in refs
+            ],
+        }
+    )[:20]
+    return f"review:{identity}"
+
+
+def _legacy_review_entity_key(review: ReviewItem, version_id: str) -> str:
+    """Reproduce the pre-v2 key for the citation order received today."""
+
+    return _legacy_review_entity_key_for_refs(
+        review,
+        version_id,
+        review.source_refs,
+    )
+
+
+def _legacy_review_entity_key_candidates(
+    review: ReviewItem,
+    version_id: str,
+) -> tuple[str, ...]:
+    """Return a bounded set of old order-sensitive keys for safe migration."""
+
+    current_order = _legacy_review_entity_key(review, version_id)
+    canonical_order = _legacy_review_entity_key_for_refs(
+        review,
+        version_id,
+        _normalized_source_refs(review.source_refs),
+    )
+    return tuple(dict.fromkeys((current_order, canonical_order)))
+
+
+def _compact_title_part(value: object, limit: int) -> str:
+    normalized = " ".join(str(value).split())
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[: limit - 1].rstrip()}…"
+
+
+def _review_source_locator(review: ReviewItem) -> str:
+    if review.source_refs:
+        ref = min(review.source_refs, key=lambda item: sha256_json(_source_ref_identity(item)))
+        locator = f"{ref.sheet}!{ref.cells}" if ref.cells else f"{ref.sheet} {ref.row}행"
+    elif review.knowledge_refs:
+        ref = min(
+            review.knowledge_refs,
+            key=lambda item: sha256_json(_knowledge_ref_identity(item)),
+        )
+        locator = f"Wiki {ref.display_name or ref.chunk_locator}"
+    else:
+        locator = review.review_type
+    return _compact_title_part(locator or "근거 미지정", _REVIEW_LOCATOR_LIMIT)
+
+
+def _bounded_review_title(review: ReviewItem, identity: str) -> str:
+    """Keep the visible title readable while making title matching deterministic."""
+
+    base = " ".join(str(review.title).split()) or "검토 항목"
+    suffix = (
+        f" · {_review_source_locator(review)}"
+        f" · {identity[:_REVIEW_TITLE_DIGEST_LENGTH]}"
+    )
+    available = _NOTION_TITLE_TEXT_LIMIT - len(suffix)
+    if len(base) > available:
+        base = f"{base[: max(available - 1, 0)].rstrip()}…"
+    return f"{base}{suffix}"
+
+
+def _bounded_history_title(change: ProposedChange) -> str:
+    """Give each append-only history row a readable, operation-unique title."""
+
+    operation_id = " ".join(str(change.operation_id).split())
+    if len(operation_id) > _REVIEW_LOCATOR_LIMIT:
+        operation_id = (
+            f"{operation_id[: _REVIEW_LOCATOR_LIMIT - 18].rstrip()}…"
+            f"{sha256_json({'operation_id': change.operation_id})[:16]}"
+        )
+    suffix = f" · op {operation_id}"
+    base = f"{change.entity_key} · {change.property_name}"
+    available = _NOTION_TITLE_TEXT_LIMIT - len(suffix)
+    if len(base) > available:
+        base = f"{base[: max(available - 1, 0)].rstrip()}…"
+    return f"{base}{suffix}"
 
 
 class SyncPreparationService:
-    """Read OneDrive, analyze changed rows, and create a non-mutating proposal."""
+    """Read the configured source, analyze changed rows, and create a proposal."""
 
     def __init__(
         self,
@@ -69,6 +427,7 @@ class SyncPreparationService:
         data_source_ids: Mapping[str, str] | None = None,
         notion_schema_provider: Callable[[str], Mapping[str, Any]] | None = None,
         knowledge_provider: AnalyzerKnowledgeProvider | None = None,
+        ai_service: StructuredAIService | None = None,
         first_run_full_reconcile: bool = False,
         snapshot_observer: Callable[[WorkbookSnapshot, bool], None] | None = None,
     ) -> None:
@@ -82,6 +441,7 @@ class SyncPreparationService:
         self.data_source_ids = data_source_ids
         self.notion_schema_provider = notion_schema_provider
         self.knowledge_provider = knowledge_provider
+        self.ai_service = ai_service
         self.first_run_full_reconcile = first_run_full_reconcile
         self.snapshot_observer = snapshot_observer
 
@@ -90,12 +450,12 @@ class SyncPreparationService:
     ) -> tuple[DriveVersion, DriveVersion]:
         versions = self.onedrive.list_versions(drive_id, item_id)
         if not versions:
-            raise RuntimeError("OneDrive returned no retained workbook versions")
+            raise RuntimeError("Configured source returned no retained workbook versions")
         latest_time = max(item.last_modified_at for item in versions)
         latest = [item for item in versions if item.last_modified_at == latest_time]
         if len(latest) != 1:
             raise RuntimeError(
-                "OneDrive returned multiple current versions with the same timestamp"
+                "Configured source returned multiple current versions with the same timestamp"
             )
         current = latest[0]
         checkpoint = self.database.get_checkpoint(drive_id, item_id)
@@ -103,7 +463,7 @@ class SyncPreparationService:
             matching = [item for item in versions if item.id == checkpoint["version_id"]]
             if not matching:
                 raise RuntimeError(
-                    "The last committed OneDrive version is no longer retained; manual baseline "
+                    "The last committed source version is no longer retained; manual baseline "
                     "recovery is required"
                 )
             baseline = matching[0]
@@ -138,11 +498,68 @@ class SyncPreparationService:
         chat_id: str,
         source_web_url: str | None = None,
     ) -> PreparationResult:
+        clear_reader_cache = getattr(self.notion_reader, "clear_cache", None)
+        if callable(clear_reader_cache):
+            clear_reader_cache()
         first_run = self.database.get_checkpoint(drive_id, item_id) is None
         baseline_version, current_version = self._versions(
             drive_id, item_id, initial_cutoff
         )
+        bootstrap_review_retirement = {
+            "stale_operations": 0,
+            "low_confidence_operations": 0,
+            "retired_operations": 0,
+        }
+        obsolete_party_operations_retired = 0
         pending_operations = self.database.load_pending_operations()
+        legacy_provenance = [
+            operation
+            for operation in pending_operations
+            if (
+                operation.change.analyzer == _LEGACY_ROW_PROVENANCE_ANALYZER
+                and operation.change.target_database
+                == _LEGACY_ROW_PROVENANCE_DATABASE
+            )
+        ]
+        if legacy_provenance:
+            retired_ids = {
+                operation.change.operation_id
+                for operation in legacy_provenance
+            }
+            self.database.retire_pending_operations(
+                retired_ids,
+                expected_analyzer=_LEGACY_ROW_PROVENANCE_ANALYZER,
+                expected_database=_LEGACY_ROW_PROVENANCE_DATABASE,
+                actor=requested_by,
+                reason=(
+                    "Excel row provenance remains in immutable SourceRef, "
+                    "local audit state, and Wiki; it is no longer materialized "
+                    "as one Notion page per row"
+                ),
+            )
+            pending_operations = [
+                operation
+                for operation in pending_operations
+                if operation.change.operation_id not in retired_ids
+            ]
+        if first_run:
+            (
+                pending_operations,
+                bootstrap_review_retirement,
+            ) = _retire_obsolete_bootstrap_reviews(
+                self.database,
+                pending_operations,
+                current_version_id=current_version.id,
+                actor=requested_by,
+            )
+            (
+                pending_operations,
+                obsolete_party_operations_retired,
+            ) = _retire_obsolete_party_pending(
+                self.database,
+                pending_operations,
+                actor=requested_by,
+            )
         wiki_pending_count = sum(
             bool(operation.change.knowledge_refs) for operation in pending_operations
         )
@@ -223,7 +640,7 @@ class SyncPreparationService:
             row_changes = diff_snapshots(baseline, current)
         _, current_after_download = self._versions(drive_id, item_id, initial_cutoff)
         if current_after_download.id != current_version.id:
-            raise RuntimeError("OneDrive source changed while the workbook was downloaded")
+            raise RuntimeError("Configured source changed while the workbook was read")
         if self.snapshot_observer is not None:
             self.snapshot_observer(current, full_reconcile)
         if not row_changes and not pending_changes:
@@ -251,6 +668,7 @@ class SyncPreparationService:
             "source_web_url": source_web_url,
             "baseline_version_id": baseline_version.id,
             "current_version_id": current_version.id,
+            "captured_at": current.captured_at.isoformat(),
             ACTUAL_COST_CONTEXT_METADATA: build_actual_cost_context(current.records),
         }
         if knowledge.available:
@@ -280,11 +698,62 @@ class SyncPreparationService:
                 metadata=metadata,
                 knowledge_refs_by_analyzer=knowledge.verified_refs_by_analyzer,
             )
-        domain_changes = [change for run in runs for change in run.proposed_changes]
+        ai_report = (
+            self.ai_service.enrich_excel_runs(
+                runs,
+                verified_context_by_analyzer=(
+                    knowledge.verified_context_by_analyzer
+                ),
+                verified_refs_by_analyzer=(
+                    knowledge.verified_ai_refs_by_analyzer
+                ),
+            )
+            if runs and self.ai_service is not None
+            else None
+        )
+        domain_changes = [
+            change
+            for run in runs
+            for change in run.proposed_changes
+            if ai_report is None
+            or change.operation_id not in ai_report.replaced_operation_ids
+        ]
+        if ai_report is not None:
+            domain_changes.extend(ai_report.proposed_changes)
         reviews = [review for run in runs for review in run.review_items]
         reviews.extend(self._unrouted_reviews(runs))
+        if ai_report is not None:
+            reviews.extend(ai_report.review_items)
+            self.database.audit(
+                "structured_ai_analysis",
+                ai_report.audit_payload(),
+                None,
+                requested_by,
+            )
+        bootstrap_reviews_suppressed = 0
+        if full_reconcile:
+            bootstrap_reviews_suppressed = sum(
+                review.confidence < _BOOTSTRAP_REVIEW_MIN_CONFIDENCE
+                for review in reviews
+            )
+            reviews = [
+                review
+                for review in reviews
+                if review.confidence >= _BOOTSTRAP_REVIEW_MIN_CONFIDENCE
+            ]
+            self.database.audit(
+                "bootstrap_review_filter",
+                {
+                    "source_version_id": current.version_id,
+                    "minimum_confidence": _BOOTSTRAP_REVIEW_MIN_CONFIDENCE,
+                    "materialized_review_pages": len(reviews),
+                    "suppressed_review_pages": bootstrap_reviews_suppressed,
+                    **bootstrap_review_retirement,
+                },
+                None,
+                requested_by,
+            )
         all_changes = self._deduplicate(domain_changes)
-        all_changes.extend(self._provenance_changes(current, row_changes, source_web_url))
         all_changes.extend(self._review_changes(reviews, current.version_id))
         all_changes = self._deduplicate(all_changes)
         pending_regular = [
@@ -299,9 +768,15 @@ class SyncPreparationService:
         ]
         all_changes = self._merge_pending(all_changes, pending_regular)
         self._refresh_current_values(all_changes)
-        history_changes = self._history_changes(all_changes)
+        # The command-time T0 snapshot establishes the initial Notion state; it
+        # is not a sequence of post-baseline changes. Detailed history begins
+        # with later incremental syncs. Previously deferred history is retained.
+        history_changes = [] if full_reconcile else self._history_changes(all_changes)
         history_changes = self._merge_pending(history_changes, pending_history)
-        self._refresh_current_values(history_changes)
+        # Fresh history rows are append-only and carry an operation-bound unique
+        # title, so they cannot have a current value before approval. Deferred
+        # history may already be mapped to a page and still needs an exact read.
+        self._refresh_pending_history_values(history_changes, pending_history)
         all_changes.extend(history_changes)
         all_changes = self._sort_changes(all_changes)
         if not all_changes:
@@ -321,16 +796,17 @@ class SyncPreparationService:
                 checkpoint_advanced=full_reconcile,
             )
 
+        proposal_changes, staged_pending = self._proposal_batch(all_changes)
         proposal = self.proposals.create(
             source_version_id=current.version_id,
             source_file_hash=current.file_hash,
             requested_by=requested_by,
             chat_id=chat_id,
-            changes=all_changes,
+            changes=proposal_changes,
             defer_databases=(
                 {
                     change.target_database
-                    for change in all_changes
+                    for change in proposal_changes
                     if change.target_database not in self.available_data_sources
                 }
                 if self.available_data_sources is not None
@@ -338,7 +814,7 @@ class SyncPreparationService:
             ),
             notion_binding=(
                 build_notion_binding(
-                    all_changes,
+                    proposal_changes,
                     self.data_source_ids,
                     schema_provider=self.notion_schema_provider,
                 )
@@ -347,9 +823,10 @@ class SyncPreparationService:
             ),
             knowledge_binding=(
                 knowledge.binding
-                if any(change.knowledge_refs for change in all_changes)
+                if any(change.knowledge_refs for change in proposal_changes)
                 else None
             ),
+            staged_pending_changes=staged_pending,
         )
         proposal = self.proposals.request_approval(proposal.proposal_id)
         self.database.audit(
@@ -359,10 +836,19 @@ class SyncPreparationService:
                 "current": current.version_id,
                 "row_changes": len(row_changes),
                 "operations": len(proposal.operations),
+                "staged_pending_operations": len(staged_pending),
+                "bootstrap_reviews_suppressed": bootstrap_reviews_suppressed,
+                "bootstrap_review_retirement": bootstrap_review_retirement,
+                "obsolete_party_operations_retired": (
+                    obsolete_party_operations_retired
+                ),
                 "wiki_generation_digest": knowledge.binding.get(
                     "generation_digest", ""
                 ),
                 "wiki_shadow_hits": sum(knowledge.shadow_counts.values()),
+                "structured_ai": (
+                    ai_report.audit_payload() if ai_report is not None else {}
+                ),
             },
             proposal.proposal_id,
             requested_by,
@@ -380,6 +866,13 @@ class SyncPreparationService:
                 else None
             ),
             wiki_shadow_hits=sum(knowledge.shadow_counts.values()),
+            pending_staged=len(staged_pending),
+            ai_attempted=ai_report.attempted if ai_report is not None else 0,
+            ai_completed=ai_report.completed if ai_report is not None else 0,
+            ai_failures=ai_report.failures if ai_report is not None else 0,
+            ai_failure_codes=(
+                dict(ai_report.failure_codes) if ai_report is not None else {}
+            ),
         )
 
     def _build_evidence_context(
@@ -472,6 +965,32 @@ class SyncPreparationService:
             if key in current_values:
                 change.current_value = current_values[key]
 
+    def _refresh_pending_history_values(
+        self,
+        history_changes: list[ProposedChange],
+        pending_history: list[ProposedChange],
+    ) -> None:
+        pending_keys = {
+            (
+                change.target_database,
+                change.entity_key,
+                change.property_name,
+            )
+            for change in pending_history
+        }
+        self._refresh_current_values(
+            [
+                change
+                for change in history_changes
+                if (
+                    change.target_database,
+                    change.entity_key,
+                    change.property_name,
+                )
+                in pending_keys
+            ]
+        )
+
     @staticmethod
     def _merge_pending(
         fresh: list[ProposedChange], pending: list[ProposedChange]
@@ -545,23 +1064,103 @@ class SyncPreparationService:
         self, reviews: list[ReviewItem], version_id: str
     ) -> list[ProposedChange]:
         result: list[ProposedChange] = []
+        unique: dict[str, ReviewItem] = {}
+        legacy_noncanonical_key_by_identity: dict[str, str] = {}
+        legacy_canonical_key_by_identity: dict[str, str] = {}
+        legacy_keys_by_identity: dict[str, set[str]] = {}
+        legacy_groups: dict[str, set[str]] = {}
+        mapping_cache: dict[str, dict[str, str] | None] = {}
+
+        def mapping_for(entity_key: str) -> dict[str, str] | None:
+            if entity_key not in mapping_cache:
+                mapping_cache[entity_key] = self.database.get_entity_mapping(
+                    "검토함",
+                    entity_key,
+                )
+            return mapping_cache[entity_key]
+
         for review in reviews:
-            identity = sha256_json(
-                {
-                    "version": version_id,
-                    "title": review.title,
-                    "refs": [
-                        (item.sheet, item.row, item.cells) for item in review.source_refs
-                    ],
-                }
-            )[:20]
+            identity = sha256_json(_review_identity_payload(review, version_id))
+            unique.setdefault(identity, review)
+            legacy_keys = _legacy_review_entity_key_candidates(
+                review,
+                version_id,
+            )
+            current_key = legacy_keys[0]
+            canonical_key = legacy_keys[-1]
+            legacy_canonical_key_by_identity[identity] = canonical_key
+            if current_key != canonical_key:
+                legacy_noncanonical_key_by_identity[identity] = min(
+                    current_key,
+                    legacy_noncanonical_key_by_identity.get(
+                        identity,
+                        current_key,
+                    ),
+                )
+
+        for identity in unique:
+            legacy_keys = {legacy_canonical_key_by_identity[identity]}
+            noncanonical_key = legacy_noncanonical_key_by_identity.get(
+                identity
+            )
+            if noncanonical_key is not None:
+                legacy_keys.add(noncanonical_key)
+            legacy_keys_by_identity[identity] = legacy_keys
+            for legacy_key in legacy_keys:
+                legacy_groups.setdefault(legacy_key, set()).add(identity)
+
+        for identity in sorted(unique):
+            review = unique[identity]
             entity_key = f"review:{identity}"
+            title = _bounded_review_title(review, identity)
+            source_refs = _normalized_source_refs(review.source_refs)
+            knowledge_refs = _normalized_knowledge_refs(
+                review.knowledge_refs
+            )
+
+            # New-style mappings are exact. A legacy mapping is reused only
+            # when every order-sensitive legacy key belongs only to this
+            # semantic review and every stored mapping resolves to one
+            # identical page/title target.
+            mapping = mapping_for(entity_key)
+            legacy_keys = sorted(legacy_keys_by_identity[identity])
+            if mapping is None and all(
+                legacy_groups[legacy_key] == {identity}
+                for legacy_key in legacy_keys
+            ):
+                legacy_mappings = [
+                    (legacy_key, legacy_mapping)
+                    for legacy_key in legacy_keys
+                    if (
+                        legacy_mapping := mapping_for(legacy_key)
+                    )
+                    is not None
+                ]
+                mapping_targets = {
+                    (
+                        legacy_mapping.get("notion_page_id"),
+                        legacy_mapping.get("match_value"),
+                    )
+                    for _, legacy_mapping in legacy_mappings
+                }
+                valid_mapping_target = bool(mapping_targets) and all(
+                    isinstance(page_id, str)
+                    and bool(page_id)
+                    and isinstance(match_value, str)
+                    and bool(match_value)
+                    for page_id, match_value in mapping_targets
+                )
+                if valid_mapping_target and len(mapping_targets) == 1:
+                    entity_key, mapping = legacy_mappings[0]
+            if mapping is not None and mapping.get("match_value"):
+                title = str(mapping["match_value"])
+
             evidence = "; ".join(
                 f"{item.sheet}!{item.cells} (v{item.version_id})"
-                for item in review.source_refs
+                for item in source_refs
             )
             fields: list[tuple[str, object, float]] = [
-                ("검토항목", review.title, 1.0),
+                ("검토항목", title, 1.0),
                 ("검토유형", self._review_type(review.review_type), 1.0),
                 ("상태", "대기", 1.0),
                 ("현재값", _display_value(review.current_value), review.confidence),
@@ -580,58 +1179,16 @@ class SyncPreparationService:
                         kind=ChangeKind.CREATE,
                         current_value=None,
                         proposed_value=value,
-                        analyzer="review_materializer",
+                        analyzer=(
+                            "llm_review_materializer"
+                            if review.review_type.startswith("AI ")
+                            else "review_materializer"
+                        ),
                         analyzer_version="1.0.0",
                         confidence=confidence,
                         reason="분석 결과의 불확실성을 사용자 승인 후 검토함에 기록합니다.",
-                        source_refs=review.source_refs,
-                        knowledge_refs=review.knowledge_refs,
-                    )
-                )
-        return result
-
-    @staticmethod
-    def _provenance_changes(
-        snapshot: WorkbookSnapshot,
-        row_changes: list,
-        source_web_url: str | None,
-    ) -> list[ProposedChange]:
-        result: list[ProposedChange] = []
-        for change in row_changes:
-            record = change.after or change.before
-            if record is None or not record.source_refs:
-                continue
-            refs = record.source_refs
-            source = refs[0]
-            entity_key = f"source:{source.version_id}:{record.sheet}:{record.row}"
-            title = f"Excel {record.sheet} {record.row}행 (v{source.version_id})"
-            fields: list[tuple[str, object]] = [
-                ("근거명", title),
-                ("driveItem ID", source.item_id),
-                ("버전ID", source.version_id),
-                ("SHA256", source.file_hash),
-                ("원본유형", "엑셀"),
-                ("수집일시", snapshot.captured_at.isoformat()),
-                ("파싱상태", "완료"),
-                ("보안등급", "내부"),
-                ("요약", f"{record.sheet} 시트 {record.row}행 변경분"),
-            ]
-            if source_web_url:
-                fields.append(("OneDrive URL", source_web_url))
-            for property_name, value in fields:
-                result.append(
-                    ProposedChange(
-                        target_database="근거자료",
-                        entity_key=entity_key,
-                        property_name=property_name,
-                        kind=ChangeKind.CREATE,
-                        current_value=None,
-                        proposed_value=value,
-                        analyzer="provenance_tracker",
-                        analyzer_version="1.0.0",
-                        confidence=1.0,
-                        reason="변경 제안의 OneDrive·Excel 원본 위치를 보존합니다.",
-                        source_refs=refs,
+                        source_refs=source_refs,
+                        knowledge_refs=knowledge_refs,
                     )
                 )
         return result
@@ -646,7 +1203,7 @@ class SyncPreparationService:
             change_type = "생성" if change.kind is ChangeKind.CREATE else "값변경"
             area = _history_area(change.target_database)
             fields: list[tuple[str, object]] = [
-                ("변경명", f"{change.entity_key} · {change.property_name}"),
+                ("변경명", _bounded_history_title(change)),
                 ("변경유형", change_type),
                 ("변경영역", area),
                 ("이전값", _display_value(change.current_value)),
@@ -682,6 +1239,36 @@ class SyncPreparationService:
         return result
 
     @staticmethod
+    def _proposal_batch(
+        changes: list[ProposedChange],
+    ) -> tuple[list[ProposedChange], list[ProposedChange]]:
+        """Return one reviewable page-atomic prefix and its durable backlog."""
+
+        grouped: dict[tuple[str, str], list[ProposedChange]] = {}
+        for change in changes:
+            grouped.setdefault(
+                (change.target_database, change.entity_key),
+                [],
+            ).append(change)
+
+        selected: list[ProposedChange] = []
+        staged: list[ProposedChange] = []
+        selected_entities = 0
+        boundary_reached = False
+        for group in grouped.values():
+            if not boundary_reached and selected and (
+                selected_entities >= _PROPOSAL_BATCH_MAX_ENTITIES
+                or len(selected) + len(group) > _PROPOSAL_BATCH_MAX_OPERATIONS
+            ):
+                boundary_reached = True
+            if boundary_reached:
+                staged.extend(group)
+                continue
+            selected.extend(group)
+            selected_entities += 1
+        return selected, staged
+
+    @staticmethod
     def _sort_changes(changes: list[ProposedChange]) -> list[ProposedChange]:
         order = {
             "근거자료": 0,
@@ -692,6 +1279,7 @@ class SyncPreparationService:
             "비용·청구": 4,
             "정부지원사업 증빙": 5,
             "기일": 6,
+            "사건 히스토리": 6,
             "등록결정 후속관리": 6,
             "연락이력": 6,
             "검토함": 7,
@@ -707,7 +1295,7 @@ class SyncPreparationService:
                 == NOTION_DEFINITIONS[item.target_database].title_property
                 else 1,
                 item.target_database,
-                item.entity_key,
+                _natural_sort_key(item.entity_key),
                 item.property_name,
             ),
         )
@@ -719,6 +1307,14 @@ def _display_value(value: object) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
+
+
+def _natural_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"([0-9]+)", str(value))
+        if part
+    )
 
 
 def _history_area(database: str) -> str:

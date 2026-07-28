@@ -283,6 +283,9 @@ class HiworksIncrementalMailReader:
     ) -> HiworksMailBatch:
         if sent_after is not None and sent_after.tzinfo is None:
             raise ValueError("sent_after must include a timezone")
+        baseline_utc = (
+            sent_after.astimezone(UTC) if sent_after is not None else None
+        )
         known_uidls = {_validated_uidl(value) for value in seen_uidls}
         known_message_ids = {
             key
@@ -337,10 +340,18 @@ class HiworksIncrementalMailReader:
                 if message_id_key:
                     checkpoint_message_ids.add(message_id_key)
 
+                if baseline_utc is not None and header.sent_at is None:
+                    messages.append(
+                        _header_only_message(
+                            header,
+                            reason="unverifiable_timestamp",
+                        )
+                    )
+                    continue
                 if (
-                    sent_after is not None
+                    baseline_utc is not None
                     and header.sent_at is not None
-                    and header.sent_at < sent_after.astimezone(UTC)
+                    and header.sent_at <= baseline_utc
                 ):
                     messages.append(
                         _header_only_message(

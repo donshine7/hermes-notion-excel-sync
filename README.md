@@ -13,6 +13,9 @@ Hermes가 Telegram의 명시적 요청을 받아, 노트북의 읽기 전용 Exc
   이름 변경, 이동, 삭제 또는 덮어쓰기를 하지 않습니다.
 - 최초 기준시점 `T0`는 미리 정한 날짜가 아니라, 최초로 인증된 `/nx_sync` 명령을 받은
   시각입니다.
+- `T0` 실행은 그 시점의 Excel 전체와 Notion 현재값을 대조해 기준선을 세우는 전체
+  reconcile입니다. 기준선 자체를 과거 변경으로 간주하지 않으므로 속성별 `변경이력`은
+  만들지 않으며, 이후 성공 기준선과 비교해 발견한 증분 변경부터 변경이력을 만듭니다.
 - 최초 Wiki는 `T0`의 전체 Excel과 전체 데이터 원본 폴더만으로 만듭니다. 최초 구축에는
   메일을 넣지 않습니다.
 - 이후 Wiki는 마지막 성공 체크포인트 이후의 Excel 변경분, 데이터 폴더 변경분, 그리고
@@ -21,6 +24,9 @@ Hermes가 Telegram의 명시적 요청을 받아, 노트북의 읽기 전용 Exc
   새로 발견된 온라인 전용 파일은 Telegram에서 별도로 승인하지 않으면 내려받지 않습니다.
 - Wiki와 메일은 Notion 변경 권한을 주지 않습니다. Notion은 현재 제안의 ID, 개정번호,
   전체 digest와 정확한 변경 내용을 사용자가 Telegram에서 승인한 경우에만 변경합니다.
+- 인증된 `/nx_sync`에는 즉시 `[NX_SYNC_ACCEPTED]`가 오고, 이미 실행 중이면
+  `[NX_SYNC_IN_PROGRESS]`가 옵니다. 완료 결과는 `[NX_SYNC_PROPOSAL_READY]` 또는
+  `[NX_SYNC_NO_CHANGES]`로 구분됩니다.
 - 사용자가 제안을 수정하면 새 개정번호와 digest를 발급하며 이전 승인은 즉시 무효입니다.
 - 원본 파일, 실제 설정, 토큰, 메일 원문, Wiki 산출물, 상태 DB와 감사 로그는 Git에
   포함하지 않습니다.
@@ -38,6 +44,10 @@ flowchart TD
     D --> M["T0 이후 Hiworks 메일 수집"]
     W0 --> A["분석기 실행"]
     M --> A
+    A --> S["AI 대상 선별<br/>모호한 변경만"]
+    S --> J["구조화 AI 분석<br/>JSON + 원본 인용"]
+    J --> V0["스키마·근거·신뢰도 검증"]
+    V0 --> P
     A --> P["변경제안과 Telegram 검토 카드"]
     P --> U{"사용자 결정"}
     U -->|"수정·제외·보류"| R["새 개정·digest 생성"]
@@ -52,9 +62,13 @@ flowchart TD
 ## 분석 구조
 
 변경된 행과 관련 문서를 분석기 레지스트리로 전달합니다. 기본 분석 영역은 사건 식별,
-당사자, 그룹, 업무 상태, 기일, 실제 사건 비용, 정부지원사업 증빙, 등록결정 후속관리,
-연락, 문서·자료, 관계 및 이상 탐지입니다. 알 수 없는 필드는 버리지 않고 검토 후보로
-남깁니다.
+당사자, 그룹, 업무 상태, 기일, 사건 히스토리, 실제 사건 비용, 정부지원사업 증빙,
+등록결정 후속관리, 연락, 문서·자료, 관계 및 이상 탐지입니다. 알 수 없는 필드는 버리지
+않고 검토 후보로 남깁니다.
+
+`사건 히스토리`는 실제 사건의 시간순 업무 사건을 보관합니다. 기존 `변경이력`은 Notion
+속성 mutation 감사 기록으로 그대로 유지하므로 두 DB의 용도가 섞이지 않습니다. 자세한
+이벤트 규칙은 [사건 히스토리 운영 계약](docs/case-history.md)을 참고하십시오.
 
 비용과 증빙은 분리합니다.
 
@@ -63,6 +77,13 @@ flowchart TD
   증빙할지 분석합니다. 실제 비용을 읽기 전용 제약으로 참조하지만 덮어쓰지 않습니다.
 
 분석기는 Notion writer를 직접 호출할 수 없습니다.
+
+규칙 기반 분석 뒤에는 선택적인 구조화 AI 계층이 있습니다. AI는 모든 행을 읽지 않고
+복합 당사자, 의미가 모호한 변경, 정부지원사업 증빙 검토, 사건 히스토리 요약처럼 규칙만
+으로 확정하기 어려운 변경만 분석합니다. 출력은 JSON Schema, 입력 해시, 원본에 실제
+존재하는 인용문과 신뢰도를 모두 통과해야 합니다. 모델 실패 시 기존 규칙 분석은 계속되고,
+AI에는 Notion 쓰기 도구나 승인 비밀을 제공하지 않습니다. 자세한 내용은
+[구조화 AI 운영 계약](docs/structured-ai.md)을 참고하십시오.
 
 ## LLM Wiki
 
@@ -75,6 +96,10 @@ Wiki는 설정한 로컬 출력 폴더에 세 층으로 구성됩니다.
 Wiki는 원본과 완전히 분리된 파생물입니다. 원본 파일 자체를 복사해 공개 저장소에 넣지
 않고, 세대별 manifest와 해시를 사용해 증분 상태를 추적합니다. 자세한 경계와 신뢰 규칙은
 [LLM Wiki 운영 계약](docs/llm-wiki.md)을 참고하십시오.
+
+`/nx_sync` 준비 중에는 로컬 상태 기록과 위 계약에 따른 Wiki 파생 세대 준비가 일어날 수
+있습니다. 원본 폴더와 Excel, Notion, 그리고 사용자가 승인한 Wiki 오버레이는 변경하지
+않습니다.
 
 ## Telegram 검토
 
@@ -93,8 +118,22 @@ digest를 만들며, 최종 반영에는 다음 형식의 별도 Telegram 메시
 /nx_approve <proposal-id> <revision> <full-64-character-digest>
 ```
 
+대규모 제안도 승인 경계를 완화하지 않습니다. 현재값은 대상 DB별로 묶어 읽되 모호한
+제목이나 대상은 안전하게 실패시키고, 승인 뒤에는 모든 operation을 한 번 더 읽기 전용으로
+검증한 다음 같은 Notion 페이지·안전 단계의 연속된 승인 속성만 한 요청으로 묶습니다.
+제목 생성·변경과 후속 속성은 안전을 위해 별도 요청이 될 수 있습니다. 쓰기 도중 중단되면
+outbox와 operation ID를 사용해 승인된 범위만 복구합니다.
+
 검토 중 수정뿐 아니라 독립적인 사용자 정정 요청도 별도 제안으로 처리합니다. 원본은
 바꾸지 않으며, 별도 승인을 받은 정정만 Notion과 Wiki의 승인 오버레이에 함께 반영합니다.
+독립 정정 요청 형식은 다음과 같습니다.
+
+```text
+/nx_correct {"database":"한국 특허 사건","entity_key":"SS-SYNTHETIC-001","property":"현재상태","value":"보류","reason":"합성 예시 확인","case_number":"SS-SYNTHETIC-001"}
+```
+
+이 명령 자체는 읽기와 proposal 생성만 수행합니다. 이후 Gateway가 표시한 정확한
+`/nx_approve`가 있어야 반영되며, 정정은 Excel 동기화 체크포인트를 전진시키지 않습니다.
 
 ## 빠른 시작
 
@@ -116,6 +155,7 @@ Copy-Item .\config\sync.example.json .\config\sync.local.json
 - `notion.schema_parent_page_id`: 별도 스키마 생성에만 쓰는 허용 상위 페이지 ID
 - `approval.allowed_telegram_users`: 승인 가능한 숫자 사용자 ID
 - `email`: Hiworks POP3 읽기 설정과 비밀키 이름
+- `ai`: 구조화 AI의 shadow/assist/verified 단계, 개인정보 경계와 호출 한도
 
 실제 경로와 식별자는 예제나 Git 추적 파일에 넣지 마십시오.
 
@@ -131,10 +171,20 @@ Notion 읽기 토큰은 보호된 Windows 자격 증명에 저장하고, 쓰기 
 Hermes Gateway의 보호된 실행 환경에만 둡니다. 모델 프로세스에는 쓰기 자격 증명을
 전달하지 않습니다.
 
+플러그인 설치·갱신 뒤에는 보호된 launcher 사본으로 Gateway를 재시작합니다. 이 단계는
+Notion 쓰기 토큰을 마스킹 입력으로만 받고 파일이나 명령행에 저장하지 않습니다.
+
+```powershell
+& (Join-Path $env:LOCALAPPDATA `
+  "hermes\secure-gateway-launcher\restart-hermes-gateway-secure.ps1") `
+  -ProjectRoot $PWD
+```
+
 Notion 아래에 별도 스키마 생성이 필요한 경우에도 데이터 승인과 분리합니다.
 
 ```text
 /nx_schema_plan government-support-evidence <NOTION_PARENT_PAGE_ID>
+/nx_schema_plan case-history <NOTION_PARENT_PAGE_ID>
 /nx_schema_show <schema-proposal-id> <revision>
 /nx_schema_approve <schema-proposal-id> <revision> <full-64-character-digest>
 ```
@@ -149,6 +199,7 @@ Notion 아래에 별도 스키마 생성이 필요한 경우에도 데이터 승
 - [운영 가이드](docs/operations.md)
 - [Telegram 명령](docs/telegram-commands.md)
 - [LLM Wiki 운영 계약](docs/llm-wiki.md)
+- [구조화 AI 운영 계약](docs/structured-ai.md)
 
 ## 개발 검증
 

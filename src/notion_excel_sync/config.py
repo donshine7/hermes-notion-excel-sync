@@ -22,6 +22,7 @@ class ConfigError(ValueError):
 
 _WINDOWS_REPARSE_POINT = 0x400
 _WIKI_RUNTIME_PARTS = ("notion-excel-sync", "wiki")
+_AI_RUNTIME_PARTS = ("notion-excel-sync", "ai")
 
 
 def _normalized_absolute_path(value: str | Path) -> Path:
@@ -97,6 +98,29 @@ def _local_wiki_runtime_root(*, project_root: Path) -> Path:
     return runtime_root
 
 
+def _local_ai_runtime_root(*, project_root: Path) -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        raise ConfigError("LOCALAPPDATA is required for the AI runtime")
+    local_root = _normalized_absolute_path(local_app_data)
+    if not local_root.is_dir():
+        raise ConfigError("LOCALAPPDATA must be an existing local directory")
+    runtime_root = local_root.joinpath(*_AI_RUNTIME_PARTS)
+    project_root = _normalized_absolute_path(project_root)
+    if _path_is_within(runtime_root, project_root) or _path_is_within(
+        project_root, runtime_root
+    ):
+        raise ConfigError("AI runtime must be outside the project directory")
+    cloud_roots = [
+        _normalized_absolute_path(raw)
+        for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+        if (raw := os.environ.get(name, "").strip())
+    ]
+    if any(_path_is_within(runtime_root, root) for root in cloud_roots):
+        raise ConfigError("AI runtime must not be inside a cloud-synced directory")
+    return runtime_root
+
+
 @dataclass(slots=True)
 class OneDriveConfig:
     drive_id: str
@@ -162,6 +186,25 @@ class EmailConfig:
     max_message_bytes: int = 10 * 1024 * 1024
     max_body_bytes: int = 2 * 1024 * 1024
     max_attachment_bytes: int = 20 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class AIConfig:
+    """Structured, advisory AI enrichment with a local output-only cache."""
+
+    enabled: bool = False
+    provider: str = "hermes"
+    task_name: str = "web_extract"
+    model: str | None = None
+    rollout_mode: str = "shadow"
+    privacy_mode: str = "local_only"
+    cache_db: Path = Path("%LOCALAPPDATA%/notion-excel-sync/ai/analysis.db")
+    timeout_seconds: int = 45
+    max_calls_per_sync: int = 8
+    max_mail_calls_per_sync: int = 4
+    max_input_chars: int = 12_000
+    assist_confidence: float = 0.80
+    verified_confidence: float = 0.95
 
 
 @dataclass(slots=True)
@@ -276,6 +319,7 @@ class AppConfig:
     initial_cutoff: datetime
     source: SourceConfig = field(default_factory=SourceConfig)
     email: EmailConfig = field(default_factory=EmailConfig)
+    ai: AIConfig = field(default_factory=AIConfig)
 
     def secret(self, env_name: str, *, required: bool = True) -> str | None:
         gateway_only = env_name.strip().upper().startswith("GATEWAY_RELAY_")
@@ -374,12 +418,15 @@ def load_config(path: str | Path) -> AppConfig:
     approval_raw = raw.get("approval", {})
     wiki_raw = raw.get("wiki", {})
     email_raw = raw.get("email", {})
+    ai_raw = raw.get("ai", {})
     if not isinstance(source_raw, dict):
         raise ConfigError("source must be an object")
     if not isinstance(wiki_raw, dict):
         raise ConfigError("wiki must be an object")
     if not isinstance(email_raw, dict):
         raise ConfigError("email must be an object")
+    if not isinstance(ai_raw, dict):
+        raise ConfigError("ai must be an object")
 
     source_mode = str(source_raw.get("mode", "onedrive")).strip().casefold()
     if source_mode not in {"onedrive", "local_filesystem"}:
@@ -662,6 +709,75 @@ def load_config(path: str | Path) -> AppConfig:
             "email.password_secret must be an environment-style credential name"
         ) from exc
 
+    ai_defaults = AIConfig()
+    ai_enabled = bool(ai_raw.get("enabled", False))
+    ai_provider = str(ai_raw.get("provider", ai_defaults.provider)).strip().casefold()
+    if ai_provider != "hermes":
+        raise ConfigError("ai.provider currently supports hermes only")
+    ai_task_name = str(ai_raw.get("task_name", ai_defaults.task_name)).strip()
+    if not ai_task_name or not ai_task_name.replace("_", "").isalnum():
+        raise ConfigError("ai.task_name must contain only letters, digits, and underscores")
+    ai_rollout_mode = str(
+        ai_raw.get("rollout_mode", ai_defaults.rollout_mode)
+    ).strip().casefold()
+    if ai_rollout_mode not in {"shadow", "assist", "verified"}:
+        raise ConfigError("ai.rollout_mode must be shadow, assist, or verified")
+    ai_privacy_mode = str(
+        ai_raw.get("privacy_mode", ai_defaults.privacy_mode)
+    ).strip().casefold()
+    if ai_privacy_mode not in {"local_only", "redacted_remote"}:
+        raise ConfigError(
+            "ai.privacy_mode must be local_only or redacted_remote"
+        )
+    ai_runtime_root = _local_ai_runtime_root(project_root=base_dir.parent)
+    ai_cache_value = str(
+        ai_raw.get("cache_db", str(ai_runtime_root / "analysis.db"))
+    ).strip()
+    ai_cache_expanded = os.path.expandvars(os.path.expanduser(ai_cache_value))
+    if not Path(ai_cache_expanded).is_absolute():
+        raise ConfigError("ai.cache_db must be an absolute local runtime path")
+    ai_cache_db = _normalized_absolute_path(ai_cache_expanded)
+    if not _path_is_within(ai_cache_db, ai_runtime_root, allow_root=False):
+        raise ConfigError(
+            "ai.cache_db must be inside %LOCALAPPDATA%\\notion-excel-sync\\ai"
+        )
+    if ai_enabled:
+        _assert_no_existing_reparse_component(ai_cache_db)
+    ai_timeout_seconds = int(
+        ai_raw.get("timeout_seconds", ai_defaults.timeout_seconds)
+    )
+    ai_max_calls = int(
+        ai_raw.get("max_calls_per_sync", ai_defaults.max_calls_per_sync)
+    )
+    ai_max_mail_calls = int(
+        ai_raw.get(
+            "max_mail_calls_per_sync",
+            ai_defaults.max_mail_calls_per_sync,
+        )
+    )
+    ai_max_input_chars = int(
+        ai_raw.get("max_input_chars", ai_defaults.max_input_chars)
+    )
+    ai_assist_confidence = float(
+        ai_raw.get("assist_confidence", ai_defaults.assist_confidence)
+    )
+    ai_verified_confidence = float(
+        ai_raw.get("verified_confidence", ai_defaults.verified_confidence)
+    )
+    if min(
+        ai_timeout_seconds,
+        ai_max_calls,
+        ai_max_mail_calls,
+        ai_max_input_chars,
+    ) <= 0:
+        raise ConfigError("AI numeric limits must be positive")
+    if ai_max_mail_calls > ai_max_calls:
+        raise ConfigError(
+            "ai.max_mail_calls_per_sync must not exceed max_calls_per_sync"
+        )
+    if not 0 <= ai_assist_confidence <= ai_verified_confidence <= 1:
+        raise ConfigError("AI confidence thresholds are invalid")
+
     if source_mode == "local_filesystem":
         assert source_excel_path is not None
         onedrive_drive_id = "local"
@@ -762,5 +878,20 @@ def load_config(path: str | Path) -> AppConfig:
             max_message_bytes=email_max_message_bytes,
             max_body_bytes=email_max_body_bytes,
             max_attachment_bytes=email_max_attachment_bytes,
+        ),
+        ai=AIConfig(
+            enabled=ai_enabled,
+            provider=ai_provider,
+            task_name=ai_task_name,
+            model=str(ai_raw.get("model", "")).strip() or None,
+            rollout_mode=ai_rollout_mode,
+            privacy_mode=ai_privacy_mode,
+            cache_db=ai_cache_db,
+            timeout_seconds=ai_timeout_seconds,
+            max_calls_per_sync=ai_max_calls,
+            max_mail_calls_per_sync=ai_max_mail_calls,
+            max_input_chars=ai_max_input_chars,
+            assist_confidence=ai_assist_confidence,
+            verified_confidence=ai_verified_confidence,
         ),
     )

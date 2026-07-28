@@ -16,11 +16,18 @@ from notion_excel_sync.adapters.excel import ExcelSnapshotReader, SheetSpec
 from notion_excel_sync.adapters.local_directory import LocalDirectoryReadOnlyAdapter
 from notion_excel_sync.adapters.local_files import HydrationPolicy
 from notion_excel_sync.adapters.local_workbook import LocalWorkbookReadOnlyClient
-from notion_excel_sync.adapters.notion import HttpNotionGateway
+from notion_excel_sync.adapters.notion import HttpNotionGateway, NotionMatch
 from notion_excel_sync.adapters.onedrive import OneDriveReadOnlyClient
 from notion_excel_sync.adapters.onedrive_auth import build_onedrive_token_provider
+from notion_excel_sync.ai.cache import AIAnalysisCache
+from notion_excel_sync.ai.provider import HermesStructuredAIProvider
+from notion_excel_sync.ai.service import StructuredAIService
 from notion_excel_sync.config import AppConfig, load_config
 from notion_excel_sync.domain import AnalysisPipeline, build_default_registry
+from notion_excel_sync.knowledge.corrections import (
+    ApprovedCorrectionEvent,
+    CorrectionOverlayStore,
+)
 from notion_excel_sync.knowledge.index import WikiIndex
 from notion_excel_sync.knowledge.projection import WikiOutputStore
 from notion_excel_sync.knowledge.provider import AnalyzerKnowledgeProvider
@@ -28,30 +35,72 @@ from notion_excel_sync.knowledge.refresh import OneDriveWikiRefreshService
 from notion_excel_sync.knowledge.retrieval import WikiRetriever
 from notion_excel_sync.models import (
     ApprovalReceipt,
+    ChangeKind,
+    CORRECTION_OVERLAY_RECOVERY_MODE,
     JsonValue,
     ProposalAction,
+    ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
+    ProposedChange,
     WritePreconditionState,
     dataclass_to_dict,
     sha256_json,
 )
-from notion_excel_sync.persistence.database import StateDatabase
+from notion_excel_sync.persistence.database import (
+    ApplyLeaseError,
+    CorrectionEventClaimError,
+    MutationScopeConflict,
+    ProposalInternalScopeConflict,
+    ProposalRejectionError,
+    StateDatabase,
+)
 from notion_excel_sync.security.approval import ApprovalError, ApprovalService
-from notion_excel_sync.security.receipt_io import save_receipt
-from notion_excel_sync.workflow.apply import ApplyReport, ApprovalGatedApplyService
+from notion_excel_sync.security.receipt_io import (
+    receipt_reference,
+    resolve_receipt_reference,
+    save_receipt,
+)
+from notion_excel_sync.workflow.apply import (
+    ApplyReport,
+    ApprovalGatedApplyService,
+    public_apply_failure_code,
+)
+from notion_excel_sync.workflow.corrections import (
+    CORRECTION_COMMAND,
+    CorrectionRequest,
+    CorrectionRequestError,
+    parse_correction_command,
+)
 from notion_excel_sync.workflow.data_sources import configured_data_sources
 from notion_excel_sync.workflow.local_wiki import (
     LOCAL_WIKI_CHECKPOINT_KEY,
     LOCAL_WIKI_DRIVE_ID,
     LocalWikiRefreshOrchestrator,
 )
+from notion_excel_sync.workflow.mail_ingestion import (
+    HiworksMailIngestionService,
+    HiworksMailIngestionStatus,
+)
 from notion_excel_sync.workflow.notion_writer import (
+    NOTION_DEFINITIONS,
     ApprovedNotionWriter,
     ExactNotionMutationVerifier,
     NotionCurrentValueReader,
+    NotionSchemaError,
+    build_correction_target_binding,
+    build_notion_binding,
+    decode_property,
 )
 from notion_excel_sync.workflow.proposals import ProposalError, ProposalService
+from notion_excel_sync.workflow.review_cards import (
+    HISTORY_DATABASE,
+    ReviewCardPageError,
+    build_review_cards,
+    render_review_card_page,
+    unmerged_history_operation_ids,
+)
 from notion_excel_sync.workflow.sync import PreparationResult, SyncPreparationService
 
 
@@ -64,6 +113,7 @@ SHOW_COMMAND = "/nx_show"
 SET_COMMAND = "/nx_set"
 REJECT_COMMAND = "/nx_reject"
 RECOVER_COMMAND = "/nx_recover"
+CORRECT_COMMAND = CORRECTION_COMMAND
 SCHEMA_PLAN_COMMAND = "/nx_schema_plan"
 SCHEMA_SHOW_COMMAND = "/nx_schema_show"
 SCHEMA_REJECT_COMMAND = "/nx_schema_reject"
@@ -86,6 +136,7 @@ RESERVED_COMMANDS = frozenset(
         SET_COMMAND,
         REJECT_COMMAND,
         RECOVER_COMMAND,
+        CORRECT_COMMAND,
         *SCHEMA_COMMANDS,
     }
 )
@@ -93,7 +144,10 @@ _IDENTIFIER = r"[A-Za-z0-9._:-]{1,128}"
 _COMMAND_RE = re.compile(
     rf"/nx_approve ({_IDENTIFIER}) ([1-9][0-9]*) ([0-9A-Fa-f]{{64}})"
 )
-_SHOW_RE = re.compile(rf"/nx_show ({_IDENTIFIER}) ([1-9][0-9]*)(?: ([1-9][0-9]*))?")
+_SHOW_RE = re.compile(
+    rf"/nx_show ({_IDENTIFIER}) ([1-9][0-9]*)"
+    r"(?: ([1-9][0-9]*))?(?: detail ([1-5]))?"
+)
 _SET_RE = re.compile(
     rf"/nx_set ({_IDENTIFIER}) ([1-9][0-9]*) ({_IDENTIFIER}) "
     r"(apply|edit|exclude|defer)(?:\s+(.+))?",
@@ -101,7 +155,6 @@ _SET_RE = re.compile(
 )
 _REJECT_RE = re.compile(rf"/nx_reject ({_IDENTIFIER}) ([1-9][0-9]*)")
 _RECOVER_RE = re.compile(rf"/nx_recover ({_IDENTIFIER}) ([1-9][0-9]*)")
-_SHOW_PAGE_SIZE = 4
 _MAX_EDIT_JSON_CHARS = 2048
 _WIKI_BOOTSTRAP_CHECKPOINT = "wiki-bootstrap"
 _WIKI_EXCEL_CHECKPOINT = "wiki-excel"
@@ -110,6 +163,10 @@ _WIKI_DATA_CHECKPOINT = LOCAL_WIKI_CHECKPOINT_KEY
 
 class HermesGatewayApprovalError(PermissionError):
     """Raised when a Telegram event cannot authorize a proposal."""
+
+    def __init__(self, public_message: str) -> None:
+        super().__init__(public_message)
+        self.public_message = public_message
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +181,7 @@ class ParsedProposalCommand:
     proposal_id: str
     revision: int
     page: int = 1
+    detail_item: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,12 +246,30 @@ def _parse_proposal_command(text: str, pattern: re.Pattern[str]) -> ParsedPropos
     match = pattern.fullmatch(text.strip())
     if match is None:
         command = text.strip().split(maxsplit=1)[0]
-        suffix = " [page]" if command == SHOW_COMMAND else ""
+        suffix = " [page [detail 1-5]]" if command == SHOW_COMMAND else ""
         raise HermesGatewayApprovalError(
             f"Use exactly: {command} <proposal_id> <revision>{suffix}"
         )
-    page = int(match.group(3)) if match.lastindex == 3 and match.group(3) else 1
-    return ParsedProposalCommand(match.group(1), int(match.group(2)), page)
+    page = (
+        int(match.group(3))
+        if match.lastindex is not None
+        and match.lastindex >= 3
+        and match.group(3)
+        else 1
+    )
+    detail_item = (
+        int(match.group(4))
+        if match.lastindex is not None
+        and match.lastindex >= 4
+        and match.group(4)
+        else None
+    )
+    return ParsedProposalCommand(
+        match.group(1),
+        int(match.group(2)),
+        page,
+        detail_item,
+    )
 
 
 def _validate_json_shape(value: object, *, depth: int = 0) -> None:
@@ -237,7 +313,9 @@ def _parse_set_command(text: str) -> ParsedSetCommand:
         try:
             value = json.loads(raw_value, parse_constant=_reject_non_finite_json)
         except (json.JSONDecodeError, ValueError) as exc:
-            raise HermesGatewayApprovalError(f"Edit value is not strict JSON: {exc}") from exc
+            raise HermesGatewayApprovalError(
+                "Edit value is not strict JSON"
+            ) from exc
         _validate_json_shape(value)
     else:
         if raw_value is not None:
@@ -405,108 +483,36 @@ def _audit_gateway_command(
     )
 
 
-def _short_value(value: object, limit: int = 240) -> str:
-    rendered = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return rendered if len(rendered) <= limit else rendered[: limit - 1] + "…"
-
-
 def _proposal_screen(proposal: ProposalRevision, *, prefix: str) -> str:
-    actions: dict[str, int] = {}
-    for operation in proposal.operations:
-        actions[operation.action.value] = actions.get(operation.action.value, 0) + 1
-    lines = [
-        f"[{prefix}]",
-        f"Proposal: {proposal.proposal_id}",
-        f"Revision: {proposal.revision}",
-        f"Status: {proposal.status.value}",
-        f"Digest: {proposal.digest}",
-        f"Operations: {len(proposal.operations)} {json.dumps(actions, sort_keys=True)}",
-        f"Show: /nx_show {proposal.proposal_id} {proposal.revision}",
-        "Final approval (exact full digest):",
-        f"/nx_approve {proposal.proposal_id} {proposal.revision} {proposal.digest}",
-        "Notion has not been changed.",
-    ]
-    return "\n".join(lines)
+    return f"[{prefix}]\n{render_review_card_page(proposal, 1)}"
+
+
+def _is_overlay_only_correction_recovery(
+    proposal: ProposalRevision,
+) -> bool:
+    recovery = proposal.correction_binding.get("recovery")
+    return (
+        proposal.purpose is ProposalPurpose.USER_CORRECTION
+        and isinstance(recovery, dict)
+        and recovery.get("mode") == CORRECTION_OVERLAY_RECOVERY_MODE
+    )
 
 
 def _proposal_page(
     proposal: ProposalRevision,
     page: int,
+    detail_item: int | None = None,
 ) -> str:
-    total_pages = max(
-        1,
-        (len(proposal.operations) + _SHOW_PAGE_SIZE - 1) // _SHOW_PAGE_SIZE,
-    )
-    if page > total_pages:
+    try:
+        return render_review_card_page(
+            proposal,
+            page,
+            detail_item=detail_item,
+        )
+    except ReviewCardPageError as exc:
         raise HermesGatewayApprovalError(
-            f"Page {page} does not exist; valid pages are 1-{total_pages}"
-        )
-    start = (page - 1) * _SHOW_PAGE_SIZE
-    selected = proposal.operations[start : start + _SHOW_PAGE_SIZE]
-    lines = [
-        f"[NX_PROPOSAL {proposal.proposal_id} r{proposal.revision}]",
-        f"Status: {proposal.status.value}",
-        f"Digest: {proposal.digest}",
-        f"Page: {page}/{total_pages}",
-    ]
-    if not selected:
-        lines.append("No operations.")
-    for index, operation in enumerate(selected, start=start + 1):
-        change = operation.change
-        lines.extend(
-            [
-                "",
-                f"{index}. Operation ID: {change.operation_id}",
-                (
-                    f"[{operation.action.value}] {change.target_database} / "
-                    f"{change.entity_key} / {change.property_name}"
-                ),
-                f"Current: {_short_value(change.current_value)}",
-                f"Analyzed: {_short_value(change.proposed_value)}",
-                f"Selected: {_short_value(operation.approved_value)}",
-                f"Reason: {change.reason[:240]}",
-                "Exact commands:",
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} apply"
-                ),
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} exclude"
-                ),
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} defer"
-                ),
-                (
-                    f"/nx_set {proposal.proposal_id} {proposal.revision} "
-                    f"{change.operation_id} edit <JSON>"
-                ),
-            ]
-        )
-    if page < total_pages:
-        lines.extend(
-            [
-                "",
-                f"Next: /nx_show {proposal.proposal_id} {proposal.revision} {page + 1}",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            f"Reject: /nx_reject {proposal.proposal_id} {proposal.revision}",
-            "Final approval (exact full digest):",
-            f"/nx_approve {proposal.proposal_id} {proposal.revision} {proposal.digest}",
-            "Notion has not been changed.",
-        ]
-    )
-    return "\n".join(lines)
+            "The requested proposal review page is unavailable"
+        ) from exc
 
 
 def _configured_knowledge_provider(
@@ -518,6 +524,32 @@ def _configured_knowledge_provider(
         return None
     return AnalyzerKnowledgeProvider(
         WikiRetriever(WikiIndex(config.wiki.index_db), config.wiki)
+    )
+
+
+def _configured_ai_service(
+    config: AppConfig,
+) -> StructuredAIService | None:
+    """Build a no-tools AI enrichment service; disabled means no model call."""
+
+    ai_config = getattr(config, "ai", None)
+    if ai_config is None or not ai_config.enabled:
+        return None
+    return StructuredAIService(
+        provider=HermesStructuredAIProvider(
+            task_name=ai_config.task_name,
+            model=ai_config.model,
+            timeout_seconds=ai_config.timeout_seconds,
+            privacy_mode=ai_config.privacy_mode,
+        ),
+        cache=AIAnalysisCache(ai_config.cache_db),
+        rollout_mode=ai_config.rollout_mode,
+        privacy_mode=ai_config.privacy_mode,
+        max_calls_per_sync=ai_config.max_calls_per_sync,
+        max_mail_calls_per_sync=ai_config.max_mail_calls_per_sync,
+        max_input_chars=ai_config.max_input_chars,
+        assist_confidence=ai_config.assist_confidence,
+        verified_confidence=ai_config.verified_confidence,
     )
 
 
@@ -643,6 +675,41 @@ def _refresh_local_wiki_data(
         ) from exc
 
 
+def _refresh_hiworks_mail(
+    config: AppConfig,
+    database: StateDatabase,
+    identity: TelegramEventIdentity,
+    baseline: Mapping[str, Any] | None,
+    ai_service: StructuredAIService | None = None,
+) -> None:
+    """Publish only provably post-T0 Hiworks mail before Excel analysis starts."""
+
+    if baseline is None:
+        return
+    try:
+        result = HiworksMailIngestionService(
+            email=config.email,
+            wiki=config.wiki,
+            checkpoints=database,
+            secret_resolver=lambda name: config.secret(name),
+            ai_service=ai_service,
+        ).ingest(actor=identity.user_id)
+        if result.status is HiworksMailIngestionStatus.COMPLETED:
+            logger.info(
+                "Hiworks Wiki generation ready: generation=%s messages=%s remaining=%s "
+                "ai_analyzed=%s ai_failures=%s",
+                result.generation,
+                result.new_count,
+                result.remaining,
+                result.ai_analyzed_count,
+                result.ai_failure_count,
+            )
+    except Exception as exc:
+        raise HermesGatewayApprovalError(
+            "Hiworks Wiki refresh failed; Excel and Notion processing did not start"
+        ) from exc
+
+
 def _source_client(
     config: AppConfig,
     database: StateDatabase,
@@ -762,11 +829,55 @@ def _prepare_authenticated_sync(
     identity: TelegramEventIdentity,
 ) -> PreparationResult:
     wiki_baseline = _ensure_local_wiki_baseline(config, database, identity)
+    ai_service = _configured_ai_service(config)
     _refresh_local_wiki_data(config, database, identity, wiki_baseline)
-    source = _source_client(config, database)
-    item = source.get_item(config.onedrive.drive_id, config.onedrive.item_id)
-    data_sources = _configured_data_sources(config, database)
-    read_gateway = _notion_read_gateway(config)
+    if ai_service is None:
+        _refresh_hiworks_mail(config, database, identity, wiki_baseline)
+    else:
+        _refresh_hiworks_mail(
+            config,
+            database,
+            identity,
+            wiki_baseline,
+            ai_service,
+        )
+    try:
+        source = _source_client(config, database)
+        item = source.get_item(config.onedrive.drive_id, config.onedrive.item_id)
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=local_workbook_capture)"
+        )
+        raise HermesGatewayApprovalError(
+            "Local Excel capture failed; Notion was not changed"
+        ) from exc
+    try:
+        data_sources = _configured_data_sources(config, database)
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=notion_target_binding)"
+        )
+        raise HermesGatewayApprovalError(
+            "Notion target verification failed; Notion was not changed"
+        ) from exc
+    try:
+        read_gateway = _notion_read_gateway(config)
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=notion_read_setup)"
+        )
+        raise HermesGatewayApprovalError(
+            "Notion read setup failed; Notion was not changed"
+        ) from exc
     service = SyncPreparationService(
         database=database,
         onedrive=source,
@@ -782,6 +893,7 @@ def _prepare_authenticated_sync(
         data_source_ids=data_sources,
         notion_schema_provider=read_gateway.get_data_source,
         knowledge_provider=_configured_knowledge_provider(config),
+        ai_service=ai_service,
         first_run_full_reconcile=config.source.mode == "local_filesystem",
         snapshot_observer=_local_snapshot_observer(
             config,
@@ -790,14 +902,25 @@ def _prepare_authenticated_sync(
             wiki_baseline,
         ),
     )
-    return service.prepare(
-        drive_id=config.onedrive.drive_id,
-        item_id=config.onedrive.item_id,
-        initial_cutoff=config.initial_cutoff,
-        requested_by=identity.user_id,
-        chat_id=identity.chat_id,
-        source_web_url=item.web_url,
-    )
+    try:
+        return service.prepare(
+            drive_id=config.onedrive.drive_id,
+            item_id=config.onedrive.item_id,
+            initial_cutoff=config.initial_cutoff,
+            requested_by=identity.user_id,
+            chat_id=identity.chat_id,
+            source_web_url=item.web_url,
+        )
+    except HermesGatewayApprovalError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Authenticated sync preparation failed closed "
+            "(stage=excel_notion_analysis)"
+        )
+        raise HermesGatewayApprovalError(
+            "Excel and Notion comparison failed; Notion was not changed"
+        ) from exc
 
 
 def _latest_version(
@@ -808,13 +931,13 @@ def _latest_version(
     versions = client.list_versions(drive_id, item_id)
     if not versions:
         raise HermesGatewayApprovalError(
-            "OneDrive returned no retained workbook versions"
+            "The configured source returned no retained workbook versions"
         )
     latest_time = max(item.last_modified_at for item in versions)
     candidates = [item for item in versions if item.last_modified_at == latest_time]
     if len(candidates) != 1:
         raise HermesGatewayApprovalError(
-            "OneDrive returned an ambiguous latest workbook version"
+            "The configured source returned an ambiguous latest workbook version"
         )
     return candidates[0]
 
@@ -829,7 +952,7 @@ def _capture_current_source(
     after = _latest_version(client, drive_id, item_id)
     if before.id != after.id:
         raise HermesGatewayApprovalError(
-            "OneDrive source changed while it was being revalidated"
+            "The configured source changed while it was being revalidated"
         )
     return before.id, hashlib.sha256(content).hexdigest()
 
@@ -851,6 +974,10 @@ def _handle_sync_command(
             "changed_rows": result.changes_detected,
             "pending_reintroduced": result.pending_reintroduced,
             "checkpoint_advanced": result.checkpoint_advanced,
+            "ai_attempted": result.ai_attempted,
+            "ai_completed": result.ai_completed,
+            "ai_failures": result.ai_failures,
+            "ai_failure_codes": result.ai_failure_codes,
             "notion_mutated": False,
         }
         return "[NX_SYNC_NO_CHANGES] " + json.dumps(
@@ -866,7 +993,237 @@ def _handle_sync_command(
         revision=result.proposal.revision,
         digest=result.proposal.digest,
     )
-    return _proposal_screen(result.proposal, prefix="NX_SYNC_PROPOSAL_READY")
+    screen = _proposal_screen(result.proposal, prefix="NX_SYNC_PROPOSAL_READY")
+    if result.ai_attempted or result.ai_failures:
+        failure_codes = ",".join(
+            f"{name}:{count}"
+            for name, count in sorted(result.ai_failure_codes.items())
+        )
+        screen += (
+            "\n[NX_AI_ANALYSIS] "
+            f"mode={config.ai.rollout_mode} "
+            f"attempted={result.ai_attempted} "
+            f"completed={result.ai_completed} "
+            f"failures={result.ai_failures} "
+            f"failure_codes={failure_codes or 'none'}"
+        )
+    if result.pending_staged:
+        screen += (
+            "\n[NX_SYNC_BATCH] "
+            f"review_operations={len(result.proposal.operations)} "
+            f"remaining_operations={result.pending_staged}"
+        )
+    return screen
+
+
+def _correction_proposal_id(
+    identity: TelegramEventIdentity,
+    request: CorrectionRequest,
+) -> str:
+    return "PC-" + sha256_json(
+        {
+            "purpose": ProposalPurpose.USER_CORRECTION.value,
+            "telegram_user_id": identity.user_id,
+            "chat_id": identity.chat_id,
+            "message_id": identity.message_id,
+            "update_id": identity.update_id,
+            "request_digest": request.digest,
+        }
+    )[:32]
+
+
+def _prepare_correction_proposal(
+    config: AppConfig,
+    database: StateDatabase,
+    identity: TelegramEventIdentity,
+    request: CorrectionRequest,
+) -> ProposalRevision:
+    """Create one read-only, source-bound correction proposal."""
+
+    proposal_id = _correction_proposal_id(identity, request)
+    claim = database.claim_correction_gateway_event(
+        telegram_user_id=identity.user_id,
+        chat_id=identity.chat_id,
+        message_id=identity.message_id,
+        update_id=identity.update_id,
+        request_digest=request.digest,
+        proposal_id=proposal_id,
+    )
+    try:
+        existing = database.load_proposal(proposal_id)
+    except KeyError:
+        existing = None
+    if existing is not None:
+        if (
+            existing.purpose is not ProposalPurpose.USER_CORRECTION
+            or existing.requested_by != identity.user_id
+            or existing.chat_id != identity.chat_id
+            or existing.correction_binding.get("request_digest")
+            != request.digest
+            or existing.correction_binding.get("event_key")
+            != claim["event_key"]
+        ):
+            raise HermesGatewayApprovalError(
+                "Stored correction proposal does not match the Telegram request"
+            )
+        return existing
+
+    data_sources = _configured_data_sources(config, database)
+    definition = NOTION_DEFINITIONS.get(request.database)
+    data_source_id = data_sources.get(request.database)
+    if definition is None or data_source_id is None:
+        raise HermesGatewayApprovalError(
+            "Correction target database is not configured"
+        )
+    property_type = definition.properties.get(request.property_name)
+    if property_type is None:
+        raise HermesGatewayApprovalError(
+            "Correction target property is not configured"
+        )
+
+    source = _source_client(config, database)
+    version_id, file_hash = _capture_current_source(
+        source,
+        config.onedrive.drive_id,
+        config.onedrive.item_id,
+    )
+    notion = _notion_read_gateway(config)
+    mapping = database.get_entity_mapping(
+        request.database,
+        request.entity_key,
+    )
+    if mapping is not None:
+        page = notion.get_page(mapping["notion_page_id"])
+    else:
+        page = notion.find_page(
+            data_source_id,
+            NotionMatch(definition.title_property, "title"),
+            request.case_number or request.entity_key,
+        )
+    if not page:
+        raise HermesGatewayApprovalError(
+            "Correction target Notion item was not found"
+        )
+    target_binding = build_correction_target_binding(
+        page,
+        database_name=request.database,
+        data_source_id=data_source_id,
+        entity_key=request.entity_key,
+        property_name=request.property_name,
+    )
+    current_value = decode_property(
+        page.get("properties", {}).get(request.property_name),
+        property_type,
+    )
+    operation_id = "corr-" + sha256_json(
+        {
+            "proposal_id": proposal_id,
+            "request_digest": request.digest,
+        }
+    )[:32]
+    change = ProposedChange(
+        target_database=request.database,
+        entity_key=request.entity_key,
+        property_name=request.property_name,
+        kind=ChangeKind.UPDATE,
+        current_value=current_value,
+        proposed_value=request.value,
+        analyzer="user_correction",
+        analyzer_version="1.0.0",
+        confidence=1.0,
+        reason=request.reason,
+        source_refs=[],
+        operation_id=operation_id,
+    )
+    notion_binding = build_notion_binding(
+        [change],
+        data_sources,
+        schema_provider=notion.get_data_source,
+    )
+    correction_binding: dict[str, JsonValue] = {
+        "version": 1,
+        "request_digest": request.digest,
+        "event_key": str(claim["event_key"]),
+        "case_number": request.case_number or request.entity_key,
+        "mutation_scope": list(request.mutation_scope),
+        "target": target_binding,
+    }
+    preview = ProposalRevision(
+        proposal_id=proposal_id,
+        revision=1,
+        source_version_id=version_id,
+        source_file_hash=file_hash,
+        requested_by=identity.user_id,
+        chat_id=identity.chat_id,
+        operations=[
+            ProposalOperation(
+                change=change,
+                action=ProposalAction.EDIT,
+                approved_value=request.value,
+                user_override=True,
+            )
+        ],
+        notion_binding=notion_binding,
+        purpose=ProposalPurpose.USER_CORRECTION,
+        correction_binding=correction_binding,
+    )
+    ProposalService._validate_approved_value(
+        preview.operations[0],
+        request.value,
+    )
+    inspection = ApprovedNotionWriter(
+        notion,
+        database,
+        preview,
+        data_sources,
+        require_exact_schema=True,
+    ).inspect(preview.operations[0])
+    if inspection is WritePreconditionState.CONFLICT:
+        raise HermesGatewayApprovalError(
+            "Correction target changed while the proposal was prepared"
+        )
+
+    proposals = _proposal_service(config, database)
+    proposal = proposals.create(
+        source_version_id=version_id,
+        source_file_hash=file_hash,
+        requested_by=identity.user_id,
+        chat_id=identity.chat_id,
+        changes=[change],
+        notion_binding=notion_binding,
+        purpose=ProposalPurpose.USER_CORRECTION,
+        proposal_id=proposal_id,
+        correction_binding=correction_binding,
+    )
+    return proposals.request_approval(proposal.proposal_id)
+
+
+def _handle_correction_command(
+    text: str,
+    config: AppConfig,
+    database: StateDatabase,
+    identity: TelegramEventIdentity,
+) -> str:
+    request = parse_correction_command(text)
+    proposal = _prepare_correction_proposal(
+        config,
+        database,
+        identity,
+        request,
+    )
+    _audit_gateway_command(
+        database,
+        CORRECT_COMMAND,
+        identity,
+        proposal.proposal_id,
+        revision=proposal.revision,
+        digest=proposal.digest,
+        request_digest=request.digest,
+    )
+    return _proposal_screen(
+        proposal,
+        prefix="NX_CORRECTION_PROPOSAL_READY",
+    )
 
 
 def _handle_show_command(
@@ -884,8 +1241,13 @@ def _handle_show_command(
         proposal.proposal_id,
         revision=proposal.revision,
         page=command.page,
+        detail_item=command.detail_item,
     )
-    return _proposal_page(proposal, command.page)
+    return _proposal_page(
+        proposal,
+        command.page,
+        command.detail_item,
+    )
 
 
 def _handle_set_command(
@@ -897,6 +1259,35 @@ def _handle_set_command(
     command = _parse_set_command(text)
     proposal = database.load_proposal(command.proposal_id)
     _validate_revision_binding(identity, proposal, command.revision)
+    if _is_overlay_only_correction_recovery(proposal):
+        raise HermesGatewayApprovalError(
+            "Overlay-only correction recovery cannot be revised; "
+            "send only its exact approval command"
+        )
+    target = next(
+        (
+            operation
+            for operation in proposal.operations
+            if operation.change.operation_id == command.operation_id
+        ),
+        None,
+    )
+    if (
+        target is not None
+        and target.change.target_database == HISTORY_DATABASE
+    ):
+        raise HermesGatewayApprovalError(
+            "Generated history operations cannot be edited directly"
+        )
+    if (
+        proposal.purpose is ProposalPurpose.USER_CORRECTION
+        and command.action
+        not in {ProposalAction.EDIT, ProposalAction.EXCLUDE}
+    ):
+        raise HermesGatewayApprovalError(
+            "Independent corrections support only edit or exclude; "
+            "apply and defer would break the required Wiki correction record"
+        )
     proposals = _proposal_service(config, database)
     if command.action is ProposalAction.EDIT:
         revised = proposals.edit(
@@ -928,29 +1319,107 @@ def _handle_set_command(
 
 def _handle_reject_command(
     text: str,
-    config: AppConfig,
     database: StateDatabase,
     identity: TelegramEventIdentity,
+    command: ParsedProposalCommand | None = None,
 ) -> str:
-    command = _parse_proposal_command(text, _REJECT_RE)
+    command = command or _parse_proposal_command(text, _REJECT_RE)
     proposal = database.load_proposal(command.proposal_id)
     _validate_revision_binding(identity, proposal, command.revision)
-    _proposal_service(config, database).reject(
+    database.reject_proposal_atomically(
         proposal.proposal_id,
-        identity.user_id,
-        identity.chat_id,
-    )
-    _audit_gateway_command(
-        database,
-        REJECT_COMMAND,
-        identity,
-        proposal.proposal_id,
-        revision=proposal.revision,
+        expected_revision=command.revision,
+        actor=identity.user_id,
+        chat_id=identity.chat_id,
+        gateway_audit_details={
+            "command": REJECT_COMMAND,
+            "telegram_message_id": identity.message_id,
+            "telegram_update_id": identity.update_id,
+            "telegram_chat_id": identity.chat_id,
+            "telegram_chat_type": identity.chat_type,
+            "telegram_thread_id": identity.thread_id,
+            "telegram_event_timestamp": identity.event_timestamp,
+            "revision": proposal.revision,
+        },
     )
     return (
         f"[NX_PROPOSAL_REJECTED] {proposal.proposal_id} r{proposal.revision}. "
         "Notion was not changed and the checkpoint was not advanced."
     )
+
+
+def _assert_started_apply_recovery_evidence(
+    database: StateDatabase,
+    proposal: ProposalRevision,
+) -> None:
+    """Adopt only an exact, durably started apply after signer rotation."""
+
+    try:
+        receipt = database.load_latest_receipt(
+            proposal.proposal_id,
+            proposal.revision,
+        )
+    except Exception as exc:
+        raise HermesGatewayApprovalError(
+            "The started apply has no valid stored approval receipt"
+        ) from exc
+    text_fields = (
+        receipt.proposal_digest,
+        receipt.source_version_id,
+        receipt.source_file_hash,
+        receipt.telegram_user_id,
+        receipt.chat_id,
+        receipt.nonce,
+        receipt.signature,
+        receipt.notion_binding_digest,
+    )
+    if any(not isinstance(value, str) or not value.strip() for value in text_fields):
+        raise HermesGatewayApprovalError(
+            "The started apply approval evidence is incomplete"
+        )
+    if (
+        receipt.proposal_id != proposal.proposal_id
+        or receipt.revision != proposal.revision
+        or not hmac.compare_digest(receipt.proposal_digest, proposal.digest)
+        or not hmac.compare_digest(
+            receipt.notion_binding_digest,
+            sha256_json(proposal.notion_binding),
+        )
+        or receipt.source_version_id != proposal.source_version_id
+        or receipt.source_file_hash != proposal.source_file_hash
+        or receipt.telegram_user_id != proposal.requested_by
+        or receipt.chat_id != proposal.chat_id
+        or not database.nonce_used(receipt.nonce)
+    ):
+        raise HermesGatewayApprovalError(
+            "The started apply approval evidence does not match the proposal"
+        )
+    write_operation_ids = [
+        operation.change.operation_id
+        for operation in proposal.operations
+        if operation.action in {ProposalAction.APPLY, ProposalAction.EDIT}
+    ]
+    if (
+        not write_operation_ids
+        or len(set(write_operation_ids)) != len(write_operation_ids)
+    ):
+        raise HermesGatewayApprovalError(
+            "The started apply has no exact write-operation scope"
+        )
+    outbox = database.outbox_statuses(
+        proposal.proposal_id,
+        proposal.revision,
+    )
+    if (
+        set(outbox) != set(write_operation_ids)
+        or any(
+            status not in {"pending", "failed", "blocked", "done"}
+            for status in outbox.values()
+        )
+    ):
+        raise HermesGatewayApprovalError(
+            "The started apply outbox does not match the approved scope"
+        )
 
 
 def _handle_recover_command(
@@ -962,50 +1431,180 @@ def _handle_recover_command(
     command = _parse_proposal_command(text, _RECOVER_RE)
     proposal = database.load_proposal(command.proposal_id)
     _validate_revision_binding(identity, proposal, command.revision)
+    if proposal.status is ProposalStatus.APPLYING:
+        try:
+            with database.apply_lease(
+                drive_id=config.onedrive.drive_id,
+                item_id=config.onedrive.item_id,
+                proposal_id=proposal.proposal_id,
+                revision=proposal.revision,
+            ):
+                current = database.load_proposal(
+                    proposal.proposal_id,
+                    proposal.revision,
+                )
+                _validate_revision_binding(
+                    identity,
+                    current,
+                    command.revision,
+                )
+                if current.status is ProposalStatus.APPLYING:
+                    _assert_started_apply_recovery_evidence(
+                        database,
+                        current,
+                    )
+                    current.status = ProposalStatus.FAILED
+                    database.save_proposal(current)
+                    database.audit(
+                        "apply_failed",
+                        {
+                            "recovery": "started_apply_adopted",
+                            "revision": current.revision,
+                        },
+                        current.proposal_id,
+                        identity.user_id,
+                    )
+                elif current.status is not ProposalStatus.FAILED:
+                    raise HermesGatewayApprovalError(
+                        "The proposal changed before recovery could start"
+                    )
+                # Re-enter the existing FAILED-only reconciliation while the
+                # exact source lease remains held. This path performs Notion
+                # reads only and prepares a new revision for separate approval.
+                return _handle_recover_command(
+                    text,
+                    config,
+                    database,
+                    identity,
+                )
+        except ApplyLeaseError as exc:
+            raise HermesGatewayApprovalError(
+                "A live apply worker still owns this recovery scope"
+            ) from exc
     if proposal.status is not ProposalStatus.FAILED:
         raise HermesGatewayApprovalError("Only a failed proposal can be recovered")
-    onedrive = _source_client(config, database)
+    proposals = _proposal_service(config, database)
+    overlay_only_recovery = proposals.correction_remote_writes_complete(
+        proposal
+    )
+    configured_source = _source_client(config, database)
     version_id, file_hash = _capture_current_source(
-        onedrive,
+        configured_source,
         config.onedrive.drive_id,
         config.onedrive.item_id,
     )
-    if version_id != proposal.source_version_id or file_hash != proposal.source_file_hash:
-        raise HermesGatewayApprovalError(
-            "OneDrive changed after the failed run; send /nx_sync for a fresh proposal"
+    if not overlay_only_recovery:
+        if (
+            version_id != proposal.source_version_id
+            or file_hash != proposal.source_file_hash
+        ):
+            raise HermesGatewayApprovalError(
+                "The configured source changed after the failed run; "
+                "send /nx_sync for a fresh proposal"
+            )
+        _assert_recovery_knowledge_is_current(
+            proposal,
+            _wiki_live_binding_guard(
+                config,
+                configured_source,
+                proposal=proposal,
+            ),
         )
-    _assert_recovery_knowledge_is_current(
-        proposal,
-        _wiki_live_binding_guard(config, onedrive, proposal=proposal),
-    )
-    writer = ApprovedNotionWriter(
-        _notion_read_gateway(config),
-        database,
-        proposal,
-        _configured_data_sources(config, database),
-        require_exact_schema=True,
-    )
     reconciled: list[str] = []
+    reconciled_batches: list[list[ProposalOperation]] = []
     conflicts: list[str] = []
-    for operation in proposal.operations:
-        if operation.action not in {ProposalAction.APPLY, ProposalAction.EDIT}:
-            continue
-        state = database.operation_outbox_state(operation.change.operation_id)
-        if state and state["status"] == "done":
-            continue
-        inspection = writer.inspect(operation)
-        if inspection is WritePreconditionState.ALREADY_APPLIED:
-            reconciled.append(operation.change.operation_id)
-        elif inspection is WritePreconditionState.CONFLICT:
-            conflicts.append(operation.change.operation_id)
+    if overlay_only_recovery:
+        reconciled = [
+            operation.change.operation_id
+            for operation in proposal.operations
+            if (
+                (
+                    state := database.operation_outbox_state(
+                        operation.change.operation_id
+                    )
+                )
+                is not None
+                and state["status"] == "done"
+            )
+        ]
+    else:
+        writer = ApprovedNotionWriter(
+            _notion_read_gateway(config),
+            database,
+            proposal,
+            _configured_data_sources(config, database),
+            require_exact_schema=True,
+        )
+        write_operations = [
+            operation
+            for operation in proposal.operations
+            if operation.action
+            in {ProposalAction.APPLY, ProposalAction.EDIT}
+        ]
+        page_batches: list[list[ProposalOperation]] = []
+        for operation in write_operations:
+            target = (
+                operation.change.target_database,
+                operation.change.entity_key,
+            )
+            if page_batches:
+                previous = page_batches[-1][0].change
+                if target == (
+                    previous.target_database,
+                    previous.entity_key,
+                ):
+                    page_batches[-1].append(operation)
+                    continue
+            page_batches.append([operation])
+        for page_batch in page_batches:
+            candidates = [
+                operation
+                for operation in page_batch
+                if (
+                    (
+                        state := database.operation_outbox_state(
+                            operation.change.operation_id
+                        )
+                    )
+                    is None
+                    or state["status"] != "done"
+                )
+            ]
+            if not candidates:
+                continue
+            inspections = writer.inspect_batch(candidates)
+            already = [
+                operation
+                for operation in candidates
+                if inspections[operation.change.operation_id]
+                is WritePreconditionState.ALREADY_APPLIED
+            ]
+            reconciled.extend(
+                operation.change.operation_id for operation in already
+            )
+            if already:
+                reconciled_batches.append(already)
+            conflicts.extend(
+                operation.change.operation_id
+                for operation in candidates
+                if inspections[operation.change.operation_id]
+                is WritePreconditionState.CONFLICT
+            )
     if conflicts:
         raise HermesGatewayApprovalError(
             "Recovery has Notion conflicts for operations: " + ", ".join(conflicts)
         )
-    for operation_id in reconciled:
-        database.mark_outbox(operation_id, "done")
-    proposals = _proposal_service(config, database)
-    recovery = proposals.create_recovery_revision(proposal.proposal_id)
+    if not overlay_only_recovery:
+        for batch in reconciled_batches:
+            writer.complete_batch(batch)
+    recovery = proposals.create_recovery_revision(
+        proposal.proposal_id,
+        source_rebind=(
+            (version_id, file_hash)
+            if overlay_only_recovery
+            else None
+        ),
+    )
     recovery = proposals.request_approval(recovery.proposal_id)
     _audit_gateway_command(
         database,
@@ -1015,6 +1614,11 @@ def _handle_recover_command(
         previous_revision=command.revision,
         revision=recovery.revision,
         reconciled_already_applied=reconciled,
+        recovery_mode=(
+            "wiki_overlay_only"
+            if overlay_only_recovery
+            else "notion_reconciliation"
+        ),
         digest=recovery.digest,
     )
     return _proposal_screen(recovery, prefix="NX_RECOVERY_PROPOSAL_READY")
@@ -1026,6 +1630,8 @@ def _handle_nonapproval_command(
     config: AppConfig,
     database: StateDatabase,
     identity: TelegramEventIdentity,
+    *,
+    reject_command: ParsedProposalCommand | None = None,
 ) -> str:
     if command_name == SYNC_COMMAND:
         return _handle_sync_command(text, config, database, identity)
@@ -1034,10 +1640,108 @@ def _handle_nonapproval_command(
     if command_name == SET_COMMAND:
         return _handle_set_command(text, config, database, identity)
     if command_name == REJECT_COMMAND:
-        return _handle_reject_command(text, config, database, identity)
+        return _handle_reject_command(
+            text,
+            database,
+            identity,
+            reject_command,
+        )
     if command_name == RECOVER_COMMAND:
         return _handle_recover_command(text, config, database, identity)
+    if command_name == CORRECT_COMMAND:
+        return _handle_correction_command(
+            text,
+            config,
+            database,
+            identity,
+        )
     raise AssertionError(f"Unsupported non-approval command: {command_name}")
+
+
+def _correction_overlay_publisher(
+    config: AppConfig,
+    database: StateDatabase,
+) -> Callable[[ProposalRevision, ApprovalReceipt], None]:
+    """Build the post-Notion publisher for user-approved value overrides."""
+
+    def publish(
+        proposal: ProposalRevision,
+        receipt: ApprovalReceipt,
+    ) -> None:
+        selected = []
+        for operation in proposal.operations:
+            if not operation.user_override:
+                continue
+            if operation.change.entity_key.startswith("history:"):
+                continue
+            state = database.operation_outbox_state(
+                operation.change.operation_id
+            )
+            if (
+                operation.action
+                not in {ProposalAction.APPLY, ProposalAction.EDIT}
+                and (state is None or state.get("status") != "done")
+            ):
+                continue
+            selected.append(operation)
+        if not selected:
+            return
+        if not config.wiki.enabled or config.wiki.output_root is None:
+            raise RuntimeError(
+                "A user-approved correction requires an enabled Wiki output"
+            )
+        cards = {
+            card.operation_id: card
+            for card in build_review_cards(proposal)
+        }
+        store = CorrectionOverlayStore(config.wiki.output_root)
+        for operation in selected:
+            change = operation.change
+            event_id = "correction-" + sha256_json(
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "revision": proposal.revision,
+                    "operation_id": change.operation_id,
+                    "digest": proposal.digest,
+                }
+            )[:40]
+            card = cards.get(change.operation_id)
+            store.publish(
+                ApprovedCorrectionEvent(
+                    event_id=event_id,
+                    proposal_id=proposal.proposal_id,
+                    proposal_revision=proposal.revision,
+                    proposal_digest=proposal.digest,
+                    operation_id=change.operation_id,
+                    case_number=(
+                        str(
+                            proposal.correction_binding.get("case_number")
+                            or (
+                                card.case_number
+                                if card is not None
+                                else change.entity_key
+                            )
+                        )
+                    ),
+                    target_database=change.target_database,
+                    entity_key=change.entity_key,
+                    property_name=change.property_name,
+                    current_value=change.current_value,
+                    approved_value=operation.approved_value,
+                    reason=change.reason,
+                    approved_by_user_id=receipt.telegram_user_id,
+                    approved_in_chat_id=receipt.chat_id,
+                    approved_at=receipt.issued_at,
+                    source_refs_digest=sha256_json(
+                        [
+                            dataclass_to_dict(source_ref)
+                            for source_ref in change.source_refs
+                        ]
+                    ),
+                )
+            )
+
+    return publish
 
 
 def _apply_gateway_receipt(
@@ -1084,7 +1788,15 @@ def _apply_gateway_receipt(
     )
 
     def apply_under_current_generation() -> ApplyReport:
-        return ApprovalGatedApplyService(database, approval, writer).apply(
+        return ApprovalGatedApplyService(
+            database,
+            approval,
+            writer,
+            correction_overlay_publisher=_correction_overlay_publisher(
+                config,
+                database,
+            ),
+        ).apply(
             receipt=receipt,
             drive_id=config.onedrive.drive_id,
             item_id=config.onedrive.item_id,
@@ -1167,17 +1879,141 @@ def _validate_pending_scope(
     _validate_target_binding(command, identity, proposal)
     if proposal.status is not ProposalStatus.PENDING_APPROVAL:
         raise HermesGatewayApprovalError("Proposal is not awaiting final approval")
+    if unmerged_history_operation_ids(proposal.operations):
+        raise HermesGatewayApprovalError(
+            "Proposal contains generated history operations that were not "
+            "displayed on a review card"
+        )
     if proposal.expires_at is None or now >= proposal.expires_at:
         raise HermesGatewayApprovalError("Proposal approval window has expired")
 
 
+def _receipt_directory(config: AppConfig) -> Path:
+    return (config.work_dir.parent / "receipts").resolve()
+
+
 def _receipt_path(config: AppConfig, receipt: ApprovalReceipt) -> Path:
-    file_id = re.sub(r"[^A-Za-z0-9._-]", "_", receipt.proposal_id)
+    return resolve_receipt_reference(
+        _receipt_directory(config),
+        receipt_reference(receipt),
+    )
+
+
+_PUBLIC_OUTBOX_STATUSES = frozenset(
+    {"blocked", "done", "failed", "pending", "unknown"}
+)
+
+
+def _public_outbox_state(
+    operation_id: str,
+    state: Mapping[str, object],
+) -> dict[str, object]:
+    """Remove internal paths and adapter errors from a Telegram/audit payload."""
+
+    raw_status = state.get("status")
+    status = (
+        raw_status
+        if isinstance(raw_status, str) and raw_status in _PUBLIC_OUTBOX_STATUSES
+        else "unknown"
+    )
+    raw_attempts = state.get("attempts")
+    attempts = (
+        raw_attempts
+        if isinstance(raw_attempts, int) and raw_attempts >= 0
+        else 0
+    )
+    result: dict[str, object] = {
+        "operation_id": operation_id,
+        "status": status,
+        "attempts": attempts,
+    }
+    if status in {"blocked", "failed", "unknown"}:
+        result["error_code"] = public_apply_failure_code(
+            state.get("last_error")
+        )
+    return result
+
+
+def _proposal_public_outbox(
+    proposal: ProposalRevision,
+    database: StateDatabase,
+) -> list[dict[str, object]]:
+    public: list[dict[str, object]] = []
+    for operation in proposal.operations:
+        operation_id = operation.change.operation_id
+        state = database.operation_outbox_state(operation_id)
+        if state is not None:
+            public.append(_public_outbox_state(operation_id, state))
+    return public
+
+
+def _public_failure_codes(report: ApplyReport) -> dict[str, str]:
+    return {
+        operation_id: public_apply_failure_code(reason)
+        for operation_id, reason in report.failed.items()
+    }
+
+
+def _apply_error_details(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, ApprovalError):
+        return (
+            "approval_state_invalid",
+            "The approved synchronization state changed, so the protected apply stopped.",
+        )
+    if isinstance(exc, ProposalInternalScopeConflict):
+        return (
+            "proposal_duplicate_scope",
+            "The prepared proposal contains multiple changes for the same "
+            "Notion mutation scope.",
+        )
+    if isinstance(exc, MutationScopeConflict):
+        return (
+            "mutation_scope_conflict",
+            "Another active proposal owns the same Notion mutation scope.",
+        )
     return (
-        config.work_dir.parent
-        / "receipts"
-        / f"{file_id}-r{receipt.revision}-{receipt.nonce}.json"
-    ).resolve()
+        "apply_worker_failed",
+        "The protected apply could not be completed; use the recovery command after review.",
+    )
+
+
+def _public_denial_message(exc: Exception) -> str:
+    """Map trusted workflow failures to non-sensitive Telegram text."""
+
+    if isinstance(exc, HermesGatewayApprovalError):
+        return exc.public_message
+    if isinstance(exc, ApprovalError):
+        return "Approval state or source bindings are no longer valid."
+    if isinstance(exc, CorrectionRequestError):
+        return "The correction command is invalid."
+    if isinstance(exc, CorrectionEventClaimError):
+        return "The Telegram correction event conflicts with an earlier request."
+    if isinstance(exc, ProposalInternalScopeConflict):
+        return (
+            "The prepared proposal contains multiple changes for the same "
+            "Notion mutation scope."
+        )
+    if isinstance(exc, MutationScopeConflict):
+        return "Another active proposal owns the same Notion mutation scope."
+    if isinstance(exc, ProposalRejectionError):
+        return "The proposal state transition was rejected."
+    if isinstance(exc, NotionSchemaError):
+        return "The Notion target or schema did not match the approved scope."
+    if isinstance(exc, ProposalError):
+        return "The proposal state transition was rejected."
+    return "The trusted workflow rejected the request."
+
+
+def _public_denial_code(command_name: str, exc: Exception) -> str:
+    """Return a stable, non-sensitive reason code for one rejected command."""
+
+    if isinstance(exc, ProposalInternalScopeConflict):
+        return "proposal_duplicate_scope"
+    if isinstance(exc, MutationScopeConflict):
+        return "active_proposal_scope_conflict"
+    if command_name == APPROVAL_COMMAND:
+        return "approval_rejected"
+    return "command_rejected"
 
 
 def _apply_result_marker(
@@ -1189,6 +2025,19 @@ def _apply_result_marker(
     *,
     redelivered: bool = False,
 ) -> str:
+    reference = receipt_reference(receipt)
+    if (
+        resolve_receipt_reference(_receipt_directory(config), reference)
+        != receipt_path.resolve()
+    ):
+        raise HermesGatewayApprovalError("Stored approval receipt reference is invalid")
+    proposal = database.load_proposal(
+        receipt.proposal_id,
+        receipt.revision,
+    )
+    is_correction = (
+        proposal.purpose is ProposalPurpose.USER_CORRECTION
+    )
     changed = bool(report.applied or report.already_applied)
     mutation_state = (
         "confirmed" if changed else ("unknown" if report.failed else "none")
@@ -1198,32 +2047,49 @@ def _apply_result_marker(
             "proposal_id": receipt.proposal_id,
             "revision": receipt.revision,
             "digest": receipt.proposal_digest,
-            "receipt_file": str(receipt_path),
+            "receipt_ref": reference,
             "redelivered": redelivered,
             "committed": report.committed,
             "applied": report.applied,
             "already_applied": report.already_applied,
             "excluded": report.excluded,
             "deferred": report.deferred,
-            "failed": report.failed,
+            "failed_operations": sorted(report.failed),
+            "failure_codes": _public_failure_codes(report),
+            "failure_message": (
+                "One or more approved operations could not be completed."
+                if report.failed
+                else None
+            ),
             "notion_mutated": changed if not report.failed else (True if changed else None),
             "mutation_state": mutation_state,
+            "purpose": proposal.purpose.value,
+            "checkpoint_advanced": bool(
+                report.committed and not is_correction
+            ),
             "checkpoint": (
                 database.get_checkpoint(
                     config.onedrive.drive_id,
                     config.onedrive.item_id,
                 )
-                if report.committed
+                if report.committed and not is_correction
                 else None
             ),
         },
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    marker = "NX_SYNC_COMMITTED" if report.committed else "NX_SYNC_FAILED"
+    if is_correction:
+        marker = (
+            "NX_CORRECTION_COMMITTED"
+            if report.committed
+            else "NX_CORRECTION_FAILED"
+        )
+    else:
+        marker = "NX_SYNC_COMMITTED" if report.committed else "NX_SYNC_FAILED"
     return (
         f"[{marker}] {payload} "
-        "신뢰된 gateway가 Telegram 최종 승인을 인증하고 OneDrive·Notion을 "
+        "신뢰된 gateway가 Telegram 최종 승인을 인증하고 로컬 원본·Notion을 "
         "재검증한 뒤 승인 범위의 적용 시도를 완료했습니다."
     )
 
@@ -1233,17 +2099,11 @@ def _apply_error_marker(
     receipt: ApprovalReceipt,
     exc: Exception,
 ) -> str:
+    purpose = ProposalPurpose.EXCEL_SYNC
     try:
         proposal = database.load_proposal(receipt.proposal_id, receipt.revision)
-        outbox = [
-            state
-            for operation in proposal.operations
-            if (
-                state := database.operation_outbox_state(
-                    operation.change.operation_id
-                )
-            )
-        ]
+        purpose = proposal.purpose
+        outbox = _proposal_public_outbox(proposal, database)
         confirmed = any(state["status"] == "done" for state in outbox)
         unknown = bool(outbox) and proposal.status in {
             ProposalStatus.APPLYING,
@@ -1255,25 +2115,32 @@ def _apply_error_marker(
         confirmed = False
         unknown = True
         status = "unknown"
+    error_code, message = _apply_error_details(exc)
     payload = json.dumps(
         {
             "proposal_id": receipt.proposal_id,
             "revision": receipt.revision,
             "digest": receipt.proposal_digest,
             "proposal_status": status,
-            "error": type(exc).__name__,
-            "message": str(exc),
+            "error_code": error_code,
+            "message": message,
             "outbox": outbox,
             "notion_mutated": True if confirmed else (None if unknown else False),
             "mutation_state": (
                 "confirmed" if confirmed else ("unknown" if unknown else "none")
             ),
+            "purpose": purpose.value,
         },
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    marker = (
+        "NX_CORRECTION_ERROR"
+        if purpose is ProposalPurpose.USER_CORRECTION
+        else "NX_SYNC_ERROR"
+    )
     return (
-        f"[NX_SYNC_ERROR] {payload} "
+        f"[{marker}] {payload} "
         "승인 영수증은 존재하지만 보호된 적용 절차가 완료되지 않았습니다."
     )
 
@@ -1284,25 +2151,26 @@ def _committed_redelivery_marker(
     proposal: ProposalRevision,
     identity: TelegramEventIdentity,
 ) -> str:
-    operations = [
-        state
-        for operation in proposal.operations
-        if (
-            state := database.operation_outbox_state(
-                operation.change.operation_id
-            )
-        )
-    ]
+    is_correction = (
+        proposal.purpose is ProposalPurpose.USER_CORRECTION
+    )
+    operations = _proposal_public_outbox(proposal, database)
     payload = {
         "proposal_id": proposal.proposal_id,
         "revision": proposal.revision,
         "digest": proposal.digest,
         "redelivered": True,
         "committed": True,
+        "purpose": proposal.purpose.value,
+        "checkpoint_advanced": not is_correction,
         "outbox": operations,
-        "checkpoint": database.get_checkpoint(
-            config.onedrive.drive_id,
-            config.onedrive.item_id,
+        "checkpoint": (
+            None
+            if is_correction
+            else database.get_checkpoint(
+                config.onedrive.drive_id,
+                config.onedrive.item_id,
+            )
         ),
     }
     database.audit(
@@ -1315,8 +2183,13 @@ def _committed_redelivery_marker(
         proposal.proposal_id,
         identity.user_id,
     )
+    marker = (
+        "NX_CORRECTION_COMMITTED"
+        if is_correction
+        else "NX_SYNC_COMMITTED"
+    )
     return (
-        "[NX_SYNC_COMMITTED] "
+        f"[{marker}] "
         + json.dumps(
             payload,
             ensure_ascii=False,
@@ -1331,7 +2204,7 @@ def _commit_approval(
     proposal: ProposalRevision,
     receipt: ApprovalReceipt,
     identity: TelegramEventIdentity,
-    receipt_path: Path,
+    receipt_ref: str,
 ) -> None:
     """Atomically save the receipt, approve the exact head, and write its audit."""
 
@@ -1428,7 +2301,7 @@ def _commit_approval(
                         "telegram_chat_type": identity.chat_type,
                         "telegram_thread_id": identity.thread_id,
                         "telegram_event_timestamp": identity.event_timestamp,
-                        "receipt_file": str(receipt_path),
+                        "receipt_ref": receipt_ref,
                     },
                     ensure_ascii=False,
                 ),
@@ -1443,7 +2316,7 @@ def _commit_reissued_approval(
     previous: ApprovalReceipt,
     replacement: ApprovalReceipt,
     identity: TelegramEventIdentity,
-    receipt_path: Path,
+    receipt_ref: str,
 ) -> None:
     """Atomically revoke an expired unused receipt and store its replacement."""
 
@@ -1520,7 +2393,7 @@ def _commit_reissued_approval(
                         "telegram_message_id": identity.message_id,
                         "telegram_update_id": identity.update_id,
                         "telegram_chat_id": identity.chat_id,
-                        "receipt_file": str(receipt_path),
+                        "receipt_ref": receipt_ref,
                     },
                     ensure_ascii=False,
                 ),
@@ -1564,14 +2437,13 @@ def _redeliver_existing_receipt(
             confirmed_digest=command.digest,
             now=now,
         )
-        replacement_path = _receipt_path(config, replacement)
         _commit_reissued_approval(
             database,
             proposal,
             receipt,
             replacement,
             identity,
-            replacement_path,
+            receipt_reference(replacement),
         )
         receipt = replacement
         reissued = True
@@ -1600,7 +2472,7 @@ def _redeliver_existing_receipt(
             "telegram_chat_type": identity.chat_type,
             "telegram_thread_id": identity.thread_id,
             "telegram_event_timestamp": identity.event_timestamp,
-            "receipt_file": str(receipt_path),
+            "receipt_ref": receipt_reference(receipt),
         },
         proposal.proposal_id,
         identity.user_id,
@@ -1608,11 +2480,71 @@ def _redeliver_existing_receipt(
     return receipt, receipt_path
 
 
+_SYNC_PROGRESS_STAGES = frozenset({"authenticating", "preparing"})
+
+
+def authenticated_sync_progress_marker(
+    *,
+    event: Any,
+    gateway: Any,
+    project_root: str | Path,
+    stage: str = "preparing",
+    elapsed_seconds: int = 0,
+) -> str:
+    """Return a safe progress marker after repeating the read-only auth checks.
+
+    This path deliberately does not initialize the state database or inspect
+    any source, Wiki, or Notion data. It is used only when an in-process sync
+    worker already owns the local execution slot.
+    """
+
+    text_value = getattr(event, "text", None)
+    if (
+        recognized_gateway_command(text_value) != SYNC_COMMAND
+        or not isinstance(text_value, str)
+        or text_value.strip() != SYNC_COMMAND
+    ):
+        return _denied("invalid_syntax", "Use exactly: /nx_sync")
+    try:
+        source = getattr(event, "source", None)
+        identity = _event_identity(event)
+        _assert_gateway_authorized(gateway, source)
+        config = load_config(_resolve_config_path(project_root))
+        _assert_project_authorized(identity, config)
+    except HermesGatewayApprovalError as exc:
+        return _denied("command_rejected", _public_denial_message(exc))
+    except Exception:
+        logger.error("Hermes synchronization progress authentication failed closed")
+        return _denied(
+            "internal_error",
+            "The trusted workflow worker encountered an internal error",
+        )
+
+    safe_stage = stage if stage in _SYNC_PROGRESS_STAGES else "preparing"
+    if isinstance(elapsed_seconds, bool) or not isinstance(elapsed_seconds, int):
+        safe_elapsed = 0
+    else:
+        safe_elapsed = min(max(elapsed_seconds, 0), 86_400)
+    progress_text = (
+        "A synchronization request is currently being authenticated."
+        if safe_stage == "authenticating"
+        else "An authenticated synchronization request is still running."
+    )
+    return (
+        f"[NX_SYNC_IN_PROGRESS] stage={safe_stage} "
+        f"elapsed_seconds={safe_elapsed}. "
+        f"{progress_text} "
+        "No additional worker was started, and this message does not approve "
+        "a Notion change."
+    )
+
+
 def handle_pre_gateway_dispatch(
     *,
     event: Any,
     gateway: Any,
     project_root: str | Path,
+    on_authenticated_sync_start: Callable[[], None] | None = None,
 ) -> str | None:
     """Consume and execute authenticated Telegram workflow commands.
 
@@ -1629,11 +2561,17 @@ def handle_pre_gateway_dispatch(
         return None
     text = str(text_value)
     approval_command: ParsedApprovalCommand | None = None
+    reject_command: ParsedProposalCommand | None = None
     if command_name == APPROVAL_COMMAND:
         try:
             approval_command = _parse_command(text)
         except HermesGatewayApprovalError as exc:
-            return _denied("invalid_syntax", str(exc))
+            return _denied("invalid_syntax", exc.public_message)
+    elif command_name == REJECT_COMMAND:
+        try:
+            reject_command = _parse_proposal_command(text, _REJECT_RE)
+        except HermesGatewayApprovalError as exc:
+            return _denied("invalid_syntax", exc.public_message)
 
     try:
         source = getattr(event, "source", None)
@@ -1643,8 +2581,24 @@ def handle_pre_gateway_dispatch(
         config_path = _resolve_config_path(project_root)
         config = load_config(config_path)
         _assert_project_authorized(identity, config)
+        if (
+            command_name == SYNC_COMMAND
+            and text.strip() == SYNC_COMMAND
+            and on_authenticated_sync_start is not None
+        ):
+            try:
+                on_authenticated_sync_start()
+            except Exception:
+                logger.error(
+                    "Authenticated synchronization start notification failed"
+                )
         database = StateDatabase(config.state_db)
-        database.initialize()
+        try:
+            database.initialize()
+        except MutationScopeConflict:
+            if reject_command is None:
+                raise
+            database.initialize_for_legacy_rejection()
         if command_name in SCHEMA_COMMANDS:
             from notion_excel_sync.security.hermes_schema_gateway import (
                 handle_schema_command,
@@ -1658,6 +2612,7 @@ def handle_pre_gateway_dispatch(
                 config,
                 database,
                 identity,
+                reject_command=reject_command,
             )
 
         assert approval_command is not None
@@ -1702,7 +2657,7 @@ def handle_pre_gateway_dispatch(
                     proposal,
                     receipt,
                     identity,
-                    receipt_path,
+                    receipt_reference(receipt),
                 )
             except Exception:
                 receipt_path.unlink(missing_ok=True)
@@ -1716,7 +2671,11 @@ def handle_pre_gateway_dispatch(
                 receipt,
             )
         except Exception as exc:
-            logger.exception("Trusted Hermes gateway apply failed")
+            error_code, _ = _apply_error_details(exc)
+            logger.error(
+                "Trusted Hermes gateway apply failed closed (code=%s)",
+                error_code,
+            )
             return _apply_error_marker(database, receipt, exc)
         return _apply_result_marker(
             receipt,
@@ -1728,13 +2687,18 @@ def handle_pre_gateway_dispatch(
         )
     except KeyError:
         return _denied("proposal_not_found", "Proposal was not found")
-    except (ApprovalError, HermesGatewayApprovalError, ProposalError) as exc:
-        code = (
-            "approval_rejected"
-            if command_name == APPROVAL_COMMAND
-            else "command_rejected"
-        )
-        return _denied(code, str(exc))
+    except (
+        ApprovalError,
+        CorrectionEventClaimError,
+        CorrectionRequestError,
+        HermesGatewayApprovalError,
+        MutationScopeConflict,
+        NotionSchemaError,
+        ProposalError,
+        ProposalRejectionError,
+    ) as exc:
+        code = _public_denial_code(command_name, exc)
+        return _denied(code, _public_denial_message(exc))
     except Exception:
         logger.exception("Hermes Telegram workflow command failed closed")
         return _denied(

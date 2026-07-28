@@ -61,7 +61,13 @@ class AnalyzerKnowledgeSnapshot:
     verified_refs_by_analyzer: dict[str, tuple[KnowledgeRef, ...]] = field(
         default_factory=dict
     )
+    verified_ai_refs_by_analyzer: dict[str, tuple[KnowledgeRef, ...]] = field(
+        default_factory=dict
+    )
     shadow_counts: dict[str, int] = field(default_factory=dict)
+    verified_context_by_analyzer: dict[
+        str, tuple[dict[str, str], ...]
+    ] = field(default_factory=dict, repr=False)
 
 
 @dataclass(slots=True)
@@ -128,6 +134,8 @@ class AnalyzerKnowledgeProvider:
                 continue
             selected.update(pipeline.router.route(record).analyzer_names)
         verified: dict[str, tuple[KnowledgeRef, ...]] = {}
+        verified_ai_refs: dict[str, tuple[KnowledgeRef, ...]] = {}
+        verified_context: dict[str, tuple[dict[str, str], ...]] = {}
         shadow_counts: dict[str, int] = {}
         for analyzer in pipeline.registry.ordered(selected) if selected else ():
             topics = analyzer.manifest.knowledge_topics
@@ -140,10 +148,7 @@ class AnalyzerKnowledgeProvider:
                 verified_only=False,
             )
             shadow_counts[analyzer.manifest.name] = len(shadow_hits)
-            if (
-                self.retriever.config.rollout_mode != "verified"
-                or not analyzer.manifest.uses_verified_knowledge
-            ):
+            if self.retriever.config.rollout_mode != "verified":
                 continue
             verified_hits = self.retriever.query(
                 query,
@@ -151,12 +156,29 @@ class AnalyzerKnowledgeProvider:
                 verified_only=True,
             )
             if verified_hits:
-                verified[analyzer.manifest.name] = tuple(
+                verified_ai_refs[analyzer.manifest.name] = tuple(
                     hit.ref for hit in verified_hits
+                )
+                if analyzer.manifest.uses_verified_knowledge:
+                    verified[analyzer.manifest.name] = tuple(
+                        hit.ref for hit in verified_hits
+                    )
+                verified_context[analyzer.manifest.name] = tuple(
+                    {
+                        "display_name": hit.ref.display_name,
+                        "category": hit.category,
+                        "relative_path": hit.relative_path,
+                        "excerpt": hit.untrusted_excerpt,
+                        "content_hash": hit.ref.content_hash,
+                        "chunk_locator": hit.ref.chunk_locator,
+                    }
+                    for hit in verified_hits
                 )
         return AnalyzerKnowledgeSnapshot(
             available=True,
             binding=snapshot.binding(),
             verified_refs_by_analyzer=verified,
+            verified_ai_refs_by_analyzer=verified_ai_refs,
             shadow_counts=dict(sorted(shadow_counts.items())),
+            verified_context_by_analyzer=verified_context,
         )

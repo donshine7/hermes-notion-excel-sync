@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 
 from notion_excel_sync.domain.analyzer import AnalysisContext, AnalyzerManifest, DomainAnalyzer
@@ -12,7 +13,6 @@ from notion_excel_sync.domain.analyzers.common import (
     parse_count,
     parse_money,
     record_case_numbers,
-    split_values,
 )
 from notion_excel_sync.models import AnalyzerResult
 
@@ -135,7 +135,7 @@ class CaseIdentityAnalyzer(DomainAnalyzer):
 class PartyAnalyzer(DomainAnalyzer):
     manifest = AnalyzerManifest(
         name="party",
-        version="1.0.0",
+        version="1.1.0",
         description="Extracts clients, applicants, inventors, and cost bearers.",
         header_signals=("의뢰인", "출원인", "발명자", "당사자", "비용부담자", "대표자"),
         dependencies=("case_identity",),
@@ -152,37 +152,105 @@ class PartyAnalyzer(DomainAnalyzer):
         "비용부담자": ("비용부담자", "청구처"),
         "담당자": ("고객담당자", "담당자명"),
     }
+    _AMBIGUOUS_MARKERS = ("_", "/", "신규법인", "미정", "확인필요")
+    _LEGAL_ENTITY_RE = re.compile(
+        r"(?i)(?:"
+        r"\bco\.(?:\s*,?\s*ltd\.)?"
+        r"|\bltd\."
+        r"|\binc\."
+        r"|\bcorp\."
+        r"|\bcorporation\b"
+        r"|\bllc\b"
+        r"|\blimited\b"
+        r")"
+    )
+    _LEGAL_SUFFIX_ONLY_RE = re.compile(
+        r"(?i)^(?:co\.?|ltd\.?|inc\.?|corp\.?|llc|limited)$"
+    )
+    _KOREAN_PERSON_RE = re.compile(r"^[가-힣]{2,4}$")
+
+    @staticmethod
+    def _party_names(value: object) -> list[str]:
+        """Split explicit lists without breaking commas inside legal names."""
+
+        if value is None:
+            return []
+        raw_values = value if isinstance(value, list) else [value]
+        names: list[str] = []
+        for raw in raw_values:
+            names.extend(
+                part.strip()
+                for part in re.split(r"\s*(?:;|\r?\n|\|)\s*", str(raw))
+                if part.strip()
+            )
+        return list(dict.fromkeys(names))
+
+    @classmethod
+    def _ambiguous_name_reason(cls, name: str) -> str | None:
+        if cls._LEGAL_SUFFIX_ONLY_RE.fullmatch(name.strip()):
+            return "영문 법인 접미사만 있어 완전한 당사자명인지 확인해야 합니다."
+        if any(marker in name for marker in cls._AMBIGUOUS_MARKERS):
+            return (
+                "복합 구분자나 임시 표기가 포함되어 있어 한 명의 정식 "
+                "당사자명으로 자동 등록하지 않습니다."
+            )
+        return None
+
+    @classmethod
+    def _party_type(
+        cls,
+        name: str,
+        roles: list[str],
+        explicit_type: str | None,
+    ) -> tuple[str, float]:
+        allowed_types = {"개인", "법인", "기관", "정부지원기관", "기타"}
+        if explicit_type in allowed_types:
+            return explicit_type, 0.97
+        if any(marker in name for marker in ("주식회사", "(주)", "㈜", "법인")):
+            return "법인", 0.95
+        if cls._LEGAL_ENTITY_RE.search(name):
+            return "법인", 0.93
+        if any(marker in name for marker in ("공단", "진흥원", "협회", "대학교", "연구원")):
+            return "기관", 0.84
+        if cls._KOREAN_PERSON_RE.fullmatch(name):
+            return "개인", 0.9
+        if roles == ["발명자"]:
+            return "개인", 0.82
+        return "기타", 0.55
 
     def analyze(self, context: AnalysisContext) -> AnalyzerResult:
         result = self.empty_result()
         parties: dict[str, set[str]] = defaultdict(set)
         for role, aliases in self._ROLE_FIELDS.items():
-            for name in split_values(find_value(context.record, aliases)):
+            for name in self._party_names(find_value(context.record, aliases)):
                 parties[name].add(role)
 
         derived_parties: list[dict[str, object]] = []
         for name in sorted(parties):
             roles = sorted(parties[name])
+            ambiguous_reason = self._ambiguous_name_reason(name)
+            if ambiguous_reason:
+                result.review_items.append(
+                    self.review_item(
+                        context,
+                        review_type="당사자 이름",
+                        title=f"{name} 정식 당사자명 확인",
+                        reason=ambiguous_reason,
+                        current_value=name,
+                        confidence=0.3,
+                    )
+                )
+                continue
             entity_key = f"party:{name.casefold()}"
             explicit_type = normalized_text(
                 find_value(context.record, ("당사자구분", "당사자유형", "법인구분"))
             )
             allowed_types = {"개인", "법인", "기관", "정부지원기관", "기타"}
-            if explicit_type in allowed_types:
-                party_type = explicit_type
-                type_confidence = 0.97
-            elif any(marker in name for marker in ("주식회사", "(주)", "㈜", "법인")):
-                party_type = "법인"
-                type_confidence = 0.93
-            elif any(marker in name for marker in ("공단", "진흥원", "협회", "대학교", "연구원")):
-                party_type = "기관"
-                type_confidence = 0.84
-            elif roles == ["발명자"]:
-                party_type = "개인"
-                type_confidence = 0.82
-            else:
-                party_type = "기타"
-                type_confidence = 0.55
+            party_type, type_confidence = self._party_type(
+                name,
+                roles,
+                explicit_type,
+            )
             for property_name, value, confidence in (
                 ("당사자명", name, 0.98),
                 ("구분", party_type, type_confidence),

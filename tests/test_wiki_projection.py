@@ -141,6 +141,15 @@ def test_mail_projection_analyzes_cases_without_attachment_payloads() -> None:
             [message],
             baseline_at="2026-07-23T10:00:00+09:00",
             collected_at=datetime(2026, 7, 23, tzinfo=UTC),
+            ai_analyses={
+                "uid-1": {
+                    "summary": "등록결정 메일 검토",
+                    "claims": {"event_type": "등록결정"},
+                    "needs_review": True,
+                    "overall_confidence": 0.91,
+                    "analysis_digest": "b" * 64,
+                }
+            },
         )
 
         assert projection.document_count == 1
@@ -155,6 +164,12 @@ def test_mail_projection_analyzes_cases_without_attachment_payloads() -> None:
         )
         assert "payload" not in metadata
         assert all("payload" not in item for item in metadata["attachments"])
+        assert metadata["ai_analysis"]["summary"] == "등록결정 메일 검토"
+        markdown = next((output / "mail" / "messages").glob("*.md")).read_text(
+            encoding="utf-8"
+        )
+        assert "구조화 AI 분석" in markdown
+        assert "Excel 사실을 대체하지 않습니다" in markdown
         assert not list(output.rglob("*.pdf"))
 
 

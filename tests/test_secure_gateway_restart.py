@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -334,7 +335,10 @@ class SecureGatewayRestartTest(unittest.TestCase):
         wrapper = self.wrapper.read_text(encoding="utf-8")
         worker = self.worker.read_text(encoding="utf-8")
 
-        self.assertIn("Read-Host \"Notion 쓰기 통합 토큰\" -AsSecureString", wrapper)
+        self.assertIn("0xC4F0, 0xAE30", wrapper)
+        self.assertIn("0xD1A0, 0xD070", wrapper)
+        self.assertIn("Read-Host $prompt -AsSecureString", wrapper)
+        self.assertNotIn("Notion 쓰기 통합 토큰", wrapper)
         self.assertIn("SecureStringToBSTR", wrapper)
         self.assertIn("ZeroFreeBSTR", wrapper)
         self.assertIn("FILE_TYPE_PIPE", wrapper)
@@ -375,6 +379,31 @@ class SecureGatewayRestartTest(unittest.TestCase):
         self.assertNotIn("argparse", worker)
         self.assertNotIn("write_text(", worker)
         self.assertNotIn("write_bytes(", worker)
+
+    def test_pinned_plugin_hashes_match_the_lf_repository_files(self) -> None:
+        tree = ast.parse(self.worker.read_text(encoding="utf-8"))
+        assignment = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "EXPECTED_PLUGIN_FILES"
+                for target in node.targets
+            )
+        )
+        expected = ast.literal_eval(assignment.value)
+        plugin_root = (
+            self.project_root
+            / ".hermes"
+            / "plugins"
+            / "notion-excel-sync-attestor"
+        )
+        observed = {
+            name: hashlib.sha256((plugin_root / name).read_bytes()).hexdigest()
+            for name in expected
+        }
+        self.assertEqual(observed, expected)
 
     def test_operations_docs_invoke_only_the_protected_launcher_copy(self) -> None:
         for relative in ("README.md", "docs/operations.md", "docs/configuration.md"):

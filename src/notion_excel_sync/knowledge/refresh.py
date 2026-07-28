@@ -284,10 +284,12 @@ def _isolated_extract(
             if key in os.environ
         }
         environment["PYTHONUTF8"] = "1"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
             completed = _run_extractor_process(
                 [
                     str(executable),
+                    "-B",
                     "-I",
                     str(worker),
                     "--root",

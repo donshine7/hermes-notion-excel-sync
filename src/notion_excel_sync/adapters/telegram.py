@@ -147,7 +147,7 @@ class TelegramProposalFormatter:
         lines = [
             f"[동기화 제안 {revision.proposal_id} / 개정 {revision.revision}]",
             "",
-            f"OneDrive 버전: {revision.source_version_id}",
+            f"원본 버전: {revision.source_version_id}",
             f"제안 digest: {revision.digest}",
             f"상태: {revision.status.value}",
             (

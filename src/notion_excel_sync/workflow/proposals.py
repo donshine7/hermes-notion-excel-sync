@@ -8,14 +8,24 @@ from uuid import uuid4
 
 from notion_excel_sync.models import (
     ApprovalReceipt,
+    CORRECTION_OVERLAY_RECOVERY_MODE,
     ProposalAction,
     ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
+    source_basis_digest,
 )
-from notion_excel_sync.persistence.database import StateDatabase
+from notion_excel_sync.persistence.database import (
+    ProposalRejectionError,
+    StateDatabase,
+)
 from notion_excel_sync.security.approval import ApprovalService
+from notion_excel_sync.workflow.review_cards import (
+    HISTORY_DATABASE,
+    unmerged_history_operation_ids,
+)
 
 
 class ProposalError(ValueError):
@@ -23,6 +33,31 @@ class ProposalError(ValueError):
 
 
 _UNSET = object()
+_OVERRIDE_RETAINED_REASON = (
+    "[approved_override_retained] 동일한 Excel 셀 근거가 유지되어 "
+    "이전에 승인된 사용자 수정값을 제안값으로 유지합니다."
+)
+_OVERRIDE_CONFLICT_REASON = (
+    "[approved_override_source_conflict] 이전 사용자 수정 이후 해당 Excel "
+    "셀 근거가 변경되었습니다. Excel 분석값을 유지했으며 이번 검토에서 "
+    "적용·수정·제외·보류를 다시 선택해야 합니다."
+)
+
+
+def _append_reason(reason: str, note: str) -> str:
+    normalized = str(reason).strip()
+    return f"{normalized} | {note}" if normalized else note
+
+
+def _is_overlay_only_correction_recovery(
+    proposal: ProposalRevision,
+) -> bool:
+    recovery = proposal.correction_binding.get("recovery")
+    return (
+        proposal.purpose is ProposalPurpose.USER_CORRECTION
+        and isinstance(recovery, dict)
+        and recovery.get("mode") == CORRECTION_OVERLAY_RECOVERY_MODE
+    )
 
 
 class ProposalService:
@@ -48,6 +83,10 @@ class ProposalService:
         defer_databases: set[str] | None = None,
         notion_binding: dict[str, object] | None = None,
         knowledge_binding: dict[str, object] | None = None,
+        purpose: ProposalPurpose = ProposalPurpose.EXCEL_SYNC,
+        proposal_id: str | None = None,
+        correction_binding: dict[str, object] | None = None,
+        staged_pending_changes: Iterable[ProposedChange] = (),
     ) -> ProposalRevision:
         deferred = defer_databases or set()
         change_list = list(changes)
@@ -55,18 +94,114 @@ class ProposalService:
             raise ProposalError(
                 "Wiki-backed changes require an immutable knowledge binding"
             )
-        operations = [
+        resolved_proposal_id = (
+            proposal_id
+            or f"P-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8]}"
+        )
+        identity_operations = [
             ProposalOperation(
-                change=item,
+                change=change,
                 action=(
-                    ProposalAction.DEFER
-                    if item.target_database in deferred
-                    else ProposalAction.APPLY
+                    ProposalAction.EDIT
+                    if purpose is ProposalPurpose.USER_CORRECTION
+                    else (
+                        ProposalAction.DEFER
+                        if change.target_database in deferred
+                        else ProposalAction.APPLY
+                    )
                 ),
-                approved_value=item.proposed_value,
+                approved_value=change.proposed_value,
+                user_override=purpose is ProposalPurpose.USER_CORRECTION,
             )
-            for item in change_list
+            for change in change_list
         ]
+        identity_context = ProposalRevision(
+            proposal_id=resolved_proposal_id,
+            revision=1,
+            source_version_id=source_version_id,
+            source_file_hash=source_file_hash,
+            requested_by=str(requested_by),
+            chat_id=str(chat_id),
+            operations=identity_operations,
+            notion_binding=dict(notion_binding or {}),
+            knowledge_binding=dict(knowledge_binding or {}),
+            status=ProposalStatus.DRAFT,
+            purpose=purpose,
+            correction_binding=dict(correction_binding or {}),
+        )
+        effective_changes: list[ProposedChange] = []
+        operations: list[ProposalOperation] = []
+        retained_override_operation_ids: set[str] = set()
+        override_by_operation: dict[int, dict[str, object] | None] = {}
+        if purpose is ProposalPurpose.EXCEL_SYNC:
+            override_candidates = [
+                operation
+                for operation in identity_operations
+                if operation.change.target_database != HISTORY_DATABASE
+            ]
+            override_by_operation = {
+                id(operation): override
+                for operation, override in zip(
+                    override_candidates,
+                    self.database.get_approved_overrides_for_operations(
+                        identity_context,
+                        override_candidates,
+                    ),
+                    strict=True,
+                )
+            }
+        for identity_operation in identity_operations:
+            change = identity_operation.change
+            action = identity_operation.action
+            approved_value = identity_operation.approved_value
+            user_override = identity_operation.user_override
+            if purpose is ProposalPurpose.EXCEL_SYNC:
+                override = override_by_operation.get(
+                    id(identity_operation)
+                )
+                if override is not None:
+                    observed_basis = (
+                        source_basis_digest(change.source_refs)
+                        if change.source_refs
+                        else ""
+                    )
+                    stored_basis = str(override["source_basis_digest"])
+                    change = deepcopy(change)
+                    if (
+                        stored_basis
+                        and observed_basis
+                        and stored_basis == observed_basis
+                    ):
+                        approved_value = override["approved_value"]
+                        # This is not a new user edit, so it must not publish a
+                        # duplicate correction overlay. The exact effective
+                        # value remains bound by this proposal's fresh
+                        # Telegram approval.
+                        user_override = False
+                        retained_override_operation_ids.add(
+                            change.operation_id
+                        )
+                        change.reason = _append_reason(
+                            change.reason,
+                            _OVERRIDE_RETAINED_REASON,
+                        )
+                        if change.current_value == approved_value:
+                            action = ProposalAction.EXCLUDE
+                    else:
+                        change.reason = _append_reason(
+                            change.reason,
+                            _OVERRIDE_CONFLICT_REASON,
+                        )
+            effective_changes.append(change)
+            operations.append(
+                ProposalOperation(
+                    change=change,
+                    action=action,
+                    approved_value=approved_value,
+                    user_override=user_override,
+                )
+            )
+        change_list = effective_changes
         if notion_binding is None and self.notion_data_sources is not None:
             from notion_excel_sync.workflow.notion_writer import build_notion_binding
 
@@ -75,7 +210,7 @@ class ProposalService:
                 self.notion_data_sources,
             )
         proposal = ProposalRevision(
-            proposal_id=f"P-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8]}",
+            proposal_id=resolved_proposal_id,
             revision=1,
             source_version_id=source_version_id,
             source_file_hash=source_file_hash,
@@ -85,15 +220,30 @@ class ProposalService:
             notion_binding=dict(notion_binding or {}),
             knowledge_binding=dict(knowledge_binding or {}),
             status=ProposalStatus.DRAFT,
+            purpose=purpose,
+            correction_binding=dict(correction_binding or {}),
         )
-        self.database.save_proposal(proposal)
+        for operation in proposal.operations:
+            if (
+                operation.user_override
+                or operation.change.operation_id
+                in retained_override_operation_ids
+            ):
+                self._cascade_history(proposal, operation)
+        staged_pending = list(staged_pending_changes)
+        self.database.save_proposal(
+            proposal,
+            staged_pending_changes=staged_pending,
+        )
         self.database.audit(
             "proposal_created",
             {
                 "revision": 1,
                 "operations": len(proposal.operations),
+                "staged_pending_operations": len(staged_pending),
                 "deferred_unavailable_databases": sorted(deferred),
                 "digest": proposal.digest,
+                "purpose": proposal.purpose.value,
             },
             proposal.proposal_id,
             requested_by,
@@ -116,6 +266,21 @@ class ProposalService:
             ProposalStatus.EXPIRED,
         }:
             raise ProposalError(f"Proposal cannot be edited in status {current.status.value}")
+        if _is_overlay_only_correction_recovery(current):
+            raise ProposalError(
+                "An overlay-only correction recovery cannot be revised; "
+                "it must be finalized with its exact approval"
+            )
+        if (
+            current.purpose is ProposalPurpose.USER_CORRECTION
+            and action not in {
+                ProposalAction.EDIT,
+                ProposalAction.EXCLUDE,
+            }
+        ):
+            raise ProposalError(
+                "A user-correction proposal may only be edited or excluded"
+            )
         revised = deepcopy(current)
         revised.revision += 1
         revised.created_at = datetime.now(UTC)
@@ -126,6 +291,10 @@ class ProposalService:
         )
         if target is None:
             raise ProposalError(f"Operation not found: {operation_id}")
+        if target.change.target_database == HISTORY_DATABASE:
+            raise ProposalError(
+                "Generated history operations cannot be edited directly"
+            )
         target.action = action
         target.user_override = action is ProposalAction.EDIT
         if action is ProposalAction.EDIT:
@@ -238,6 +407,14 @@ class ProposalService:
         proposal = self.database.load_proposal(proposal_id)
         if proposal.status not in {ProposalStatus.DRAFT, ProposalStatus.PENDING_APPROVAL}:
             raise ProposalError(f"Cannot request approval in status {proposal.status.value}")
+        unmerged_history = unmerged_history_operation_ids(
+            proposal.operations
+        )
+        if unmerged_history:
+            raise ProposalError(
+                "Proposal contains generated history operations that are not "
+                "displayed on any review card"
+            )
         proposal.status = ProposalStatus.PENDING_APPROVAL
         proposal.expires_at = datetime.now(UTC) + timedelta(seconds=self.ttl_seconds)
         self.database.save_proposal(proposal)
@@ -253,15 +430,76 @@ class ProposalService:
         )
         return proposal
 
-    def create_recovery_revision(self, proposal_id: str) -> ProposalRevision:
+    def correction_remote_writes_complete(
+        self,
+        proposal: ProposalRevision,
+    ) -> bool:
+        """Return true only when a correction has no Notion write left to run."""
+
+        if proposal.purpose is not ProposalPurpose.USER_CORRECTION:
+            return False
+        observed_completed_write = False
+        for operation in proposal.operations:
+            state = self.database.operation_outbox_state(
+                operation.change.operation_id
+            )
+            if operation.action in {
+                ProposalAction.APPLY,
+                ProposalAction.EDIT,
+            }:
+                if state is None or state["status"] != "done":
+                    return False
+                observed_completed_write = True
+                continue
+            if (
+                operation.user_override
+                and state is not None
+                and state["status"] == "done"
+            ):
+                observed_completed_write = True
+        return observed_completed_write
+
+    def create_recovery_revision(
+        self,
+        proposal_id: str,
+        *,
+        source_rebind: tuple[str, str] | None = None,
+    ) -> ProposalRevision:
         current = self.database.load_proposal(proposal_id)
         if current.status is not ProposalStatus.FAILED:
             raise ProposalError("Only a failed apply can create a recovery revision")
+        overlay_only_recovery = source_rebind is not None
+        if overlay_only_recovery:
+            if (
+                len(source_rebind) != 2
+                or not all(
+                    isinstance(value, str) and value.strip()
+                    for value in source_rebind
+                )
+            ):
+                raise ProposalError("Recovery source rebind is invalid")
+            if not self.correction_remote_writes_complete(current):
+                raise ProposalError(
+                    "Only a fully applied independent correction may rebind "
+                    "its recovery source"
+                )
         revised = deepcopy(current)
         revised.revision += 1
         revised.created_at = datetime.now(UTC)
         revised.expires_at = None
         revised.status = ProposalStatus.DRAFT
+        if overlay_only_recovery:
+            assert source_rebind is not None
+            revised.source_version_id, revised.source_file_hash = source_rebind
+            revised.knowledge_binding = {}
+            for operation in revised.operations:
+                operation.change.source_refs = []
+                operation.change.knowledge_refs = []
+            revised.correction_binding["recovery"] = {
+                "mode": CORRECTION_OVERLAY_RECOVERY_MODE,
+                "notion_writes": "already_done",
+                "source_rebound": True,
+            }
         skipped_done: list[str] = []
         retried: list[str] = []
         for operation in revised.operations:
@@ -302,6 +540,11 @@ class ProposalService:
                 "Approval receipts may be issued only by the trusted Hermes gateway"
             )
         proposal = self.database.load_proposal(proposal_id)
+        if unmerged_history_operation_ids(proposal.operations):
+            raise ProposalError(
+                "Proposal contains generated history operations that are not "
+                "displayed on any review card"
+            )
         if proposal.revision != revision:
             raise ProposalError(
                 "Only the current final proposal revision can be approved"
@@ -328,21 +571,26 @@ class ProposalService:
         proposal_id: str,
         actor: str,
         chat_id: str | None = None,
+        *,
+        expected_revision: int | None = None,
     ) -> None:
-        proposal = self.database.load_proposal(proposal_id)
-        if str(actor) != proposal.requested_by:
-            raise ProposalError("Only the request owner can reject the proposal")
-        if chat_id is not None and str(chat_id) != proposal.chat_id:
-            raise ProposalError("Proposal must be rejected from the original Telegram chat")
-        if proposal.status in {
-            ProposalStatus.APPLYING,
-            ProposalStatus.COMMITTED,
-            ProposalStatus.REJECTED,
-        }:
-            raise ProposalError(f"Proposal cannot be rejected in {proposal.status.value}")
-        proposal.status = ProposalStatus.REJECTED
-        self.database.save_proposal(proposal)
-        self.database.audit("proposal_rejected", {}, proposal_id, actor)
+        if chat_id is None:
+            raise ProposalError(
+                "Proposal rejection requires the original Telegram chat"
+            )
+        if expected_revision is None:
+            expected_revision = self.database.load_proposal(
+                proposal_id
+            ).revision
+        try:
+            self.database.reject_proposal_atomically(
+                proposal_id,
+                expected_revision=expected_revision,
+                actor=str(actor),
+                chat_id=str(chat_id),
+            )
+        except ProposalRejectionError as exc:
+            raise ProposalError(str(exc)) from exc
 
 
 def _display_value(value: object) -> str:

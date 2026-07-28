@@ -21,6 +21,26 @@ WINDOWS_ONLINE_ONLY_ATTRIBUTE_MASK = (
 _READ_CHUNK_BYTES = 1024 * 1024
 
 
+def windows_extended_path(path: str | Path) -> Path:
+    """Return an absolute Windows path that is safe beyond ``MAX_PATH``.
+
+    Python's Windows filesystem calls are long-path aware when the extended
+    namespace is used.  Keep the conversion at the adapter boundary so source
+    content is still addressed read-only and callers do not need to change
+    their configured paths.
+    """
+
+    requested = Path(path)
+    if os.name != "nt":
+        return requested
+    value = os.path.abspath(os.fspath(requested))
+    if value.startswith("\\\\?\\"):
+        return Path(value)
+    if value.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + value[2:])
+    return Path("\\\\?\\" + value)
+
+
 class LocalFileError(RuntimeError):
     """Raised when a local source cannot be read without violating its binding."""
 
@@ -137,7 +157,7 @@ class LocalFileReadOnlyAdapter:
         if not requested_root.is_absolute():
             raise LocalFilePathError("Local source root must be an absolute path")
         try:
-            resolved_root = requested_root.resolve(strict=True)
+            resolved_root = windows_extended_path(requested_root).resolve(strict=True)
         except OSError as exc:
             raise LocalFilePathError("Local source root does not exist") from exc
         if not resolved_root.is_dir():
@@ -156,7 +176,7 @@ class LocalFileReadOnlyAdapter:
         if not requested.is_absolute():
             raise LocalFilePathError("Local source file must be an absolute path")
         try:
-            resolved = requested.resolve(strict=True)
+            resolved = windows_extended_path(requested).resolve(strict=True)
             resolved.relative_to(self.root)
         except (OSError, ValueError) as exc:
             raise LocalFilePathError(

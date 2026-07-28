@@ -518,7 +518,15 @@ function Read-TokenAsSecureString {
     param([switch]$FromStdin)
 
     if (-not $FromStdin) {
-        return Read-Host "Notion 쓰기 통합 토큰" -AsSecureString
+        # Windows PowerShell 5.1 decodes a UTF-8 script without BOM through
+        # the active ANSI code page. Build the Korean portion from Unicode
+        # code points so the protected launcher remains ASCII-only and the
+        # masked prompt renders correctly on every Windows code page.
+        $prompt = "Notion " + -join [char[]]@(
+            0xC4F0, 0xAE30, 0x0020, 0xD1B5,
+            0xD569, 0x0020, 0xD1A0, 0xD070
+        )
+        return Read-Host $prompt -AsSecureString
     }
     Add-PipeHandleProbe
     $handle = [NxSecureGateway.NativeMethods]::GetStdHandle(

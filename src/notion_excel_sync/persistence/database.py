@@ -8,19 +8,22 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Mapping, NamedTuple
 
 from notion_excel_sync.models import (
     ApprovalReceipt,
     ChangeKind,
+    EXCEL_SYNC_PURPOSE,
     KnowledgeRef,
     ProposalAction,
     ProposalOperation,
+    ProposalPurpose,
     ProposalRevision,
     ProposalStatus,
     ProposedChange,
     SCHEMA_APPROVAL_PURPOSE,
     SCHEMA_RECOVERY_PURPOSE,
+    USER_CORRECTION_PURPOSE,
     SchemaApprovalReceipt,
     SchemaProposalRevision,
     SchemaProposalStatus,
@@ -31,6 +34,7 @@ from notion_excel_sync.models import (
     schema_approval_command_hash,
     schema_recovery_command_hash,
     sha256_json,
+    source_basis_digest,
 )
 
 
@@ -56,6 +60,7 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoint (
 CREATE TABLE IF NOT EXISTS proposal (
     proposal_id TEXT PRIMARY KEY,
     current_revision INTEGER NOT NULL,
+    purpose TEXT NOT NULL DEFAULT 'excel_sync/v1',
     requested_by TEXT NOT NULL,
     chat_id TEXT NOT NULL,
     source_version_id TEXT NOT NULL,
@@ -308,6 +313,58 @@ CREATE TABLE IF NOT EXISTS notion_schema_installation (
     FOREIGN KEY (schema_proposal_id, revision)
         REFERENCES schema_proposal_revision(schema_proposal_id, revision)
 );
+
+CREATE TABLE IF NOT EXISTS correction_gateway_event_claim (
+    event_key TEXT PRIMARY KEY,
+    telegram_user_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    update_id INTEGER NOT NULL,
+    request_digest TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (telegram_user_id, update_id),
+    UNIQUE (chat_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS mutation_scope_claim (
+    scope_digest TEXT PRIMARY KEY,
+    case_number TEXT NOT NULL,
+    database_name TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    property_name TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    claim_state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposal(proposal_id)
+);
+
+CREATE INDEX IF NOT EXISTS mutation_scope_claim_by_proposal
+ON mutation_scope_claim(proposal_id, revision);
+
+CREATE TABLE IF NOT EXISTS approved_override (
+    scope_digest TEXT PRIMARY KEY,
+    case_number TEXT NOT NULL,
+    database_name TEXT NOT NULL,
+    entity_key TEXT NOT NULL,
+    property_name TEXT NOT NULL,
+    approved_value TEXT NOT NULL,
+    source_basis_digest TEXT NOT NULL,
+    observed_basis_digest TEXT NOT NULL,
+    source_file_hash TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    operation_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES proposal(proposal_id)
+);
+
+CREATE INDEX IF NOT EXISTS approved_override_by_entity
+ON approved_override(database_name, entity_key, property_name);
 """
 
 
@@ -321,6 +378,478 @@ class SchemaStateError(RuntimeError):
 
 class SchemaEventClaimError(SchemaStateError):
     """Raised when a Telegram update/message is replayed with changed content."""
+
+
+class CorrectionEventClaimError(RuntimeError):
+    """Raised when a correction command event is replayed inconsistently."""
+
+
+class MutationScopeConflict(RuntimeError):
+    """Raised when another live proposal owns the same Notion property."""
+
+
+class ProposalInternalScopeConflict(MutationScopeConflict):
+    """Raised when one proposal contains conflicting writes to one target."""
+
+
+class ProposalRejectionError(RuntimeError):
+    """Raised when an atomic proposal rejection cannot be completed safely."""
+
+
+_HISTORY_DATABASE = "변경이력"
+_ACTIVE_MUTATION_CLAIM_STATUSES = frozenset(
+    {
+        ProposalStatus.DRAFT,
+        ProposalStatus.PENDING_APPROVAL,
+        ProposalStatus.APPROVED,
+        ProposalStatus.APPLYING,
+        ProposalStatus.FAILED,
+    }
+)
+
+
+class _PrecomputedMutationTarget(NamedTuple):
+    identity: tuple[str, str]
+    match_value: str
+
+
+class _StoredMutationClaimOwner(NamedTuple):
+    proposal: ProposalRevision
+    operations: Mapping[
+        tuple[str, str, str, str],
+        ProposalOperation,
+    ]
+    targets: Mapping[int, _PrecomputedMutationTarget]
+
+
+def _proposal_title_property(
+    proposal: ProposalRevision,
+    database_name: str,
+) -> str | None:
+    databases = proposal.notion_binding.get("databases")
+    if isinstance(databases, dict):
+        entry = databases.get(database_name)
+        if isinstance(entry, dict):
+            value = entry.get("title_property")
+            if isinstance(value, str) and value:
+                return value
+    # Older and synthetic proposals may not carry a Notion binding. Import
+    # lazily to avoid a module import cycle during database initialization.
+    try:
+        from notion_excel_sync.workflow.notion_writer import (
+            NOTION_DEFINITIONS,
+        )
+
+        definition = NOTION_DEFINITIONS.get(database_name)
+        return definition.title_property if definition is not None else None
+    except ImportError:
+        return None
+
+
+def _canonical_mutation_identity(
+    connection: sqlite3.Connection,
+    proposal: ProposalRevision,
+    operation: ProposalOperation,
+) -> tuple[str, str]:
+    """Resolve the same logical page identity used by the Notion writer.
+
+    A known Notion page ID is strongest. Otherwise the exact title match value
+    is used, including a title operation in the same proposal or the writer's
+    ``prefix:value -> value`` fallback. Looking up mappings by match value also
+    makes a mapped ``case:ABC`` alias collide with an unmapped ``ABC`` alias.
+    """
+
+    change = operation.change
+    target = proposal.correction_binding.get("target")
+    if (
+        proposal.purpose is ProposalPurpose.USER_CORRECTION
+        and isinstance(target, dict)
+    ):
+        page_id = target.get("page_id")
+        if (
+            isinstance(page_id, str)
+            and page_id
+            and target.get("database") == change.target_database
+            and target.get("entity_key") == change.entity_key
+            and target.get("property") == change.property_name
+        ):
+            return "notion_page", page_id
+    direct = connection.execute(
+        "SELECT notion_page_id FROM entity_mapping "
+        "WHERE database_name = ? AND entity_key = ?",
+        (change.target_database, change.entity_key),
+    ).fetchone()
+    if direct is not None and str(direct["notion_page_id"]):
+        return "notion_page", str(direct["notion_page_id"])
+
+    match_value = _writer_match_value(proposal, operation)
+    mapped_rows = connection.execute(
+        "SELECT DISTINCT notion_page_id FROM entity_mapping "
+        "WHERE database_name = ? AND match_value = ? "
+        "ORDER BY notion_page_id",
+        (change.target_database, match_value),
+    ).fetchall()
+    mapped_page_ids = {
+        str(row["notion_page_id"])
+        for row in mapped_rows
+        if str(row["notion_page_id"])
+    }
+    if len(mapped_page_ids) == 1:
+        return "notion_page", next(iter(mapped_page_ids))
+    return "match_value", match_value
+
+
+def _writer_match_value(
+    proposal: ProposalRevision,
+    operation: ProposalOperation,
+) -> str:
+    """Return the title value the writer uses when no mapping is available."""
+
+    change = operation.change
+    if proposal.purpose is ProposalPurpose.USER_CORRECTION:
+        case_number = proposal.correction_binding.get("case_number")
+        if isinstance(case_number, str) and case_number.strip():
+            return case_number
+    title_property = _proposal_title_property(
+        proposal,
+        change.target_database,
+    )
+    title_value = next(
+        (
+            item.approved_value
+            for item in proposal.operations
+            if item.action in {ProposalAction.APPLY, ProposalAction.EDIT}
+            and item.change.target_database == change.target_database
+            and item.change.entity_key == change.entity_key
+            and item.change.property_name == title_property
+            and item.approved_value not in (None, "")
+        ),
+        None,
+    )
+    match_value = (
+        str(title_value)
+        if title_value not in (None, "")
+        else change.entity_key.split(":", 1)[-1]
+    )
+    return match_value
+
+
+def _precompute_mutation_targets(
+    connection: sqlite3.Connection,
+    proposal: ProposalRevision,
+    operations: Iterable[ProposalOperation],
+) -> dict[int, _PrecomputedMutationTarget]:
+    """Resolve proposal-local match values and mappings in linear passes."""
+
+    operation_list = list(operations)
+    if not operation_list:
+        return {}
+
+    database_names = {
+        operation.change.target_database
+        for operation in operation_list
+    }
+    title_properties = {
+        database_name: _proposal_title_property(
+            proposal,
+            database_name,
+        )
+        for database_name in database_names
+    }
+    title_values: dict[tuple[str, str], str] = {}
+    for item in proposal.operations:
+        change = item.change
+        if (
+            change.target_database not in database_names
+            or item.action
+            not in {ProposalAction.APPLY, ProposalAction.EDIT}
+            or change.property_name
+            != title_properties.get(change.target_database)
+            or item.approved_value in (None, "")
+        ):
+            continue
+        title_values.setdefault(
+            (change.target_database, change.entity_key),
+            str(item.approved_value),
+        )
+
+    match_values: dict[int, str] = {}
+    correction_case_number = proposal.correction_binding.get(
+        "case_number"
+    )
+    correction_match = (
+        correction_case_number
+        if (
+            proposal.purpose is ProposalPurpose.USER_CORRECTION
+            and isinstance(correction_case_number, str)
+            and correction_case_number.strip()
+        )
+        else None
+    )
+    for operation in operation_list:
+        change = operation.change
+        match_values[id(operation)] = (
+            correction_match
+            or title_values.get(
+                (change.target_database, change.entity_key),
+            )
+            or change.entity_key.split(":", 1)[-1]
+        )
+
+    direct_mappings: dict[tuple[str, str], str] = {}
+    pages_by_match: dict[tuple[str, str], set[str]] = {}
+    for row in connection.execute(
+        "SELECT database_name, entity_key, notion_page_id, match_value "
+        "FROM entity_mapping"
+    ).fetchall():
+        database_name = str(row["database_name"])
+        if database_name not in database_names:
+            continue
+        page_id = str(row["notion_page_id"])
+        if not page_id:
+            continue
+        direct_mappings[
+            (database_name, str(row["entity_key"]))
+        ] = page_id
+        pages_by_match.setdefault(
+            (database_name, str(row["match_value"])),
+            set(),
+        ).add(page_id)
+
+    correction_target = proposal.correction_binding.get("target")
+    targets: dict[int, _PrecomputedMutationTarget] = {}
+    for operation in operation_list:
+        change = operation.change
+        operation_key = id(operation)
+        match_value = match_values[operation_key]
+        page_id: str | None = None
+        if (
+            proposal.purpose is ProposalPurpose.USER_CORRECTION
+            and isinstance(correction_target, dict)
+        ):
+            bound_page_id = correction_target.get("page_id")
+            if (
+                isinstance(bound_page_id, str)
+                and bound_page_id
+                and correction_target.get("database")
+                == change.target_database
+                and correction_target.get("entity_key")
+                == change.entity_key
+                and correction_target.get("property")
+                == change.property_name
+            ):
+                page_id = bound_page_id
+        if page_id is None:
+            page_id = direct_mappings.get(
+                (change.target_database, change.entity_key)
+            )
+        if page_id is None:
+            mapped_pages = pages_by_match.get(
+                (change.target_database, match_value),
+                set(),
+            )
+            if len(mapped_pages) == 1:
+                page_id = next(iter(mapped_pages))
+        identity = (
+            ("notion_page", page_id)
+            if page_id is not None
+            else ("match_value", match_value)
+        )
+        targets[operation_key] = _PrecomputedMutationTarget(
+            identity,
+            match_value,
+        )
+    return targets
+
+
+def _mutation_targets_overlap(
+    first_identity: tuple[str, str],
+    first_match_value: str,
+    second_identity: tuple[str, str],
+    second_match_value: str,
+) -> bool:
+    """Conservatively decide whether two writes may target the same page.
+
+    Two distinct, known Notion page IDs are independent even when their title
+    values match. When either side has only the writer's title match value,
+    matching titles must be treated as the same target until both page IDs are
+    known.
+    """
+
+    if first_identity == second_identity:
+        return True
+    if first_identity[0] == second_identity[0] == "notion_page":
+        return False
+    return first_match_value == second_match_value
+
+
+def _stored_mutation_claim_target(
+    claim: sqlite3.Row,
+    owner: _StoredMutationClaimOwner,
+) -> tuple[tuple[str, str], str]:
+    """Resolve one persisted claim from its validated, precomputed owner."""
+
+    key = (
+        str(claim["operation_id"]),
+        str(claim["database_name"]),
+        str(claim["entity_key"]),
+        str(claim["property_name"]),
+    )
+    operation = owner.operations.get(key)
+    if operation is None:
+        raise MutationScopeConflict(
+            "Stored mutation-scope claim owner is inconsistent"
+        )
+    try:
+        target = owner.targets[id(operation)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MutationScopeConflict(
+            "Stored mutation-scope claim owner is inconsistent"
+        ) from exc
+    return target.identity, target.match_value
+
+
+def _precompute_stored_mutation_claim_owners(
+    connection: sqlite3.Connection,
+    claims: Iterable[sqlite3.Row],
+) -> dict[tuple[str, int], _StoredMutationClaimOwner]:
+    """Load and index each foreign claim owner exactly once."""
+
+    claims_by_owner: dict[
+        tuple[str, int],
+        list[sqlite3.Row],
+    ] = {}
+    try:
+        for claim in claims:
+            owner_key = (
+                str(claim["proposal_id"]),
+                int(claim["revision"]),
+            )
+            claims_by_owner.setdefault(owner_key, []).append(claim)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MutationScopeConflict(
+            "Stored mutation-scope claim owner is inconsistent"
+        ) from exc
+
+    owners: dict[tuple[str, int], _StoredMutationClaimOwner] = {}
+    for owner_key, owner_claims in claims_by_owner.items():
+        revision = connection.execute(
+            "SELECT payload FROM proposal_revision "
+            "WHERE proposal_id = ? AND revision = ?",
+            owner_key,
+        ).fetchone()
+        if revision is None:
+            raise MutationScopeConflict(
+                "Stored mutation-scope claim owner is inconsistent"
+            )
+        try:
+            proposal = _proposal_from_dict(
+                json.loads(str(revision["payload"]))
+            )
+            if (
+                proposal.proposal_id != owner_key[0]
+                or proposal.revision != owner_key[1]
+            ):
+                raise MutationScopeConflict(
+                    "Stored mutation-scope claim owner is inconsistent"
+                )
+            expected_keys = {
+                (
+                    str(claim["operation_id"]),
+                    str(claim["database_name"]),
+                    str(claim["entity_key"]),
+                    str(claim["property_name"]),
+                )
+                for claim in owner_claims
+            }
+            operation_index: dict[
+                tuple[str, str, str, str],
+                ProposalOperation,
+            ] = {}
+            for operation in proposal.operations:
+                change = operation.change
+                operation_key = (
+                    change.operation_id,
+                    change.target_database,
+                    change.entity_key,
+                    change.property_name,
+                )
+                if operation_key not in expected_keys:
+                    continue
+                existing = operation_index.get(operation_key)
+                if existing is None:
+                    operation_index[operation_key] = operation
+                    continue
+                if existing.digest_payload() != operation.digest_payload():
+                    raise MutationScopeConflict(
+                        "Stored mutation-scope claim owner is inconsistent"
+                    )
+            if operation_index.keys() != expected_keys:
+                raise MutationScopeConflict(
+                    "Stored mutation-scope claim owner is inconsistent"
+                )
+            targets = _precompute_mutation_targets(
+                connection,
+                proposal,
+                operation_index.values(),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MutationScopeConflict(
+                "Stored mutation-scope claim owner is inconsistent"
+            ) from exc
+        owners[owner_key] = _StoredMutationClaimOwner(
+            proposal,
+            operation_index,
+            targets,
+        )
+    return owners
+
+
+def _mutation_scope_digest(
+    database_name: str,
+    property_name: str,
+    identity: tuple[str, str],
+) -> str:
+    return sha256_json(
+        {
+            "version": 2,
+            "database": database_name,
+            "entity_identity": {
+                "kind": identity[0],
+                "value": identity[1],
+            },
+            "property": property_name,
+        }
+    )
+
+
+def _mutation_scope(
+    connection: sqlite3.Connection,
+    proposal: ProposalRevision,
+    operation: ProposalOperation,
+) -> tuple[str, str, str, str, str]:
+    change = operation.change
+    case_number = str(
+        proposal.correction_binding.get("case_number")
+        or change.entity_key
+    )
+    identity_kind, identity_value = _canonical_mutation_identity(
+        connection,
+        proposal,
+        operation,
+    )
+    digest = _mutation_scope_digest(
+        change.target_database,
+        change.property_name,
+        (identity_kind, identity_value),
+    )
+    return (
+        digest,
+        case_number,
+        change.target_database,
+        change.entity_key,
+        change.property_name,
+    )
 
 
 def _safe_schema_reason_code(value: str) -> str:
@@ -388,34 +917,108 @@ class StateDatabase:
         finally:
             connection.close()
 
+    @staticmethod
+    def _initialize_schema_and_migrations(
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.executescript(SCHEMA)
+        proposal_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(proposal)"
+            ).fetchall()
+        }
+        if "purpose" not in proposal_columns:
+            connection.execute(
+                "ALTER TABLE proposal ADD COLUMN purpose TEXT NOT NULL "
+                f"DEFAULT '{EXCEL_SYNC_PURPOSE}'"
+            )
+        event_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(schema_gateway_event_claim)"
+            ).fetchall()
+        }
+        if "telegram_user_id" not in event_columns:
+            connection.execute(
+                "ALTER TABLE schema_gateway_event_claim ADD COLUMN "
+                "telegram_user_id TEXT NOT NULL DEFAULT ''"
+            )
+        journal_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(schema_apply_journal)"
+            ).fetchall()
+        }
+        if "attempt_started_at" not in journal_columns:
+            connection.execute(
+                "ALTER TABLE schema_apply_journal ADD COLUMN attempt_started_at TEXT"
+            )
+        if "attempt_finished_at" not in journal_columns:
+            connection.execute(
+                "ALTER TABLE schema_apply_journal ADD COLUMN attempt_finished_at TEXT"
+            )
+
     def initialize(self) -> None:
+        """Create/migrate state and fail closed while rebuilding active claims."""
+
         with self.session() as connection:
-            connection.executescript(SCHEMA)
-            event_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(schema_gateway_event_claim)"
-                ).fetchall()
-            }
-            if "telegram_user_id" not in event_columns:
-                connection.execute(
-                    "ALTER TABLE schema_gateway_event_claim ADD COLUMN "
-                    "telegram_user_id TEXT NOT NULL DEFAULT ''"
+            self._initialize_schema_and_migrations(connection)
+            self._backfill_active_mutation_scope_claims(connection)
+
+    def initialize_for_legacy_rejection(self) -> None:
+        """Create/migrate state without granting or rebuilding mutation claims.
+
+        The trusted gateway may call this only for an exact authenticated
+        rejection after normal initialization raised ``MutationScopeConflict``.
+        """
+
+        with self.session() as connection:
+            self._initialize_schema_and_migrations(connection)
+
+    def _backfill_active_mutation_scope_claims(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Deterministically claim every active legacy proposal head.
+
+        This migration is intentionally fail closed. If two proposal heads
+        resolve to the same canonical Notion page/property, initialization
+        raises and rolls back the backfill instead of selecting a winner.
+        """
+
+        statuses = tuple(
+            sorted(status.value for status in _ACTIVE_MUTATION_CLAIM_STATUSES)
+        )
+        placeholders = ",".join("?" for _ in statuses)
+        rows = connection.execute(
+            "SELECT p.proposal_id, p.current_revision, p.status, "
+            "r.payload FROM proposal AS p "
+            "JOIN proposal_revision AS r "
+            "ON r.proposal_id = p.proposal_id "
+            "AND r.revision = p.current_revision "
+            f"WHERE p.status IN ({placeholders}) "
+            "ORDER BY p.created_at, p.proposal_id",
+            statuses,
+        ).fetchall()
+        now = datetime.now().astimezone().isoformat()
+        for row in rows:
+            proposal = _proposal_from_dict(
+                json.loads(str(row["payload"]))
+            )
+            if (
+                proposal.proposal_id != str(row["proposal_id"])
+                or proposal.revision != int(row["current_revision"])
+            ):
+                raise MutationScopeConflict(
+                    "Stored active proposal head is inconsistent"
                 )
-            journal_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(schema_apply_journal)"
-                ).fetchall()
-            }
-            if "attempt_started_at" not in journal_columns:
-                connection.execute(
-                    "ALTER TABLE schema_apply_journal ADD COLUMN attempt_started_at TEXT"
-                )
-            if "attempt_finished_at" not in journal_columns:
-                connection.execute(
-                    "ALTER TABLE schema_apply_journal ADD COLUMN attempt_finished_at TEXT"
-                )
+            proposal.status = ProposalStatus(str(row["status"]))
+            self._synchronize_mutation_scope_claims(
+                connection,
+                proposal,
+                now=now,
+            )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -489,7 +1092,7 @@ class StateDatabase:
                 }
                 if owner_alive or (not same_proposal and not terminal_holder):
                     raise ApplyLeaseError(
-                        "Another approved synchronization owns this OneDrive "
+                        "Another approved synchronization owns this configured source "
                         f"source (proposal {row['proposal_id']}/{row['revision']})"
                     )
                 connection.execute(
@@ -599,6 +1202,486 @@ class StateDatabase:
                 (drive_id, item_id),
             ).fetchone()
         return dict(row) if row else None
+
+    def get_approved_override(
+        self,
+        database_name: str,
+        entity_key: str,
+        property_name: str,
+    ) -> dict[str, Any] | None:
+        """Return the active, approval-backed value for one Notion property.
+
+        This lookup is intentionally scoped only by the logical Notion
+        mutation target. Whether the override can be reused for a new Excel
+        observation is decided separately by comparing its stable
+        ``source_basis_digest``.
+        """
+
+        change = ProposedChange(
+            target_database=database_name,
+            entity_key=entity_key,
+            property_name=property_name,
+            kind=ChangeKind.UPDATE,
+            current_value=None,
+            proposed_value=None,
+            analyzer="approved_override_lookup",
+            analyzer_version="1",
+            confidence=1.0,
+            reason="local override lookup",
+            source_refs=[],
+        )
+        operation = ProposalOperation(change=change)
+        proposal = ProposalRevision(
+            proposal_id="approved-override-lookup",
+            revision=1,
+            source_version_id="lookup",
+            source_file_hash="lookup",
+            requested_by="local",
+            chat_id="local",
+            operations=[operation],
+        )
+        return self.get_approved_override_for_operation(
+            proposal,
+            operation,
+        )
+
+    def _stored_override_identity(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> tuple[str, str, str]:
+        return self._precompute_stored_override_identities(
+            connection,
+            [row],
+        )[str(row["scope_digest"])]
+
+    def _precompute_stored_override_identities(
+        self,
+        connection: sqlite3.Connection,
+        rows: Iterable[sqlite3.Row],
+    ) -> dict[str, tuple[str, str, str]]:
+        """Resolve stored override targets once per owner proposal revision."""
+
+        row_list = list(rows)
+        identities: dict[str, tuple[str, str, str]] = {}
+        rows_by_owner: dict[
+            tuple[str, int],
+            list[sqlite3.Row],
+        ] = {}
+        try:
+            for row in row_list:
+                rows_by_owner.setdefault(
+                    (
+                        str(row["proposal_id"]),
+                        int(row["revision"]),
+                    ),
+                    [],
+                ).append(row)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MutationScopeConflict(
+                "Stored approved override owner is inconsistent"
+            ) from exc
+
+        def use_weak_fallback(owner_rows: Iterable[sqlite3.Row]) -> None:
+            for owner_row in owner_rows:
+                match_value = str(owner_row["entity_key"]).split(
+                    ":",
+                    1,
+                )[-1]
+                identities[str(owner_row["scope_digest"])] = (
+                    "match_value",
+                    match_value,
+                    match_value,
+                )
+
+        for owner_key, owner_rows in rows_by_owner.items():
+            revision = connection.execute(
+                "SELECT payload FROM proposal_revision "
+                "WHERE proposal_id = ? AND revision = ?",
+                owner_key,
+            ).fetchone()
+            if revision is None:
+                use_weak_fallback(owner_rows)
+                continue
+            try:
+                proposal = _proposal_from_dict(
+                    json.loads(str(revision["payload"]))
+                )
+                if (
+                    proposal.proposal_id != owner_key[0]
+                    or proposal.revision != owner_key[1]
+                ):
+                    use_weak_fallback(owner_rows)
+                    continue
+                operation_ids = {
+                    str(owner_row["operation_id"])
+                    for owner_row in owner_rows
+                }
+                operation_index: dict[str, ProposalOperation] = {}
+                for operation in proposal.operations:
+                    operation_id = operation.change.operation_id
+                    if operation_id in operation_ids:
+                        operation_index.setdefault(
+                            operation_id,
+                            operation,
+                        )
+                relevant_operations = list(operation_index.values())
+                targets = _precompute_mutation_targets(
+                    connection,
+                    proposal,
+                    relevant_operations,
+                )
+                for owner_row in owner_rows:
+                    operation = operation_index.get(
+                        str(owner_row["operation_id"])
+                    )
+                    if operation is None:
+                        use_weak_fallback([owner_row])
+                        continue
+                    target = targets[id(operation)]
+                    identities[str(owner_row["scope_digest"])] = (
+                        target.identity[0],
+                        target.identity[1],
+                        target.match_value,
+                    )
+            except (KeyError, TypeError, ValueError):
+                use_weak_fallback(owner_rows)
+        return identities
+
+    def _find_approved_override(
+        self,
+        connection: sqlite3.Connection,
+        proposal: ProposalRevision,
+        operation: ProposalOperation,
+        *,
+        candidate_rows: Iterable[sqlite3.Row] | None = None,
+        current_target: _PrecomputedMutationTarget | None = None,
+        stored_identity_cache: (
+            dict[str, tuple[str, str, str]] | None
+        ) = None,
+        mapped_pages_cache: (
+            dict[tuple[str, str], set[str]] | None
+        ) = None,
+    ) -> sqlite3.Row | None:
+        change = operation.change
+        if current_target is None:
+            current_target = _precompute_mutation_targets(
+                connection,
+                proposal,
+                [operation],
+            )[id(operation)]
+        current_identity = current_target.identity
+        current_match_value = current_target.match_value
+        scope_digest = _mutation_scope_digest(
+            change.target_database,
+            change.property_name,
+            current_identity,
+        )
+        rows = (
+            list(candidate_rows)
+            if candidate_rows is not None
+            else connection.execute(
+                "SELECT * FROM approved_override "
+                "WHERE database_name = ? AND property_name = ? "
+                "ORDER BY updated_at DESC, scope_digest",
+                (change.target_database, change.property_name),
+            ).fetchall()
+        )
+        candidates: list[sqlite3.Row] = []
+        for row in rows:
+            if str(row["scope_digest"]) == scope_digest:
+                candidates.append(row)
+                continue
+            row_digest = str(row["scope_digest"])
+            stored_identity = (
+                stored_identity_cache.get(row_digest)
+                if stored_identity_cache is not None
+                else None
+            )
+            if stored_identity is None:
+                stored_identity = self._stored_override_identity(
+                    connection,
+                    row,
+                )
+                if stored_identity_cache is not None:
+                    stored_identity_cache[row_digest] = stored_identity
+            stored_kind, stored_value, stored_match = stored_identity
+            if stored_match != current_match_value:
+                continue
+            current_kind, current_value = current_identity
+            if current_kind == stored_kind == "notion_page":
+                if current_value == stored_value:
+                    candidates.append(row)
+                continue
+            if current_kind == "match_value":
+                candidates.append(row)
+                continue
+            if stored_kind == "match_value":
+                mapping_key = (
+                    change.target_database,
+                    current_match_value,
+                )
+                mapped_pages = (
+                    mapped_pages_cache.get(mapping_key)
+                    if mapped_pages_cache is not None
+                    else None
+                )
+                if mapped_pages is None:
+                    mapped_pages = {
+                        str(mapped["notion_page_id"])
+                        for mapped in connection.execute(
+                            "SELECT DISTINCT notion_page_id "
+                            "FROM entity_mapping WHERE database_name = ? "
+                            "AND match_value = ?",
+                            mapping_key,
+                        ).fetchall()
+                    }
+                    if mapped_pages_cache is not None:
+                        mapped_pages_cache[mapping_key] = mapped_pages
+                if mapped_pages == {current_value}:
+                    candidates.append(row)
+        if not candidates:
+            return None
+        signatures = {
+            (
+                str(row["approved_value"]),
+                str(row["source_basis_digest"]),
+            )
+            for row in candidates
+        }
+        if len(signatures) != 1:
+            raise MutationScopeConflict(
+                "Conflicting approved overrides resolve to the same "
+                "Notion page/property"
+            )
+        return candidates[0]
+
+    def get_approved_overrides_for_operations(
+        self,
+        proposal: ProposalRevision,
+        operations: Iterable[ProposalOperation],
+    ) -> list[dict[str, Any] | None]:
+        """Resolve source-value overrides in one state DB read session."""
+
+        operation_list = list(operations)
+        if not operation_list:
+            return []
+        results: list[dict[str, Any] | None] = [
+            None
+            for _ in operation_list
+        ]
+        applicable = [
+            operation
+            for operation in operation_list
+            if operation.change.target_database != _HISTORY_DATABASE
+        ]
+        if not applicable:
+            return results
+        with self.session() as connection:
+            rows = connection.execute(
+                "SELECT * FROM approved_override "
+                "ORDER BY updated_at DESC, scope_digest"
+            ).fetchall()
+            if not rows:
+                return results
+            relevant_buckets = {
+                (
+                    operation.change.target_database,
+                    operation.change.property_name,
+                )
+                for operation in applicable
+            }
+            relevant_rows = [
+                row
+                for row in rows
+                if (
+                    str(row["database_name"]),
+                    str(row["property_name"]),
+                )
+                in relevant_buckets
+            ]
+            if not relevant_rows:
+                return results
+            available_buckets = {
+                (
+                    str(row["database_name"]),
+                    str(row["property_name"]),
+                )
+                for row in relevant_rows
+            }
+            relevant = [
+                operation
+                for operation in applicable
+                if (
+                    operation.change.target_database,
+                    operation.change.property_name,
+                )
+                in available_buckets
+            ]
+            targets = _precompute_mutation_targets(
+                connection,
+                proposal,
+                relevant,
+            )
+            stored_identity_cache = (
+                self._precompute_stored_override_identities(
+                    connection,
+                    relevant_rows,
+                )
+            )
+            row_order = {
+                str(row["scope_digest"]): index
+                for index, row in enumerate(relevant_rows)
+            }
+            exact_rows: dict[
+                tuple[str, str, str],
+                list[sqlite3.Row],
+            ] = {}
+            all_match_rows: dict[
+                tuple[str, str, str],
+                list[sqlite3.Row],
+            ] = {}
+            strong_match_rows: dict[
+                tuple[str, str, str, str],
+                list[sqlite3.Row],
+            ] = {}
+            weak_match_rows: dict[
+                tuple[str, str, str],
+                list[sqlite3.Row],
+            ] = {}
+            for row in relevant_rows:
+                database_name = str(row["database_name"])
+                property_name = str(row["property_name"])
+                scope_digest = str(row["scope_digest"])
+                stored_kind, stored_value, stored_match = (
+                    stored_identity_cache[scope_digest]
+                )
+                exact_rows.setdefault(
+                    (database_name, property_name, scope_digest),
+                    [],
+                ).append(row)
+                match_key = (
+                    database_name,
+                    property_name,
+                    stored_match,
+                )
+                all_match_rows.setdefault(match_key, []).append(row)
+                if stored_kind == "notion_page":
+                    strong_match_rows.setdefault(
+                        (*match_key, stored_value),
+                        [],
+                    ).append(row)
+                else:
+                    weak_match_rows.setdefault(match_key, []).append(row)
+
+            mapped_pages_cache: dict[
+                tuple[str, str],
+                set[str],
+            ] = {
+                (database_name, match_value): set()
+                for database_name, _property_name, match_value
+                in weak_match_rows
+            }
+            if mapped_pages_cache:
+                for mapping in connection.execute(
+                    "SELECT database_name, match_value, notion_page_id "
+                    "FROM entity_mapping"
+                ).fetchall():
+                    mapping_key = (
+                        str(mapping["database_name"]),
+                        str(mapping["match_value"]),
+                    )
+                    if mapping_key in mapped_pages_cache:
+                        page_id = str(mapping["notion_page_id"])
+                        if page_id:
+                            mapped_pages_cache[mapping_key].add(page_id)
+
+            for index, operation in enumerate(operation_list):
+                change = operation.change
+                if (
+                    change.target_database == _HISTORY_DATABASE
+                    or (
+                        change.target_database,
+                        change.property_name,
+                    )
+                    not in available_buckets
+                ):
+                    continue
+                target = targets[id(operation)]
+                scope_digest = _mutation_scope_digest(
+                    change.target_database,
+                    change.property_name,
+                    target.identity,
+                )
+                match_key = (
+                    change.target_database,
+                    change.property_name,
+                    target.match_value,
+                )
+                candidate_groups: list[list[sqlite3.Row]] = [
+                    exact_rows.get(
+                        (
+                            change.target_database,
+                            change.property_name,
+                            scope_digest,
+                        ),
+                        [],
+                    )
+                ]
+                if target.identity[0] == "notion_page":
+                    candidate_groups.extend(
+                        (
+                            strong_match_rows.get(
+                                (*match_key, target.identity[1]),
+                                [],
+                            ),
+                            weak_match_rows.get(match_key, []),
+                        )
+                    )
+                else:
+                    candidate_groups.append(
+                        all_match_rows.get(match_key, [])
+                    )
+                candidate_rows_by_digest = {
+                    str(candidate["scope_digest"]): candidate
+                    for group in candidate_groups
+                    for candidate in group
+                }
+                candidate_rows = sorted(
+                    candidate_rows_by_digest.values(),
+                    key=lambda candidate: row_order[
+                        str(candidate["scope_digest"])
+                    ],
+                )
+                row = self._find_approved_override(
+                    connection,
+                    proposal,
+                    operation,
+                    candidate_rows=candidate_rows,
+                    current_target=target,
+                    stored_identity_cache=stored_identity_cache,
+                    mapped_pages_cache=mapped_pages_cache,
+                )
+                if row is None:
+                    continue
+                result = dict(row)
+                result["approved_value"] = json.loads(
+                    str(result["approved_value"])
+                )
+                results[index] = result
+        return results
+
+    def get_approved_override_for_operation(
+        self,
+        proposal: ProposalRevision,
+        operation: ProposalOperation,
+    ) -> dict[str, Any] | None:
+        """Resolve an override through canonical page and title identities."""
+
+        return self.get_approved_overrides_for_operations(
+            proposal,
+            [operation],
+        )[0]
 
     def get_ingestion_checkpoint(self, stream_key: str) -> dict[str, Any] | None:
         if not stream_key.strip():
@@ -712,6 +1795,117 @@ class StateDatabase:
             )
         return winner
 
+    def claim_correction_gateway_event(
+        self,
+        *,
+        telegram_user_id: str,
+        chat_id: str,
+        message_id: str,
+        update_id: int,
+        request_digest: str,
+        proposal_id: str,
+    ) -> dict[str, Any]:
+        """Claim one exact Telegram correction event idempotently.
+
+        A Telegram retry with the same event and canonical request returns the
+        existing claim. Reuse of either the update ID or message ID with
+        different content fails closed.
+        """
+
+        values = {
+            "telegram_user_id": str(telegram_user_id).strip(),
+            "chat_id": str(chat_id).strip(),
+            "message_id": str(message_id).strip(),
+            "proposal_id": str(proposal_id).strip(),
+        }
+        if any(not value or len(value) > 256 for value in values.values()):
+            raise ValueError("Correction event identifiers are invalid")
+        if isinstance(update_id, bool) or not isinstance(update_id, int) or update_id < 0:
+            raise ValueError("Correction Telegram update_id is invalid")
+        digest = str(request_digest).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("Correction request digest must be SHA-256")
+        event_key = sha256_json(
+            {
+                "purpose": USER_CORRECTION_PURPOSE,
+                "telegram_user_id": values["telegram_user_id"],
+                "chat_id": values["chat_id"],
+                "message_id": values["message_id"],
+                "update_id": update_id,
+            }
+        )
+        now = datetime.now().astimezone().isoformat()
+        expected = {
+            "event_key": event_key,
+            **values,
+            "update_id": update_id,
+            "request_digest": digest,
+        }
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM correction_gateway_event_claim
+                WHERE event_key = ?
+                   OR (telegram_user_id = ? AND update_id = ?)
+                   OR (chat_id = ? AND message_id = ?)
+                """,
+                (
+                    event_key,
+                    values["telegram_user_id"],
+                    update_id,
+                    values["chat_id"],
+                    values["message_id"],
+                ),
+            ).fetchone()
+            if row is not None:
+                existing = dict(row)
+                if any(
+                    str(existing[key]) != str(value)
+                    for key, value in expected.items()
+                ):
+                    raise CorrectionEventClaimError(
+                        "Telegram correction event was replayed with changed content"
+                    )
+                return existing
+            connection.execute(
+                """
+                INSERT INTO correction_gateway_event_claim(
+                    event_key, telegram_user_id, chat_id, message_id, update_id,
+                    request_digest, proposal_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    values["telegram_user_id"],
+                    values["chat_id"],
+                    values["message_id"],
+                    update_id,
+                    digest,
+                    values["proposal_id"],
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO audit_log("
+                "event_type, proposal_id, actor, details, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    "correction_gateway_event_claimed",
+                    values["proposal_id"],
+                    values["telegram_user_id"],
+                    json.dumps(
+                        {
+                            "event_key": event_key,
+                            "request_digest": digest,
+                            "telegram_update_id": update_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return {**expected, "created_at": now}
+
     def commit_checkpoint(
         self,
         drive_id: str,
@@ -777,17 +1971,365 @@ class StateDatabase:
                 ),
             )
 
-    def save_proposal(self, proposal: ProposalRevision) -> None:
+    def _desired_mutation_scope_claims(
+        self,
+        connection: sqlite3.Connection,
+        proposal: ProposalRevision,
+    ) -> dict[
+        str,
+        tuple[
+            ProposalOperation,
+            str,
+            str,
+            str,
+            str,
+            tuple[str, str],
+            str,
+        ],
+    ]:
+        desired: dict[
+            str,
+            tuple[
+                ProposalOperation,
+                str,
+                str,
+                str,
+                str,
+                tuple[str, str],
+                str,
+            ],
+        ] = {}
+        completed_outbox_operations: set[str] = set()
+        if any(
+            operation.action is ProposalAction.EXCLUDE
+            and operation.user_override
+            for operation in proposal.operations
+        ):
+            completed_outbox_operations = {
+                str(row["operation_id"])
+                for row in connection.execute(
+                    "SELECT operation_id FROM outbox WHERE status = 'done'"
+                ).fetchall()
+            }
+
+        candidate_operations: list[ProposalOperation] = []
+        for operation in proposal.operations:
+            change = operation.change
+            if change.target_database == _HISTORY_DATABASE:
+                continue
+            retain_completed_override = (
+                operation.action is ProposalAction.EXCLUDE
+                and operation.user_override
+                and change.operation_id in completed_outbox_operations
+            )
+            if (
+                operation.action is ProposalAction.EXCLUDE
+                and not retain_completed_override
+            ):
+                continue
+            candidate_operations.append(operation)
+
+        targets = _precompute_mutation_targets(
+            connection,
+            proposal,
+            candidate_operations,
+        )
+        all_match_scopes: set[tuple[str, str, str]] = set()
+        weak_match_scopes: set[tuple[str, str, str]] = set()
+        for operation in candidate_operations:
+            change = operation.change
+            target = targets[id(operation)]
+            identity = target.identity
+            match_value = target.match_value
+            database_name = change.target_database
+            entity_key = change.entity_key
+            property_name = change.property_name
+            case_number = str(
+                proposal.correction_binding.get("case_number")
+                or entity_key
+            )
+            scope_digest = _mutation_scope_digest(
+                database_name,
+                property_name,
+                identity,
+            )
+            if scope_digest in desired:
+                previous = desired[scope_digest][0]
+                if (
+                    previous.change.operation_id
+                    == operation.change.operation_id
+                    and previous.digest_payload()
+                    == operation.digest_payload()
+                ):
+                    # An exact deterministic duplicate has one stable outbox
+                    # identity and one semantic mutation, so one external
+                    # claim is sufficient.
+                    continue
+                raise ProposalInternalScopeConflict(
+                    "One proposal contains multiple non-identical mutations "
+                    f"for {database_name}/{entity_key}/{property_name}"
+                )
+            match_scope = (
+                database_name,
+                property_name,
+                match_value,
+            )
+            weak_identity = identity[0] != "notion_page"
+            overlapping_match = (
+                match_scope in all_match_scopes
+                if weak_identity
+                else match_scope in weak_match_scopes
+            )
+            if overlapping_match:
+                raise ProposalInternalScopeConflict(
+                    "One proposal contains multiple non-identical "
+                    "mutations for "
+                    f"{database_name}/{entity_key}/{property_name}"
+                )
+            desired[scope_digest] = (
+                operation,
+                case_number,
+                database_name,
+                entity_key,
+                property_name,
+                identity,
+                match_value,
+            )
+            all_match_scopes.add(match_scope)
+            if weak_identity:
+                weak_match_scopes.add(match_scope)
+        return desired
+
+    def _synchronize_mutation_scope_claims(
+        self,
+        connection: sqlite3.Connection,
+        proposal: ProposalRevision,
+        *,
+        now: str,
+    ) -> None:
+        if proposal.status not in _ACTIVE_MUTATION_CLAIM_STATUSES:
+            connection.execute(
+                "DELETE FROM mutation_scope_claim WHERE proposal_id = ?",
+                (proposal.proposal_id,),
+            )
+            return
+
+        desired = self._desired_mutation_scope_claims(
+            connection,
+            proposal,
+        )
+
+        existing_owned = connection.execute(
+            "SELECT scope_digest FROM mutation_scope_claim "
+            "WHERE proposal_id = ?",
+            (proposal.proposal_id,),
+        ).fetchall()
+        stale_digests = [
+            str(row["scope_digest"])
+            for row in existing_owned
+            if str(row["scope_digest"]) not in desired
+        ]
+        if stale_digests:
+            # Do not construct one unbounded ``NOT IN`` expression. Production
+            # SQLite builds may retain the legacy 999-variable limit, while an
+            # initial full reconcile can legitimately claim many thousands of
+            # independent Notion properties.
+            connection.executemany(
+                "DELETE FROM mutation_scope_claim "
+                "WHERE proposal_id = ? AND scope_digest = ?",
+                (
+                    (proposal.proposal_id, scope_digest)
+                    for scope_digest in stale_digests
+                ),
+            )
+
+        claim_state = (
+            "recovery"
+            if proposal.status is ProposalStatus.FAILED
+            else proposal.status.value
+        )
+        relevant_buckets = {
+            (claim[2], claim[4])
+            for claim in desired.values()
+        }
+        claim_rows = connection.execute(
+            "SELECT * FROM mutation_scope_claim ORDER BY scope_digest"
+        ).fetchall()
+        existing_by_digest = {
+            str(row["scope_digest"]): row
+            for row in claim_rows
+        }
+        exact_identity_claims: dict[
+            tuple[str, str, tuple[str, str]],
+            set[str],
+        ] = {}
+        all_match_claims: dict[
+            tuple[str, str, str],
+            set[str],
+        ] = {}
+        weak_match_claims: dict[
+            tuple[str, str, str],
+            set[str],
+        ] = {}
+        foreign_claim_rows = [
+            row
+            for row in claim_rows
+            if str(row["proposal_id"]) != proposal.proposal_id
+            and (
+                str(row["database_name"]),
+                str(row["property_name"]),
+            )
+            in relevant_buckets
+        ]
+        foreign_owners = _precompute_stored_mutation_claim_owners(
+            connection,
+            foreign_claim_rows,
+        )
+        for row in foreign_claim_rows:
+            database_name = str(row["database_name"])
+            property_name = str(row["property_name"])
+            try:
+                owner_key = (
+                    str(row["proposal_id"]),
+                    int(row["revision"]),
+                )
+                owner = foreign_owners[owner_key]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MutationScopeConflict(
+                    "Stored mutation-scope claim owner is inconsistent"
+                ) from exc
+            identity, match_value = _stored_mutation_claim_target(
+                row,
+                owner,
+            )
+            scope_digest = str(row["scope_digest"])
+            exact_identity_claims.setdefault(
+                (database_name, property_name, identity),
+                set(),
+            ).add(scope_digest)
+            match_key = (
+                database_name,
+                property_name,
+                match_value,
+            )
+            all_match_claims.setdefault(match_key, set()).add(
+                scope_digest
+            )
+            if identity[0] != "notion_page":
+                weak_match_claims.setdefault(match_key, set()).add(
+                    scope_digest
+                )
+
+        for scope_digest, (
+            operation,
+            case_number,
+            database_name,
+            entity_key,
+            property_name,
+            identity,
+            match_value,
+        ) in desired.items():
+            exact_conflicts = exact_identity_claims.get(
+                (database_name, property_name, identity),
+                set(),
+            )
+            match_key = (
+                database_name,
+                property_name,
+                match_value,
+            )
+            match_conflicts = (
+                all_match_claims.get(match_key, set())
+                if identity[0] != "notion_page"
+                else weak_match_claims.get(match_key, set())
+            )
+            if (
+                exact_conflicts - {scope_digest}
+                or match_conflicts - {scope_digest}
+            ):
+                raise MutationScopeConflict(
+                    "Another active proposal already owns "
+                    f"{database_name}/{entity_key}/{property_name}"
+                )
+            existing = existing_by_digest.get(scope_digest)
+            if existing is not None:
+                same_proposal = (
+                    str(existing["proposal_id"]) == proposal.proposal_id
+                )
+                pending_transfer = (
+                    str(existing["claim_state"]) == "pending"
+                    and str(existing["operation_id"])
+                    == operation.change.operation_id
+                )
+                if not same_proposal and not pending_transfer:
+                    raise MutationScopeConflict(
+                        "Another active proposal already owns "
+                        f"{database_name}/{entity_key}/{property_name}"
+                    )
+                connection.execute(
+                    """
+                    UPDATE mutation_scope_claim SET
+                        case_number = ?, database_name = ?, entity_key = ?,
+                        property_name = ?, operation_id = ?, proposal_id = ?,
+                        revision = ?, claim_state = ?, updated_at = ?
+                    WHERE scope_digest = ?
+                    """,
+                    (
+                        case_number,
+                        database_name,
+                        entity_key,
+                        property_name,
+                        operation.change.operation_id,
+                        proposal.proposal_id,
+                        proposal.revision,
+                        claim_state,
+                        now,
+                        scope_digest,
+                    ),
+                )
+                continue
+            connection.execute(
+                """
+                INSERT INTO mutation_scope_claim(
+                    scope_digest, case_number, database_name, entity_key,
+                    property_name, operation_id, proposal_id, revision,
+                    claim_state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope_digest,
+                    case_number,
+                    database_name,
+                    entity_key,
+                    property_name,
+                    operation.change.operation_id,
+                    proposal.proposal_id,
+                    proposal.revision,
+                    claim_state,
+                    now,
+                    now,
+                ),
+            )
+
+    def save_proposal(
+        self,
+        proposal: ProposalRevision,
+        *,
+        staged_pending_changes: Iterable[ProposedChange] = (),
+    ) -> None:
         payload = json.dumps(dataclass_to_dict(proposal), ensure_ascii=False)
+        pending_changes = list(staged_pending_changes)
+        now = datetime.now().astimezone().isoformat()
         with self.transaction() as connection:
             connection.execute(
                 """
                 INSERT INTO proposal(
-                    proposal_id, current_revision, requested_by, chat_id,
+                    proposal_id, current_revision, purpose, requested_by, chat_id,
                     source_version_id, source_file_hash, status, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
                     current_revision = excluded.current_revision,
+                    purpose = excluded.purpose,
                     source_version_id = excluded.source_version_id,
                     source_file_hash = excluded.source_file_hash,
                     status = excluded.status,
@@ -796,6 +2338,7 @@ class StateDatabase:
                 (
                     proposal.proposal_id,
                     proposal.revision,
+                    proposal.purpose.value,
                     proposal.requested_by,
                     proposal.chat_id,
                     proposal.source_version_id,
@@ -804,6 +2347,11 @@ class StateDatabase:
                     proposal.created_at.isoformat(),
                     proposal.expires_at.isoformat() if proposal.expires_at else None,
                 ),
+            )
+            self._synchronize_mutation_scope_claims(
+                connection,
+                proposal,
+                now=now,
             )
             connection.execute(
                 """
@@ -819,6 +2367,217 @@ class StateDatabase:
                     proposal.created_at.isoformat(),
                 ),
             )
+            for change in pending_changes:
+                operation = ProposalOperation(
+                    change=change,
+                    action=ProposalAction.DEFER,
+                    approved_value=change.proposed_value,
+                )
+                operation_payload = json.dumps(
+                    dataclass_to_dict(operation),
+                    ensure_ascii=False,
+                    default=str,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO pending_change(
+                        operation_id, proposal_id, payload, created_at, resolved_at
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    ON CONFLICT(operation_id) DO UPDATE SET
+                        proposal_id = excluded.proposal_id,
+                        payload = excluded.payload,
+                        created_at = excluded.created_at,
+                        resolved_at = NULL
+                    """,
+                    (
+                        change.operation_id,
+                        proposal.proposal_id,
+                        operation_payload,
+                        now,
+                    ),
+                )
+
+    def reject_proposal_atomically(
+        self,
+        proposal_id: str,
+        *,
+        expected_revision: int,
+        actor: str,
+        chat_id: str,
+        gateway_audit_details: dict[str, Any] | None = None,
+    ) -> ProposalRevision:
+        """Reject one exact proposal head without deriving mutation scopes."""
+
+        now = datetime.now().astimezone().isoformat()
+        with self.transaction() as connection:
+            head = connection.execute(
+                "SELECT * FROM proposal WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if head is None:
+                raise ProposalRejectionError("Proposal was not found")
+            current_revision = int(head["current_revision"])
+            if current_revision != expected_revision:
+                raise ProposalRejectionError(
+                    "Only the current proposal revision can be rejected"
+                )
+            if str(head["requested_by"]) != str(actor):
+                raise ProposalRejectionError(
+                    "Only the request owner can reject the proposal"
+                )
+            if str(head["chat_id"]) != str(chat_id):
+                raise ProposalRejectionError(
+                    "Proposal must be rejected from the original Telegram chat"
+                )
+
+            revision_row = connection.execute(
+                "SELECT digest, payload FROM proposal_revision "
+                "WHERE proposal_id = ? AND revision = ?",
+                (proposal_id, current_revision),
+            ).fetchone()
+            if revision_row is None:
+                raise ProposalRejectionError(
+                    "Current proposal revision is missing"
+                )
+            original_payload = str(revision_row["payload"])
+            stored_digest = str(revision_row["digest"])
+            try:
+                proposal = _proposal_from_dict(json.loads(original_payload))
+                head_status = ProposalStatus(str(head["status"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ProposalRejectionError(
+                    "Current proposal state is invalid"
+                ) from exc
+
+            expected_expires_at = (
+                proposal.expires_at.isoformat()
+                if proposal.expires_at is not None
+                else None
+            )
+            consistent = (
+                proposal.proposal_id == proposal_id
+                and proposal.revision == current_revision
+                and proposal.requested_by == str(head["requested_by"])
+                and proposal.chat_id == str(head["chat_id"])
+                and proposal.source_version_id
+                == str(head["source_version_id"])
+                and proposal.source_file_hash
+                == str(head["source_file_hash"])
+                and proposal.purpose.value == str(head["purpose"])
+                and proposal.status is head_status
+                and expected_expires_at == head["expires_at"]
+                and proposal.digest == stored_digest
+            )
+            if not consistent:
+                raise ProposalRejectionError(
+                    "Proposal head and current revision are inconsistent"
+                )
+            if head_status in {
+                ProposalStatus.APPLYING,
+                ProposalStatus.COMMITTED,
+                ProposalStatus.REJECTED,
+            }:
+                raise ProposalRejectionError(
+                    f"Proposal cannot be rejected in {head_status.value}"
+                )
+            if connection.execute(
+                "SELECT 1 FROM outbox WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone() is not None:
+                raise ProposalRejectionError(
+                    "A proposal with a started apply must be recovered and "
+                    "finalized before it can close"
+                )
+            if connection.execute(
+                "SELECT 1 FROM source_apply_lease "
+                "WHERE proposal_id = ? LIMIT 1",
+                (proposal_id,),
+            ).fetchone() is not None:
+                raise ProposalRejectionError(
+                    "A proposal with an active apply lease must be recovered "
+                    "and finalized before it can close"
+                )
+            if connection.execute(
+                "SELECT 1 FROM approval_receipt WHERE proposal_id = ? "
+                "AND used_at IS NOT NULL LIMIT 1",
+                (proposal_id,),
+            ).fetchone() is not None:
+                raise ProposalRejectionError(
+                    "A proposal with a consumed approval must be recovered "
+                    "and finalized before it can close"
+                )
+
+            proposal.status = ProposalStatus.REJECTED
+            rejected_payload = json.dumps(
+                dataclass_to_dict(proposal),
+                ensure_ascii=False,
+            )
+            head_cursor = connection.execute(
+                "UPDATE proposal SET status = ? WHERE proposal_id = ? "
+                "AND current_revision = ? AND status = ? "
+                "AND requested_by = ? AND chat_id = ?",
+                (
+                    ProposalStatus.REJECTED.value,
+                    proposal_id,
+                    current_revision,
+                    head_status.value,
+                    str(actor),
+                    str(chat_id),
+                ),
+            )
+            revision_cursor = connection.execute(
+                "UPDATE proposal_revision SET payload = ? "
+                "WHERE proposal_id = ? AND revision = ? "
+                "AND digest = ? AND payload = ?",
+                (
+                    rejected_payload,
+                    proposal_id,
+                    current_revision,
+                    stored_digest,
+                    original_payload,
+                ),
+            )
+            if head_cursor.rowcount != 1 or revision_cursor.rowcount != 1:
+                raise ProposalRejectionError(
+                    "Proposal state changed before rejection completed"
+                )
+            connection.execute(
+                "DELETE FROM mutation_scope_claim WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            connection.execute(
+                "INSERT INTO audit_log("
+                "event_type, proposal_id, actor, details, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    "proposal_rejected",
+                    proposal_id,
+                    str(actor),
+                    json.dumps(
+                        {"revision": current_revision},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+            if gateway_audit_details is not None:
+                connection.execute(
+                    "INSERT INTO audit_log("
+                    "event_type, proposal_id, actor, details, created_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "telegram_gateway_command",
+                        proposal_id,
+                        str(actor),
+                        json.dumps(
+                            gateway_audit_details,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        now,
+                    ),
+                )
+        return proposal
 
     def load_proposal(self, proposal_id: str, revision: int | None = None) -> ProposalRevision:
         with self.session() as connection:
@@ -856,6 +2615,25 @@ class StateDatabase:
                         json.dumps(dataclass_to_dict(revision), ensure_ascii=False),
                         proposal_id,
                         revision.revision,
+                    ),
+                )
+            if status not in _ACTIVE_MUTATION_CLAIM_STATUSES:
+                connection.execute(
+                    "DELETE FROM mutation_scope_claim WHERE proposal_id = ?",
+                    (proposal_id,),
+                )
+            else:
+                connection.execute(
+                    "UPDATE mutation_scope_claim SET claim_state = ?, "
+                    "updated_at = ? WHERE proposal_id = ?",
+                    (
+                        (
+                            "recovery"
+                            if status is ProposalStatus.FAILED
+                            else status.value
+                        ),
+                        datetime.now().astimezone().isoformat(),
+                        proposal_id,
                     ),
                 )
 
@@ -917,12 +2695,47 @@ class StateDatabase:
         if cursor.rowcount != 1:
             raise ValueError("Approval nonce is missing or already used")
 
+    def _assert_mutation_scope_claims_owned(
+        self,
+        connection: sqlite3.Connection,
+        proposal: ProposalRevision,
+    ) -> None:
+        """Fail before approval consumption if any write scope lost ownership."""
+
+        desired = self._desired_mutation_scope_claims(
+            connection,
+            proposal,
+        )
+        owned_rows = connection.execute(
+            "SELECT scope_digest, revision, claim_state "
+            "FROM mutation_scope_claim WHERE proposal_id = ?",
+            (proposal.proposal_id,),
+        ).fetchall()
+        owned = {str(row["scope_digest"]): row for row in owned_rows}
+        if set(owned) != set(desired):
+            raise MutationScopeConflict(
+                "Proposal mutation-scope ownership is incomplete"
+            )
+        for row in owned.values():
+            if (
+                int(row["revision"]) != proposal.revision
+                or str(row["claim_state"])
+                != ProposalStatus.APPROVED.value
+            ):
+                raise MutationScopeConflict(
+                    "Proposal mutation-scope ownership changed before apply"
+                )
+
     def begin_apply(self, proposal: ProposalRevision, nonce: str) -> None:
         """Atomically consume approval, enter APPLYING, and create the outbox."""
 
         now = datetime.now().astimezone().isoformat()
         payload = json.dumps(dataclass_to_dict(proposal), ensure_ascii=False)
         with self.transaction() as connection:
+            self._assert_mutation_scope_claims_owned(
+                connection,
+                proposal,
+            )
             nonce_cursor = connection.execute(
                 "UPDATE approval_receipt SET used_at = ? "
                 "WHERE nonce = ? AND used_at IS NULL",
@@ -990,6 +2803,11 @@ class StateDatabase:
                     ),
                 )
             connection.execute(
+                "UPDATE mutation_scope_claim SET claim_state = 'applying', "
+                "revision = ?, updated_at = ? WHERE proposal_id = ?",
+                (proposal.revision, now, proposal.proposal_id),
+            )
+            connection.execute(
                 "INSERT INTO audit_log("
                 "event_type, proposal_id, actor, details, created_at"
                 ") VALUES (?, ?, ?, ?, ?)",
@@ -1024,6 +2842,23 @@ class StateDatabase:
                         ") VALUES (?, ?, ?, ?, NULL)",
                         (operation.change.operation_id, proposal.proposal_id, payload, now),
                     )
+                    if (
+                        operation.change.target_database
+                        != _HISTORY_DATABASE
+                    ):
+                        connection.execute(
+                            "UPDATE mutation_scope_claim SET "
+                            "claim_state = 'pending', operation_id = ?, "
+                            "revision = ?, updated_at = ? "
+                            "WHERE proposal_id = ? AND operation_id = ?",
+                            (
+                                operation.change.operation_id,
+                                proposal.revision,
+                                now,
+                                proposal.proposal_id,
+                                operation.change.operation_id,
+                            ),
+                        )
                     continue
                 if operation.action in {ProposalAction.APPLY, ProposalAction.EDIT}:
                     connection.execute(
@@ -1056,6 +2891,78 @@ class StateDatabase:
             ).fetchall()
         return [_operation_from_dict(json.loads(row["payload"])) for row in rows]
 
+    def retire_pending_operations(
+        self,
+        operation_ids: Iterable[str],
+        *,
+        expected_analyzer: str,
+        expected_database: str,
+        actor: str,
+        reason: str,
+    ) -> int:
+        """Resolve an obsolete, exactly classified pending-operation set.
+
+        The caller cannot use this migration helper to discard arbitrary
+        proposal work. Every unresolved row must still decode to the expected
+        analyzer and target database before any row is updated.
+        """
+
+        identifiers = sorted({str(item) for item in operation_ids if str(item)})
+        if not identifiers:
+            return 0
+        now = datetime.now().astimezone().isoformat()
+        with self.transaction() as connection:
+            verified: list[str] = []
+            for start in range(0, len(identifiers), 400):
+                batch = identifiers[start : start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    "SELECT operation_id, payload FROM pending_change "
+                    f"WHERE resolved_at IS NULL AND operation_id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    operation = _operation_from_dict(json.loads(row["payload"]))
+                    change = operation.change
+                    if (
+                        change.analyzer != expected_analyzer
+                        or change.target_database != expected_database
+                    ):
+                        raise RuntimeError(
+                            "Pending-operation retirement classification mismatch"
+                        )
+                    verified.append(str(row["operation_id"]))
+            if len(verified) != len(identifiers):
+                raise RuntimeError(
+                    "Pending-operation retirement set changed before migration"
+                )
+            connection.executemany(
+                "UPDATE pending_change SET resolved_at = ? "
+                "WHERE operation_id = ? AND resolved_at IS NULL",
+                ((now, operation_id) for operation_id in verified),
+            )
+            connection.execute(
+                "INSERT INTO audit_log("
+                "event_type, proposal_id, actor, details, created_at"
+                ") VALUES (?, NULL, ?, ?, ?)",
+                (
+                    "pending_operations_retired",
+                    actor,
+                    json.dumps(
+                        {
+                            "count": len(verified),
+                            "expected_analyzer": expected_analyzer,
+                            "expected_database": expected_database,
+                            "reason": reason,
+                            "operation_set_digest": sha256_json(verified),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return len(verified)
+
     def pending_outbox(self, proposal_id: str) -> list[sqlite3.Row]:
         with self.session() as connection:
             return list(
@@ -1076,6 +2983,24 @@ class StateDatabase:
                 (proposal_id, revision, operation_id),
             ).fetchone()
         return str(row["status"]) if row else None
+
+    def outbox_statuses(
+        self,
+        proposal_id: str,
+        revision: int,
+    ) -> dict[str, str]:
+        """Load one proposal revision's outbox in a single read session."""
+
+        with self.session() as connection:
+            rows = connection.execute(
+                "SELECT operation_id, status FROM outbox "
+                "WHERE proposal_id = ? AND revision = ?",
+                (proposal_id, revision),
+            ).fetchall()
+        return {
+            str(row["operation_id"]): str(row["status"])
+            for row in rows
+        }
 
     def operation_outbox_state(self, operation_id: str) -> dict[str, Any] | None:
         with self.session() as connection:
@@ -1124,6 +3049,154 @@ class StateDatabase:
                     operation_id,
                 ),
             )
+
+    @staticmethod
+    def _validate_outbox_batch_ids(operation_ids: Iterable[str]) -> tuple[str, ...]:
+        items = tuple(operation_ids)
+        if not items or any(not item.strip() for item in items):
+            raise ValueError("Outbox batch operation IDs must be non-empty")
+        if len(set(items)) != len(items):
+            raise ValueError("Outbox batch operation IDs must be unique")
+        return items
+
+    def mark_outbox_batch(
+        self,
+        proposal_id: str,
+        revision: int,
+        operation_ids: Iterable[str],
+        status: str,
+        error: str | None = None,
+        *,
+        entity_mapping: Mapping[str, str] | None = None,
+        allow_reconciliation: bool = False,
+    ) -> None:
+        """Atomically transition a page batch and its optional page mapping."""
+
+        if status not in {"done", "failed", "blocked"}:
+            raise ValueError("Unsupported outbox batch status")
+        items = self._validate_outbox_batch_ids(operation_ids)
+        mapping: dict[str, str] | None = None
+        if entity_mapping is not None:
+            mapping = dict(entity_mapping)
+            expected_keys = {
+                "database_name",
+                "entity_key",
+                "notion_page_id",
+                "match_value",
+            }
+            if (
+                set(mapping) != expected_keys
+                or any(not mapping[key].strip() for key in expected_keys)
+                or status != "done"
+            ):
+                raise ValueError("Entity mapping is invalid for an outbox batch")
+        now = datetime.now().astimezone().isoformat()
+        placeholders = ",".join("?" for _ in items)
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT operation_id, status FROM outbox "
+                "WHERE proposal_id = ? AND revision = ? "
+                f"AND operation_id IN ({placeholders})",
+                (proposal_id, revision, *items),
+            ).fetchall()
+            states = {
+                str(row["operation_id"]): str(row["status"])
+                for row in rows
+            }
+            if set(states) != set(items):
+                raise RuntimeError("Outbox batch does not match the approved revision")
+            if status == "done":
+                allowed_done_states = (
+                    {"pending", "failed", "blocked", "done"}
+                    if allow_reconciliation
+                    else {"pending", "done"}
+                )
+                if any(value not in allowed_done_states for value in states.values()):
+                    raise RuntimeError("Outbox batch is not eligible for completion")
+            elif any(value == "done" for value in states.values()):
+                raise RuntimeError("A completed outbox item cannot be failed or blocked")
+            connection.execute(
+                "UPDATE outbox SET status = ?, attempts = attempts + 1, "
+                "last_error = ?, updated_at = ? "
+                "WHERE proposal_id = ? AND revision = ? "
+                f"AND operation_id IN ({placeholders})",
+                (
+                    status,
+                    error,
+                    now,
+                    proposal_id,
+                    revision,
+                    *items,
+                ),
+            )
+            if mapping is not None:
+                connection.execute(
+                    """
+                    INSERT INTO entity_mapping(
+                        database_name, entity_key, notion_page_id,
+                        match_value, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(database_name, entity_key) DO UPDATE SET
+                        notion_page_id = excluded.notion_page_id,
+                        match_value = excluded.match_value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        mapping["database_name"],
+                        mapping["entity_key"],
+                        mapping["notion_page_id"],
+                        mapping["match_value"],
+                        now,
+                    ),
+                )
+
+    def mark_outbox_batch_done(
+        self,
+        proposal_id: str,
+        revision: int,
+        operation_ids: Iterable[str],
+        *,
+        entity_mapping: Mapping[str, str] | None = None,
+        allow_reconciliation: bool = False,
+    ) -> None:
+        self.mark_outbox_batch(
+            proposal_id,
+            revision,
+            operation_ids,
+            "done",
+            entity_mapping=entity_mapping,
+            allow_reconciliation=allow_reconciliation,
+        )
+
+    def mark_outbox_batch_failed(
+        self,
+        proposal_id: str,
+        revision: int,
+        operation_ids: Iterable[str],
+        reason_code: str,
+    ) -> None:
+        self.mark_outbox_batch(
+            proposal_id,
+            revision,
+            operation_ids,
+            "failed",
+            reason_code,
+        )
+
+    def mark_outbox_batch_blocked(
+        self,
+        proposal_id: str,
+        revision: int,
+        operation_ids: Iterable[str],
+        reason_code: str,
+    ) -> None:
+        self.mark_outbox_batch(
+            proposal_id,
+            revision,
+            operation_ids,
+            "blocked",
+            reason_code,
+        )
 
     def get_entity_mapping(self, database_name: str, entity_key: str) -> dict[str, str] | None:
         with self.session() as connection:
@@ -3137,6 +5210,197 @@ class StateDatabase:
             ).fetchone()
         return row is not None
 
+    def _finalize_approved_overrides(
+        self,
+        connection: sqlite3.Connection,
+        proposal: ProposalRevision,
+        *,
+        now: str,
+    ) -> None:
+        """Persist or retire overrides only inside a successful local commit.
+
+        A normal Excel APPLY is an explicit acceptance of the current source
+        value and retires an older override. EXCLUDE and DEFER deliberately do
+        not. A recovery revision whose user override was already written keeps
+        the original override action even though that revision represents the
+        operation as EXCLUDE to prevent a second Notion write.
+        """
+
+        for operation in proposal.operations:
+            change = operation.change
+            if change.target_database == _HISTORY_DATABASE:
+                continue
+
+            scope_digest = _mutation_scope(
+                connection,
+                proposal,
+                operation,
+            )[0]
+            case_number = str(
+                proposal.correction_binding.get("case_number")
+                or change.entity_key
+            )
+            database_name = change.target_database
+            entity_key = change.entity_key
+            property_name = change.property_name
+            existing = self._find_approved_override(
+                connection,
+                proposal,
+                operation,
+            )
+            completed_recovery_override = False
+            if (
+                operation.user_override
+                and operation.action is ProposalAction.EXCLUDE
+            ):
+                outbox = connection.execute(
+                    "SELECT status FROM outbox WHERE operation_id = ?",
+                    (change.operation_id,),
+                ).fetchone()
+                completed_recovery_override = bool(
+                    outbox is not None and str(outbox["status"]) == "done"
+                )
+
+            successful_override = (
+                operation.user_override
+                and operation.action
+                in {ProposalAction.APPLY, ProposalAction.EDIT}
+            ) or completed_recovery_override
+            if successful_override:
+                observed_basis = (
+                    source_basis_digest(change.source_refs)
+                    if change.source_refs
+                    else ""
+                )
+                # Independent /nx_correct requests do not infer a row or cell
+                # citation. When such a correction supersedes an existing
+                # override, preserve the last approval-backed Excel basis. A
+                # brand-new unbound correction is stored safely but will be
+                # shown as a basis conflict at the next Excel proposal.
+                stable_basis = observed_basis or (
+                    str(existing["source_basis_digest"])
+                    if existing is not None
+                    else ""
+                )
+                created_at = (
+                    str(existing["created_at"])
+                    if existing is not None
+                    else now
+                )
+                if (
+                    existing is not None
+                    and str(existing["scope_digest"]) != scope_digest
+                ):
+                    connection.execute(
+                        "DELETE FROM approved_override "
+                        "WHERE scope_digest = ?",
+                        (str(existing["scope_digest"]),),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO approved_override(
+                        scope_digest, case_number, database_name, entity_key,
+                        property_name, approved_value, source_basis_digest,
+                        observed_basis_digest, source_file_hash, proposal_id,
+                        revision, operation_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(scope_digest) DO UPDATE SET
+                        case_number = excluded.case_number,
+                        approved_value = excluded.approved_value,
+                        source_basis_digest = excluded.source_basis_digest,
+                        observed_basis_digest = excluded.observed_basis_digest,
+                        source_file_hash = excluded.source_file_hash,
+                        proposal_id = excluded.proposal_id,
+                        revision = excluded.revision,
+                        operation_id = excluded.operation_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        scope_digest,
+                        case_number,
+                        database_name,
+                        entity_key,
+                        property_name,
+                        json.dumps(
+                            operation.approved_value,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        stable_basis,
+                        observed_basis,
+                        proposal.source_file_hash,
+                        proposal.proposal_id,
+                        proposal.revision,
+                        change.operation_id,
+                        created_at,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO audit_log("
+                    "event_type, proposal_id, actor, details, created_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "approved_override_saved",
+                        proposal.proposal_id,
+                        proposal.requested_by,
+                        json.dumps(
+                            {
+                                "scope_digest": scope_digest,
+                                "source_basis_digest": stable_basis,
+                                "observed_basis_digest": observed_basis,
+                                "operation_id": change.operation_id,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+                continue
+
+            if (
+                proposal.purpose is ProposalPurpose.EXCEL_SYNC
+                and operation.action is ProposalAction.APPLY
+                and not operation.user_override
+                and existing is not None
+            ):
+                retains_existing_value = (
+                    bool(change.source_refs)
+                    and bool(str(existing["source_basis_digest"]))
+                    and source_basis_digest(change.source_refs)
+                    == str(existing["source_basis_digest"])
+                    and operation.approved_value
+                    == json.loads(str(existing["approved_value"]))
+                )
+                if retains_existing_value:
+                    # ProposalService reused the existing override for an
+                    # unchanged source basis. It is freshly approved, but is
+                    # not a new user edit and must not produce another Wiki
+                    # correction event or retire the stored override.
+                    continue
+                connection.execute(
+                    "DELETE FROM approved_override WHERE scope_digest = ?",
+                    (str(existing["scope_digest"]),),
+                )
+                connection.execute(
+                    "INSERT INTO audit_log("
+                    "event_type, proposal_id, actor, details, created_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        "approved_override_cleared",
+                        proposal.proposal_id,
+                        proposal.requested_by,
+                        json.dumps(
+                            {
+                                "scope_digest": scope_digest,
+                                "operation_id": change.operation_id,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+
     def save_analyzer_definition(
         self,
         name: str,
@@ -3172,10 +5436,19 @@ class StateDatabase:
         version_id: str,
         file_hash: str,
     ) -> None:
-        """Atomically commit local proposal, pending queue, and source checkpoint."""
+        """Atomically finalize a proposal in its own authority domain.
+
+        Ordinary Excel synchronization advances the source checkpoint and may
+        retain deferred changes. An independently requested Telegram
+        correction is bound to the current source for staleness checks, but
+        must never claim that the Excel source itself was synchronized.
+        """
 
         now = datetime.now().astimezone().isoformat()
         payload = json.dumps(dataclass_to_dict(proposal), ensure_ascii=False)
+        advances_source_checkpoint = (
+            proposal.purpose is ProposalPurpose.EXCEL_SYNC
+        )
         with self.transaction() as connection:
             proposal_cursor = connection.execute(
                 "UPDATE proposal SET status = ?, expires_at = ? "
@@ -3201,50 +5474,86 @@ class StateDatabase:
                 raise RuntimeError(
                     "Proposal head changed before the local commit could finalize"
                 )
-            for operation in proposal.operations:
-                if operation.action is ProposalAction.DEFER:
-                    operation_payload = json.dumps(
-                        dataclass_to_dict(operation),
-                        ensure_ascii=False,
-                        default=str,
-                    )
+            if advances_source_checkpoint:
+                for operation in proposal.operations:
+                    if operation.action is ProposalAction.DEFER:
+                        operation_payload = json.dumps(
+                            dataclass_to_dict(operation),
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        connection.execute(
+                            "INSERT OR REPLACE INTO pending_change("
+                            "operation_id, proposal_id, payload, created_at, resolved_at"
+                            ") VALUES (?, ?, ?, ?, NULL)",
+                            (
+                                operation.change.operation_id,
+                                proposal.proposal_id,
+                                operation_payload,
+                                now,
+                            ),
+                        )
+                        continue
                     connection.execute(
-                        "INSERT OR REPLACE INTO pending_change("
-                        "operation_id, proposal_id, payload, created_at, resolved_at"
-                        ") VALUES (?, ?, ?, ?, NULL)",
+                        "UPDATE pending_change SET resolved_at = ? "
+                        "WHERE operation_id = ? AND resolved_at IS NULL",
+                        (now, operation.change.operation_id),
+                    )
+            if advances_source_checkpoint:
+                connection.execute(
+                    """
+                    INSERT INTO sync_checkpoint(
+                        drive_id, item_id, version_id, file_hash,
+                        committed_at, proposal_id
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(drive_id, item_id) DO UPDATE SET
+                        version_id = excluded.version_id,
+                        file_hash = excluded.file_hash,
+                        committed_at = excluded.committed_at,
+                        proposal_id = excluded.proposal_id
+                    """,
+                    (
+                        drive_id,
+                        item_id,
+                        version_id,
+                        file_hash,
+                        now,
+                        proposal.proposal_id,
+                    ),
+                )
+            self._finalize_approved_overrides(
+                connection,
+                proposal,
+                now=now,
+            )
+            for operation in proposal.operations:
+                if operation.change.target_database == _HISTORY_DATABASE:
+                    continue
+                if (
+                    advances_source_checkpoint
+                    and operation.action is ProposalAction.DEFER
+                ):
+                    connection.execute(
+                        "UPDATE mutation_scope_claim SET "
+                        "claim_state = 'pending', revision = ?, "
+                        "updated_at = ? WHERE proposal_id = ? "
+                        "AND operation_id = ?",
                         (
-                            operation.change.operation_id,
-                            proposal.proposal_id,
-                            operation_payload,
+                            proposal.revision,
                             now,
+                            proposal.proposal_id,
+                            operation.change.operation_id,
                         ),
                     )
-                    continue
-                connection.execute(
-                    "UPDATE pending_change SET resolved_at = ? "
-                    "WHERE operation_id = ? AND resolved_at IS NULL",
-                    (now, operation.change.operation_id),
-                )
-            connection.execute(
-                """
-                INSERT INTO sync_checkpoint(
-                    drive_id, item_id, version_id, file_hash, committed_at, proposal_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(drive_id, item_id) DO UPDATE SET
-                    version_id = excluded.version_id,
-                    file_hash = excluded.file_hash,
-                    committed_at = excluded.committed_at,
-                    proposal_id = excluded.proposal_id
-                """,
-                (
-                    drive_id,
-                    item_id,
-                    version_id,
-                    file_hash,
-                    now,
-                    proposal.proposal_id,
-                ),
-            )
+                else:
+                    connection.execute(
+                        "DELETE FROM mutation_scope_claim "
+                        "WHERE proposal_id = ? AND operation_id = ?",
+                        (
+                            proposal.proposal_id,
+                            operation.change.operation_id,
+                        ),
+                    )
             connection.execute(
                 "INSERT INTO audit_log("
                 "event_type, proposal_id, actor, details, created_at"
@@ -3256,7 +5565,10 @@ class StateDatabase:
                     json.dumps(
                         {
                             "revision": proposal.revision,
-                            "checkpoint": version_id,
+                            "purpose": proposal.purpose.value,
+                            "checkpoint": (
+                                version_id if advances_source_checkpoint else None
+                            ),
                             "file_hash": file_hash,
                             "applied_scope": [
                                 item.change.operation_id
@@ -3334,6 +5646,10 @@ def _proposal_from_dict(data: dict[str, Any]) -> ProposalRevision:
         status=ProposalStatus(data["status"]),
         created_at=datetime.fromisoformat(data["created_at"]),
         expires_at=datetime.fromisoformat(data["expires_at"]) if data.get("expires_at") else None,
+        purpose=ProposalPurpose(
+            data.get("purpose", ProposalPurpose.EXCEL_SYNC.value)
+        ),
+        correction_binding=data.get("correction_binding", {}),
     )
 
 

@@ -63,15 +63,22 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
+    def comparable(path: Path) -> str:
+        value = os.fspath(path)
+        if os.name == "nt":
+            if value.startswith("\\\\?\\UNC\\"):
+                value = "\\\\" + value[8:]
+            elif value.startswith("\\\\?\\"):
+                value = value[4:]
+        return os.path.normcase(os.path.abspath(value))
+
+    first_value = comparable(first)
+    second_value = comparable(second)
     try:
-        common = Path(os.path.commonpath((first, second)))
+        common = os.path.commonpath((first_value, second_value))
     except ValueError:
         return False
-    folded = os.path.normcase(os.fspath(common))
-    return folded in {
-        os.path.normcase(os.fspath(first)),
-        os.path.normcase(os.fspath(second)),
-    }
+    return os.path.normcase(common) in {first_value, second_value}
 
 
 def _prospective_resolve(path: Path) -> Path:

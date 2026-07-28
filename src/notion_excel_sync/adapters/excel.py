@@ -360,7 +360,7 @@ def diff_snapshots(
     """Compute stable-key record changes between two snapshots of the same drive item."""
 
     if (baseline.drive_id, baseline.item_id) != (current.drive_id, current.item_id):
-        raise SnapshotIdentityMismatch("Snapshots belong to different OneDrive items")
+        raise SnapshotIdentityMismatch("Snapshots belong to different source items")
     before_by_key = {record.key: record for record in baseline.records}
     after_by_key = {record.key: record for record in current.records}
     changes: list[RecordChange] = []

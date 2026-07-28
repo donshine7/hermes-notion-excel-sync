@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -12,8 +13,10 @@ from notion_excel_sync.adapters.notion import (
     NotionPrecondition,
 )
 from notion_excel_sync.models import (
+    CORRECTION_OVERLAY_RECOVERY_MODE,
     ChangeKind,
     ProposalAction,
+    ProposalPurpose,
     ProposalStatus,
     ProposedChange,
     SourceRef,
@@ -65,6 +68,15 @@ class AlwaysFailWriter(MemoryWriter):
     def apply(self, operation, receipt) -> str:
         self.calls += 1
         raise RuntimeError("simulated write failure")
+
+
+class SensitiveFailWriter(MemoryWriter):
+    def apply(self, operation, receipt) -> str:
+        self.calls += 1
+        raise RuntimeError(
+            r"C:\Users\private-user\AppData\Local\secret.txt "
+            "gateway-write-token=do-not-persist"
+        )
 
 
 class InspectingWriter(MemoryWriter):
@@ -183,6 +195,468 @@ class ApprovalWorkflowTest(unittest.TestCase):
         self.assertTrue(report.committed)
         self.assertEqual(writer.calls, 1)
         self.assertEqual(self.database.get_checkpoint("drive", "item")["version_id"], "2.0")
+
+    def test_stale_mapping_never_retargets_write_to_title_match(self) -> None:
+        self.database.save_entity_mapping(
+            "한국 특허 사건",
+            "SS-2026-001",
+            "page-p",
+            "SS-2026-001",
+        )
+        proposal = self.proposals.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [sample_change()],
+        )
+        gateway = InMemoryNotionGateway(
+            lambda *_: True,
+            initial_pages={
+                "cases": [
+                    {
+                        "id": "page-p",
+                        "properties": {
+                            "당소 사건번호": {
+                                "title": [{"plain_text": "DRIFTED"}]
+                            },
+                            "현재상태": {"select": {"name": "착수"}},
+                        },
+                    },
+                    {
+                        "id": "page-q",
+                        "properties": {
+                            "당소 사건번호": {
+                                "title": [{"plain_text": "SS-2026-001"}]
+                            },
+                            "현재상태": {"select": {"name": "착수"}},
+                        },
+                    },
+                ]
+            },
+        )
+        writer = ApprovedNotionWriter(
+            gateway,
+            self.database,
+            proposal,
+            {"한국 특허 사건": "cases"},
+        )
+
+        with self.assertRaisesRegex(
+            NotionSchemaError,
+            "title no longer matches",
+        ):
+            writer.inspect(proposal.operations[0])
+
+        page_q = gateway.get_page("page-q")
+        self.assertEqual(
+            page_q["properties"]["현재상태"]["select"]["name"],
+            "착수",
+        )
+
+    def test_mapped_page_id_is_updated_directly_when_titles_are_duplicated(
+        self,
+    ) -> None:
+        self.database.save_entity_mapping(
+            "한국 특허 사건",
+            "SS-2026-001",
+            "page-p",
+            "SS-2026-001",
+        )
+        proposal = self.proposals.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [sample_change()],
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        verifier = ExactNotionMutationVerifier(
+            self.approval,
+            self.database,
+            {"한국 특허 사건": "cases"},
+        )
+        gateway = InMemoryNotionGateway(
+            verifier,
+            initial_pages={
+                "cases": [
+                    {
+                        "id": page_id,
+                        "properties": {
+                            "당소 사건번호": {
+                                "title": [{"plain_text": "SS-2026-001"}]
+                            },
+                            "현재상태": {"select": {"name": "착수"}},
+                        },
+                    }
+                    for page_id in ("page-p", "page-q")
+                ]
+            },
+        )
+        writer = ApprovedNotionWriter(
+            gateway,
+            self.database,
+            self.database.load_proposal(proposal.proposal_id),
+            {"한국 특허 사건": "cases"},
+        )
+
+        report = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(report.committed)
+        self.assertEqual(
+            gateway.get_page("page-p")["properties"]["현재상태"]["select"][
+                "name"
+            ],
+            "출원",
+        )
+        self.assertEqual(
+            gateway.get_page("page-q")["properties"]["현재상태"]["select"][
+                "name"
+            ],
+            "착수",
+        )
+
+    def test_independent_correction_never_advances_excel_checkpoint(self) -> None:
+        proposal = self.proposals.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [sample_change()],
+            purpose=ProposalPurpose.USER_CORRECTION,
+        )
+        loaded = self.database.load_proposal(proposal.proposal_id)
+        self.assertIs(loaded.purpose, ProposalPurpose.USER_CORRECTION)
+        self.assertIs(loaded.operations[0].action, ProposalAction.EDIT)
+        self.assertTrue(loaded.operations[0].user_override)
+        self.assertNotEqual(loaded.digest, "")
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+
+        report = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            MemoryWriter(),
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(report.committed)
+        self.assertIsNone(self.database.get_checkpoint("drive", "item"))
+        self.assertIs(
+            self.database.load_proposal(proposal.proposal_id).status,
+            ProposalStatus.COMMITTED,
+        )
+
+    def test_hidden_history_cannot_be_edited_or_sent_for_approval(self) -> None:
+        main = sample_change()
+        hidden_history = ProposedChange(
+            target_database="변경이력",
+            entity_key=f"history:{main.operation_id}",
+            property_name="새값",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value="출원",
+            analyzer="history_analyzer",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic generated history",
+            source_refs=list(main.source_refs),
+        )
+        service = ProposalService(self.database, self.approval)
+        proposal = service.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [main, hidden_history],
+        )
+        proposal = service.request_approval(proposal.proposal_id)
+
+        with self.assertRaisesRegex(
+            ProposalError,
+            "history operations cannot be edited",
+        ):
+            service.edit(
+                proposal.proposal_id,
+                hidden_history.operation_id,
+                ProposalAction.EXCLUDE,
+            )
+
+        orphan = ProposedChange(
+            target_database="변경이력",
+            entity_key="history:missing-operation",
+            property_name="새값",
+            kind=ChangeKind.CREATE,
+            current_value=None,
+            proposed_value="orphaned",
+            analyzer="history_analyzer",
+            analyzer_version="1.0.0",
+            confidence=1.0,
+            reason="Synthetic orphan history",
+            source_refs=[],
+        )
+        orphan_proposal = service.create(
+            "2.0",
+            "hash-2",
+            "123",
+            "chat",
+            [orphan],
+        )
+        with self.assertRaisesRegex(
+            ProposalError,
+            "not displayed on any review card",
+        ):
+            service.request_approval(orphan_proposal.proposal_id)
+        self.assertIs(
+            self.database.load_proposal(orphan_proposal.proposal_id).status,
+            ProposalStatus.DRAFT,
+        )
+
+    def test_user_edit_publishes_overlay_only_after_notion_write(self) -> None:
+        proposal = self.create_pending()
+        proposal = self.proposals.edit(
+            proposal.proposal_id,
+            proposal.operations[0].change.operation_id,
+            ProposalAction.EDIT,
+            "사용자 승인값",
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        writer = MemoryWriter()
+        published: list[tuple[str, str]] = []
+
+        def publish_overlay(revision, approved_receipt) -> None:
+            self.assertEqual(writer.calls, 1)
+            published.append(
+                (revision.proposal_id, approved_receipt.proposal_digest)
+            )
+
+        report = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=publish_overlay,
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(report.committed)
+        self.assertEqual(
+            published,
+            [(proposal.proposal_id, proposal.digest)],
+        )
+
+    def test_overlay_failure_recovers_without_replaying_notion_write(self) -> None:
+        proposal = self.create_pending()
+        operation_id = proposal.operations[0].change.operation_id
+        proposal = self.proposals.edit(
+            proposal.proposal_id,
+            operation_id,
+            ProposalAction.EDIT,
+            "사용자 승인값",
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        writer = MemoryWriter()
+
+        def fail_overlay(_revision, _approved_receipt) -> None:
+            raise RuntimeError("simulated Wiki publication failure")
+
+        failed = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=fail_overlay,
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        self.assertFalse(failed.committed)
+        self.assertIn("__wiki_overlay__", failed.failed)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(
+            self.database.operation_outbox_state(operation_id)["status"],
+            "done",
+        )
+        self.assertIsNone(self.database.get_checkpoint("drive", "item"))
+        with self.assertRaises(ProposalError):
+            self.proposals.reject(proposal.proposal_id, "123", "chat")
+
+        recovery = self.proposals.create_recovery_revision(
+            proposal.proposal_id
+        )
+        self.assertIs(recovery.operations[0].action, ProposalAction.EXCLUDE)
+        recovery = self.proposals.request_approval(recovery.proposal_id)
+        with self.assertRaisesRegex(
+            ProposalError,
+            "started apply must be recovered and finalized",
+        ):
+            self.proposals.reject(
+                recovery.proposal_id,
+                "123",
+                "chat",
+            )
+        recovery_receipt = self.proposals.approve(
+            recovery.proposal_id,
+            recovery.revision,
+            "123",
+            "chat",
+            recovery.digest,
+        )
+        recovered_events: list[str] = []
+
+        recovered = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=lambda revision, _: (
+                recovered_events.append(revision.proposal_id)
+            ),
+        ).apply(recovery_receipt, "drive", "item", "2.0", "hash")
+
+        self.assertTrue(recovered.committed)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(recovered_events, [proposal.proposal_id])
+
+    def test_completed_correction_recovery_rebinds_changed_source_for_overlay_only(
+        self,
+    ) -> None:
+        proposal = self.proposals.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [sample_change()],
+            purpose=ProposalPurpose.USER_CORRECTION,
+            knowledge_binding={"generation_digest": "old-wiki"},
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        writer = MemoryWriter()
+
+        failed = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=lambda *_: (_ for _ in ()).throw(
+                RuntimeError("simulated Wiki publication failure")
+            ),
+        ).apply(
+            receipt,
+            "drive",
+            "item",
+            "2.0",
+            "hash",
+            knowledge_binding_guard=lambda: {
+                "generation_digest": "old-wiki"
+            },
+        )
+
+        self.assertFalse(failed.committed)
+        self.assertEqual(writer.calls, 1)
+        failed_proposal = self.database.load_proposal(proposal.proposal_id)
+        self.assertIs(failed_proposal.status, ProposalStatus.FAILED)
+        self.assertTrue(
+            self.proposals.correction_remote_writes_complete(
+                failed_proposal
+            )
+        )
+
+        recovery = self.proposals.create_recovery_revision(
+            proposal.proposal_id,
+            source_rebind=("3.0", "new-source-hash"),
+        )
+        self.assertEqual(recovery.source_version_id, "3.0")
+        self.assertEqual(recovery.source_file_hash, "new-source-hash")
+        self.assertEqual(recovery.knowledge_binding, {})
+        self.assertEqual(recovery.operations[0].change.source_refs, [])
+        self.assertEqual(recovery.operations[0].change.knowledge_refs, [])
+        self.assertIs(
+            recovery.operations[0].action,
+            ProposalAction.EXCLUDE,
+        )
+        self.assertEqual(
+            recovery.correction_binding["recovery"]["mode"],
+            CORRECTION_OVERLAY_RECOVERY_MODE,
+        )
+        recovery = self.proposals.request_approval(recovery.proposal_id)
+        with self.assertRaisesRegex(
+            ProposalError,
+            "overlay-only correction recovery cannot be revised",
+        ):
+            self.proposals.edit(
+                recovery.proposal_id,
+                recovery.operations[0].change.operation_id,
+                ProposalAction.EDIT,
+                "changed-again",
+            )
+        with self.assertRaisesRegex(
+            ProposalError,
+            "started apply must be recovered and finalized",
+        ):
+            self.proposals.reject(
+                recovery.proposal_id,
+                "123",
+                "chat",
+            )
+        recovery_receipt = self.proposals.approve(
+            recovery.proposal_id,
+            recovery.revision,
+            "123",
+            "chat",
+            recovery.digest,
+        )
+        published: list[str] = []
+
+        recovered = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            writer,
+            correction_overlay_publisher=lambda revision, _: (
+                published.append(revision.proposal_id)
+            ),
+        ).apply(
+            recovery_receipt,
+            "drive",
+            "item",
+            "3.0",
+            "new-source-hash",
+        )
+
+        self.assertTrue(recovered.committed)
+        self.assertEqual(writer.calls, 1)
+        self.assertEqual(published, [proposal.proposal_id])
+        self.assertIsNone(self.database.get_checkpoint("drive", "item"))
 
     def test_started_apply_resumes_without_replaying_confirmed_remote_write(self) -> None:
         proposal = self.create_pending()
@@ -326,8 +800,10 @@ class ApprovalWorkflowTest(unittest.TestCase):
             revision=first.revision,
         )
         try:
+            other_scope = sample_change()
+            other_scope.property_name = "내부상태"
             second = self.proposals.create(
-                "2.0", "hash", "123", "chat", [sample_change()]
+                "2.0", "hash", "123", "chat", [other_scope]
             )
             second = self.proposals.request_approval(second.proposal_id)
             receipt = self.proposals.approve(
@@ -379,8 +855,10 @@ class ApprovalWorkflowTest(unittest.TestCase):
                 (999999,),
             )
 
+        other_scope = sample_change()
+        other_scope.property_name = "내부상태"
         other = self.proposals.create(
-            "2.0", "hash", "123", "chat", [sample_change()]
+            "2.0", "hash", "123", "chat", [other_scope]
         )
         other = self.proposals.request_approval(other.proposal_id)
         with self.assertRaises(ApplyLeaseError):
@@ -443,6 +921,68 @@ class ApprovalWorkflowTest(unittest.TestCase):
         with self.assertRaises(ApprovalError):
             service.apply(receipt, "drive", "item", "2.0", "hash")
         self.assertEqual(writer.calls, 0)
+        self.assertIs(
+            self.database.load_proposal(proposal.proposal_id).status,
+            ProposalStatus.STALE,
+        )
+
+    def test_resumed_preflight_conflict_is_failed_and_recoverable(self) -> None:
+        first_change = sample_change()
+        second_change = sample_change()
+        second_change.property_name = "내부상태"
+        second_change.current_value = "대기"
+        second_change.proposed_value = "진행"
+        proposal = self.proposals.create(
+            "2.0",
+            "hash",
+            "123",
+            "chat",
+            [first_change, second_change],
+        )
+        proposal = self.proposals.request_approval(proposal.proposal_id)
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+        applying = self.database.load_proposal(proposal.proposal_id)
+        applying.status = ProposalStatus.APPLYING
+        self.database.begin_apply(applying, receipt.nonce)
+        self.database.mark_outbox(first_change.operation_id, "done")
+
+        writer = InspectingWriter()
+        second_key = (
+            second_change.target_database,
+            second_change.entity_key,
+            second_change.property_name,
+        )
+        writer.values[second_key] = "외부 충돌값"
+
+        with self.assertRaisesRegex(ApprovalError, "Notion values changed"):
+            ApprovalGatedApplyService(
+                self.database,
+                self.approval,
+                writer,
+            ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        failed = self.database.load_proposal(proposal.proposal_id)
+        self.assertIs(failed.status, ProposalStatus.FAILED)
+        with self.database.session() as connection:
+            claims = connection.execute(
+                "SELECT claim_state FROM mutation_scope_claim "
+                "WHERE proposal_id = ? ORDER BY property_name",
+                (proposal.proposal_id,),
+            ).fetchall()
+        self.assertEqual([row["claim_state"] for row in claims], ["recovery", "recovery"])
+
+        recovery = self.proposals.create_recovery_revision(
+            proposal.proposal_id
+        )
+        self.assertEqual(recovery.revision, proposal.revision + 1)
+        self.assertIs(recovery.operations[0].action, ProposalAction.EXCLUDE)
+        self.assertIs(recovery.operations[1].action, ProposalAction.APPLY)
 
     def test_partial_failure_requires_new_revision_and_can_recover(self) -> None:
         first_change = sample_change()
@@ -498,6 +1038,46 @@ class ApprovalWorkflowTest(unittest.TestCase):
         ).apply(recovery_receipt, "drive", "item", "2.0", "hash")
         self.assertTrue(recovered.committed)
         self.assertEqual(recovered.applied, [second_change.operation_id])
+
+    def test_apply_failure_persists_only_stable_non_sensitive_codes(self) -> None:
+        proposal = self.create_pending()
+        receipt = self.proposals.approve(
+            proposal.proposal_id,
+            proposal.revision,
+            "123",
+            "chat",
+            proposal.digest,
+        )
+
+        report = ApprovalGatedApplyService(
+            self.database,
+            self.approval,
+            SensitiveFailWriter(),
+        ).apply(receipt, "drive", "item", "2.0", "hash")
+
+        operation_id = proposal.operations[0].change.operation_id
+        self.assertEqual(
+            report.failed,
+            {operation_id: "notion_write_failed"},
+        )
+        outbox = self.database.operation_outbox_state(operation_id)
+        assert outbox is not None
+        self.assertEqual(outbox["last_error"], "notion_write_failed")
+        with self.database.session() as connection:
+            row = connection.execute(
+                "SELECT details FROM audit_log "
+                "WHERE event_type = 'apply_failed' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert row is not None
+        details = row["details"]
+        self.assertNotIn("private-user", details)
+        self.assertNotIn("gateway-write-token", details)
+        self.assertNotIn("RuntimeError", details)
+        self.assertEqual(
+            json.loads(details)["failure_codes"],
+            {operation_id: "notion_write_failed"},
+        )
 
     def test_edit_creates_new_revision_and_invalidates_old_digest(self) -> None:
         proposal = self.create_pending()
@@ -631,12 +1211,8 @@ class ApprovalWorkflowTest(unittest.TestCase):
         self.assertFalse(failed_report.committed)
         self.assertEqual(len(self.database.load_pending_operations()), 1)
 
-        retry = self.proposals.create(
-            "2.0",
-            "hash",
-            "123",
-            "chat",
-            [self.database.load_pending_operations()[0].change],
+        retry = self.proposals.create_recovery_revision(
+            failed_retry.proposal_id
         )
         retry = self.proposals.request_approval(retry.proposal_id)
         retry_receipt = self.proposals.approve(

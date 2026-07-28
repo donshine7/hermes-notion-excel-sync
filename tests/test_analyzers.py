@@ -81,6 +81,89 @@ def test_pipeline_routes_domain_analyzers_and_keeps_actual_and_evidence_cost_sep
     assert evidence[0].proposed_value == 900_000
 
 
+def test_party_analyzer_preserves_english_legal_name_commas_and_classifies_company():
+    record = SourceRecord(
+        key="foreign-company",
+        sheet="2026",
+        row=258,
+        values={
+            "당소 사건번호": "SS-2026-258",
+            "의뢰인": "NPTI GLOBAL CO., LTD.",
+        },
+        source_refs=[source_ref()],
+    )
+    run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.CREATE, record.key, None, record)
+    )
+    party_changes = [
+        change
+        for change in run.proposed_changes
+        if change.target_database == "당사자"
+    ]
+    by_entity: dict[str, dict[str, object]] = {}
+    for change in party_changes:
+        by_entity.setdefault(change.entity_key, {})[change.property_name] = (
+            change.proposed_value
+        )
+
+    assert by_entity == {
+        "party:npti global co., ltd.": {
+            "당사자명": "NPTI GLOBAL CO., LTD.",
+            "구분": "법인",
+        }
+    }
+
+
+def test_party_analyzer_blocks_composite_or_temporary_names_from_notion():
+    for row, name in enumerate(
+        (
+            "(주)씨에프씨/김성일_서울로미래로",
+            "(주)신규법인_유준혁",
+            "LTD.",
+        ),
+        start=2,
+    ):
+        record = SourceRecord(
+            key=f"ambiguous-party-{row}",
+            sheet="2026",
+            row=row,
+            values={"당소 사건번호": f"SS-{row}", "의뢰인": name},
+            source_refs=[source_ref()],
+        )
+        run = AnalysisPipeline(build_default_registry()).analyze_change(
+            RecordChange(ChangeKind.CREATE, record.key, None, record)
+        )
+
+        assert not any(
+            change.target_database == "당사자"
+            for change in run.proposed_changes
+        )
+        assert any(
+            item.title == f"{name} 정식 당사자명 확인"
+            for item in run.review_items
+        )
+
+
+def test_party_analyzer_classifies_clear_korean_person_name_as_individual():
+    record = SourceRecord(
+        key="korean-person",
+        sheet="2026",
+        row=214,
+        values={"당소 사건번호": "SS-214", "의뢰인": "강나영"},
+        source_refs=[source_ref()],
+    )
+    run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.CREATE, record.key, None, record)
+    )
+    values = {
+        change.property_name: change.proposed_value
+        for change in run.proposed_changes
+        if change.target_database == "당사자"
+    }
+
+    assert values == {"당사자명": "강나영", "구분": "개인"}
+
+
 def test_source_profiler_and_generator_create_inert_draft_for_unknown_column():
     records = [
         SourceRecord(
@@ -203,6 +286,7 @@ def test_all_emitted_changes_match_notion_schema_types_and_create_titles():
         "group",
         "workflow_status",
         "deadline",
+        "case_history",
         "actual_cost",
         "government_support_evidence",
         "registration_followup",
@@ -249,6 +333,132 @@ def test_all_emitted_changes_match_notion_schema_types_and_create_titles():
         )
     for (database, _), properties in by_entity.items():
         assert NOTION_DEFINITIONS[database].title_property in properties
+
+
+def test_case_history_builds_a_human_event_with_stable_source_identity():
+    before = SourceRecord(
+        key="stable-work-row",
+        sheet="2026",
+        row=17,
+        values={
+            "당소 사건번호": "SS-2026-017",
+            "업무명": "가출원 명세서 제출",
+            "접수일": "2026-07-10",
+            "완료일": "2026-07-17",
+            "현재상태": "완료",
+            "법정기일": "2026-08-01",
+        },
+        source_refs=[source_ref()],
+    )
+    after = SourceRecord(
+        key=before.key,
+        sheet=before.sheet,
+        row=before.row,
+        values={**before.values, "완료일": "2026-07-18"},
+        source_refs=[source_ref()],
+    )
+
+    create_run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.CREATE, before.key, None, before),
+        metadata={"captured_at": "2026-07-18T09:30:00+09:00"},
+    )
+    update_run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.UPDATE, after.key, before, after),
+        metadata={"captured_at": "2026-07-19T09:30:00+09:00"},
+    )
+    created = [
+        change
+        for change in create_run.proposed_changes
+        if change.target_database == "사건 히스토리"
+    ]
+    updated = [
+        change
+        for change in update_run.proposed_changes
+        if change.target_database == "사건 히스토리"
+    ]
+    created_values = {change.property_name: change.proposed_value for change in created}
+    updated_values = {change.property_name: change.proposed_value for change in updated}
+
+    assert created_values["히스토리명"] == "SS-2026-017 · 2026-07-17 · 업무완료"
+    assert created_values["발생일"] == "2026-07-17"
+    assert created_values["이벤트유형"] == "업무완료"
+    assert created_values["요약"] == "가출원 명세서 제출 · 업무완료"
+    assert created_values["다음기한"] == "2026-08-01"
+    assert created_values["출처위치"] == "Excel 2026 시트 2행"
+    assert created_values["사건"] == ["SS-2026-017"]
+    assert created_values["사람확인"] is True
+    assert created_values["검토상태"] == "승인완료"
+    assert created_values["수집일시"] == "2026-07-18T09:30:00+09:00"
+    assert {change.entity_key for change in created} == {
+        change.entity_key for change in updated
+    }
+    assert updated_values["발생일"] == "2026-07-18"
+
+
+def test_case_history_uses_received_date_and_does_not_invent_missing_dates():
+    received = SourceRecord(
+        key="received-work",
+        sheet="2026",
+        row=20,
+        values={
+            "당소 사건번호": "SS-2026-020",
+            "작업설명": "발명자료 수령",
+            "받은날짜": "2026.07.20",
+        },
+        source_refs=[source_ref()],
+    )
+    undated = SourceRecord(
+        key="undated-work",
+        sheet="2026",
+        row=21,
+        values={
+            "당소 사건번호": "SS-2026-021",
+            "작업설명": "발명자료 검토",
+        },
+        source_refs=[source_ref()],
+    )
+    runs = AnalysisPipeline(build_default_registry()).analyze_changes(
+        [
+            RecordChange(ChangeKind.CREATE, received.key, None, received),
+            RecordChange(ChangeKind.CREATE, undated.key, None, undated),
+        ]
+    )
+    history = [
+        change
+        for run in runs
+        for change in run.proposed_changes
+        if change.target_database == "사건 히스토리"
+    ]
+
+    assert {change.entity_key for change in history}
+    assert {
+        change.proposed_value
+        for change in history
+        if change.property_name == "이벤트유형"
+    } == {"업무접수"}
+    assert not any(
+        change.entity_key.endswith("undated-work")
+        for change in history
+    )
+
+
+def test_case_history_rejects_internal_source_keys_as_case_numbers():
+    record = SourceRecord(
+        key="source:sha256:abc:2026:10",
+        sheet="2026",
+        row=10,
+        values={"완료일": "2026-07-20", "작업설명": "내부 식별자만 존재"},
+        source_refs=[source_ref()],
+    )
+    run = AnalysisPipeline(build_default_registry()).analyze_change(
+        RecordChange(ChangeKind.CREATE, record.key, None, record)
+    )
+
+    assert not any(
+        change.target_database == "사건 히스토리"
+        for change in run.proposed_changes
+    )
+    assert any(item.title == "사건번호 확인" for item in run.review_items)
 
 
 def test_batch_evidence_aggregates_three_cases_and_allocates_actual_cost_capacity():
