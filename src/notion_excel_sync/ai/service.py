@@ -275,8 +275,8 @@ class StructuredAIService:
         except AIProviderError:
             self._record_failure("provider_response_error")
             return None
-        except AISchemaError:
-            self._record_failure("schema_or_grounding_rejected")
+        except AISchemaError as exc:
+            self._record_failure(_schema_failure_code(exc))
             return None
         except OSError:
             self._record_failure("cache_io_error")
@@ -564,3 +564,26 @@ def _redacted_json_value(value: JsonValue) -> JsonValue:
             for key, item in value.items()
         }
     return value
+
+
+def _schema_failure_code(error: AISchemaError) -> str:
+    message = str(error)
+    if "response fields" in message or "claim does not exactly" in message:
+        return "response_shape_rejected"
+    if "claim field" in message:
+        return "claim_field_rejected"
+    if "evidence" in message or "quote" in message:
+        return "evidence_rejected"
+    if any(
+        marker in message
+        for marker in (
+            "case number",
+            "party name",
+            "canonical party",
+            "party_type",
+            "ISO date",
+            "explicitly present",
+        )
+    ):
+        return "grounding_rejected"
+    return "schema_or_grounding_rejected"

@@ -281,6 +281,85 @@ def test_validator_rejects_conflicting_trusted_envelope_field() -> None:
         validate_analysis(request, response)
 
 
+def test_validator_drops_unknown_claim_and_forces_review() -> None:
+    request = AIRequest(
+        task_type="party_resolution",
+        source_hash="2" * 64,
+        source_type="excel",
+        source_locator="Cases:2",
+        payload={"fields": [{"name": "의뢰인", "value": "(주)테스트법인"}]},
+        evidence_corpus="의뢰인: (주)테스트법인",
+    )
+    response = AIProviderResponse(
+        payload={
+            "summary": "법인명 확인",
+            "claims": [
+                {
+                    "field": "unsupported_explanation",
+                    "value": "설명",
+                    "confidence": 0.9,
+                    "inference_type": "summarize",
+                    "evidence": [
+                        {"location": "의뢰인", "quote": "(주)테스트법인"}
+                    ],
+                },
+                {
+                    "field": "party_type",
+                    "value": "법인",
+                    "confidence": 0.9,
+                    "inference_type": "classify",
+                    "evidence": [
+                        {"location": "의뢰인", "quote": "(주)테스트법인"}
+                    ],
+                },
+            ],
+            "conflicts": [],
+            "needs_review": False,
+            "overall_confidence": 0.9,
+        },
+        provider="fake",
+        model="fake",
+    )
+
+    analysis = validate_analysis(request, response)
+
+    assert [claim.field for claim in analysis.claims] == ["party_type"]
+    assert analysis.needs_review is True
+    assert "provider_output_normalized" in analysis.conflicts
+
+
+def test_validator_rejects_conflicting_duplicate_claims() -> None:
+    request = AIRequest(
+        task_type="party_resolution",
+        source_hash="3" * 64,
+        source_type="excel",
+        source_locator="Cases:2",
+        payload={"fields": [{"name": "의뢰인", "value": "(주)테스트법인"}]},
+        evidence_corpus="의뢰인: (주)테스트법인",
+    )
+    base_claim = {
+        "field": "party_type",
+        "value": "법인",
+        "confidence": 0.9,
+        "inference_type": "classify",
+        "evidence": [{"location": "의뢰인", "quote": "(주)테스트법인"}],
+    }
+    response = AIProviderResponse(
+        payload={
+            "summary": "법인명 확인",
+            "claims": [base_claim, {**base_claim, "value": "기타"}],
+            "conflicts": [],
+            "needs_review": False,
+            "overall_confidence": 0.9,
+        },
+        provider="fake",
+        model="fake",
+    )
+
+    with pytest.raises(AISchemaError, match="conflicting duplicates"):
+        validate_analysis(request, response)
+
+
 def test_local_only_provider_refuses_external_auto_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

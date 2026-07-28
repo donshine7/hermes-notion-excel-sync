@@ -330,7 +330,8 @@ def validate_analysis(
     if not isinstance(claims_raw, list) or len(claims_raw) > 25:
         raise AISchemaError("AI claims must be a bounded list")
     claims: list[AIClaim] = []
-    seen_fields: set[str] = set()
+    claims_by_field: dict[str, AIClaim] = {}
+    output_normalized = False
     for raw in claims_raw:
         if not isinstance(raw, dict) or set(raw) != {
             "field",
@@ -341,13 +342,11 @@ def validate_analysis(
         }:
             raise AISchemaError("AI claim does not exactly match the schema")
         field_name = _bounded_string(raw["field"], "claim field", 64)
-        if (
-            _FIELD_RE.fullmatch(field_name) is None
-            or field_name not in _TASK_FIELDS[request.task_type]
-            or field_name in seen_fields
-        ):
-            raise AISchemaError("AI claim field is unsupported or duplicated")
-        seen_fields.add(field_name)
+        if _FIELD_RE.fullmatch(field_name) is None:
+            raise AISchemaError("AI claim field is malformed")
+        if field_name not in _TASK_FIELDS[request.task_type]:
+            output_normalized = True
+            continue
         inference_type = _bounded_string(
             raw["inference_type"],
             "inference_type",
@@ -358,15 +357,27 @@ def validate_analysis(
         value = _json_value(raw["value"])
         evidence = _evidence_spans(raw["evidence"], request.evidence_corpus)
         _validate_claim_value(request, field_name, value)
-        claims.append(
-            AIClaim(
-                field=field_name,
-                value=value,
-                confidence=_confidence(raw["confidence"], "claim confidence"),
-                inference_type=inference_type,
-                evidence=evidence,
-            )
+        claim = AIClaim(
+            field=field_name,
+            value=value,
+            confidence=_confidence(raw["confidence"], "claim confidence"),
+            inference_type=inference_type,
+            evidence=evidence,
         )
+        existing = claims_by_field.get(field_name)
+        if existing is not None:
+            if existing != claim:
+                raise AISchemaError("AI claim field has conflicting duplicates")
+            output_normalized = True
+            continue
+        claims_by_field[field_name] = claim
+        claims.append(claim)
+
+    if output_normalized:
+        needs_review = True
+        normalization_note = "provider_output_normalized"
+        if normalization_note not in conflicts and len(conflicts) < 10:
+            conflicts = (*conflicts, normalization_note)
 
     return AIAnalysis(
         task_type=request.task_type,
